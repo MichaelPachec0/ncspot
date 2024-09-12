@@ -48,7 +48,7 @@ impl CoverView {
         xpixels = ((xpixels as f32) / scale) as u16;
         ypixels = ((ypixels as f32) / scale) as u16;
 
-        let font_size = Vec2::new( xpixels.checked_div(cols).unwrap_or(1.0) as usize, ypixels.checked_div(cols).unwrap_or(1.0) as usize);
+        let font_size = Vec2::new( xpixels.checked_div(cols).unwrap_or(1) as usize, ypixels.checked_div(cols).unwrap_or(1) as usize);
 
         debug!("Determined font size: {}x{}", font_size.x, font_size.y);
 
