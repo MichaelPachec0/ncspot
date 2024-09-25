@@ -9,7 +9,6 @@ use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::SessionConfig;
 use librespot_core::session::Session;
-use librespot_core::session::SessionError;
 use librespot_playback::audio_backend;
 use librespot_playback::audio_backend::SinkBuilder;
 use librespot_playback::config::Bitrate;
@@ -17,11 +16,12 @@ use librespot_playback::config::PlayerConfig;
 use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::MixerConfig;
 use librespot_playback::player::Player;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use url::Url;
 
 use crate::application::ASYNC_RUNTIME;
+use crate::authentication::SPOTIFY_CLIENT_ID;
 use crate::config;
 use crate::events::{Event, EventManager};
 use crate::model::playable::Playable;
@@ -129,7 +129,10 @@ impl Spotify {
 
     /// Generate the librespot [SessionConfig] used when creating a [Session].
     pub fn session_config(cfg: &config::Config) -> SessionConfig {
-        let mut session_config = SessionConfig::default();
+        let mut session_config = librespot_core::SessionConfig {
+            client_id: SPOTIFY_CLIENT_ID.to_string(),
+            ..Default::default()
+        };
         match env::var("http_proxy") {
             Ok(proxy) => {
                 info!("Setting HTTP proxy {}", proxy);
@@ -143,17 +146,18 @@ impl Spotify {
         session_config
     }
 
-    /// Test whether `credentials` are valid Spotify credentials.
     pub fn test_credentials(
         cfg: &config::Config,
         credentials: Credentials,
-    ) -> Result<Session, SessionError> {
+    ) -> Result<Session, librespot_core::Error> {
         let config = Self::session_config(cfg);
+        let _guard = ASYNC_RUNTIME.get().unwrap().enter();
+        let session = Session::new(config, None);
         ASYNC_RUNTIME
             .get()
             .unwrap()
-            .block_on(Session::connect(config, credentials, None, true))
-            .map(|r| r.0)
+            .block_on(session.connect(credentials, true))
+            .map(|_| session)
     }
 
     /// Create a [Session] that respects the user configuration in `cfg` and with the given
@@ -161,7 +165,7 @@ impl Spotify {
     async fn create_session(
         cfg: &config::Config,
         credentials: Credentials,
-    ) -> Result<Session, SessionError> {
+    ) -> Result<Session, librespot_core::Error> {
         let librespot_cache_path = config::cache_path("librespot");
         let audio_cache_path = if let Some(false) = cfg.values().audio_cache {
             None
@@ -179,9 +183,8 @@ impl Spotify {
         .expect("Could not create cache");
         debug!("opening spotify session");
         let session_config = Self::session_config(cfg);
-        Session::connect(session_config, credentials, Some(cache), true)
-            .await
-            .map(|r| r.0)
+        let session = Session::new(session_config, Some(cache));
+        session.connect(credentials, true).await.map(|_| session)
     }
 
     /// Create and initialize the requested audio backend.
@@ -248,12 +251,13 @@ impl Spotify {
         mixer.set_volume(volume);
 
         let audio_format: librespot_playback::config::AudioFormat = Default::default();
-        let (player, player_events) = Player::new(
+        let player = Player::new(
             player_config,
             session.clone(),
             mixer.get_soft_volume(),
             move || (backend)(cfg.values().backend_device.clone(), audio_format),
         );
+        let player_events = player.get_player_event_channel();
 
         let mut worker = Worker::new(
             events.clone(),
@@ -315,6 +319,9 @@ impl Spotify {
             start_playing,
             position_ms,
         ));
+
+        #[cfg(feature = "mpris")]
+        self.send_mpris(MprisCommand::EmitMetadataStatus);
     }
 
     /// Update the cached status of the [Player]. This makes sure the status
@@ -338,6 +345,9 @@ impl Spotify {
 
         let mut status = self.status.write().unwrap();
         *status = new_status;
+
+        #[cfg(feature = "mpris")]
+        self.send_mpris(MprisCommand::EmitPlaybackStatus);
     }
 
     /// Reset the time tracking stats for the current song. This should be called when a new song is
@@ -359,6 +369,17 @@ impl Spotify {
             PlayerEvent::Playing(_) => self.pause(),
             PlayerEvent::Paused(_) => self.play(),
             _ => (),
+        }
+    }
+
+    /// Send an [MprisCommand] to the mpris thread.
+    #[cfg(feature = "mpris")]
+    fn send_mpris(&self, cmd: MprisCommand) {
+        debug!("Sending mpris command: {:?}", cmd);
+        if let Some(mpris_manager) = self.mpris.lock().unwrap().as_ref() {
+            mpris_manager.send(cmd);
+        } else {
+            warn!("mpris context is unitialized");
         }
     }
 
@@ -394,6 +415,8 @@ impl Spotify {
     /// Seek in the currently played [Playable] played by the [Player].
     pub fn seek(&self, position_ms: u32) {
         self.send_worker(WorkerCommand::Seek(position_ms));
+        #[cfg(feature = "mpris")]
+        self.notify_seeked(position_ms);
     }
 
     /// Seek relatively to the current playback position of the [Player].
@@ -408,6 +431,19 @@ impl Spotify {
         self.cfg.state().volume
     }
 
+    /// Send a Seeked signal on Mpris interface
+    #[cfg(feature = "mpris")]
+    pub fn notify_seeked(&self, position_ms: u32) {
+        let new_position = Duration::from_millis(position_ms.into());
+        let command = MprisCommand::EmitSeekedStatus(
+            new_position
+                .as_micros()
+                .try_into()
+                .expect("track position exceeds MPRIS datatype"),
+        );
+        self.send_mpris(command);
+    }
+
     /// Set the current volume of the [Player]. If `notify` is true, also notify MPRIS clients about
     /// the update.
     pub fn set_volume(&self, volume: u16, notify: bool) {
@@ -418,10 +454,7 @@ impl Spotify {
         // MPRIS implementation.
         if notify {
             #[cfg(feature = "mpris")]
-            if let Some(mpris_manager) = self.mpris.lock().unwrap().as_ref() {
-                info!("updating MPRIS volume");
-                mpris_manager.send(MprisCommand::NotifyVolumeUpdate);
-            }
+            self.send_mpris(MprisCommand::EmitVolumeStatus)
         }
     }
 

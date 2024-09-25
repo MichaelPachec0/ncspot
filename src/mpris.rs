@@ -1,3 +1,5 @@
+#![allow(clippy::use_self)]
+
 use log::info;
 use std::collections::HashMap;
 use std::error::Error;
@@ -6,6 +8,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use zbus::object_server::SignalContext;
 use zbus::zvariant::{ObjectPath, Value};
 use zbus::{interface, ConnectionBuilder};
 
@@ -314,6 +317,9 @@ impl MprisPlayer {
         self.queue.get_current().is_some()
     }
 
+    #[zbus(signal)]
+    async fn seeked(context: &SignalContext<'_>, position: &i64) -> zbus::Result<()>;
+
     fn next(&self) {
         self.queue.next(true)
     }
@@ -463,11 +469,17 @@ impl MprisPlayer {
 }
 
 /// Commands to control the [MprisManager] worker thread.
+#[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
 pub enum MprisCommand {
-    /// Notify about playback status and metadata updates.
-    NotifyPlaybackUpdate,
-    /// Notify about volume updates.
-    NotifyVolumeUpdate,
+    /// Emit playback status
+    EmitPlaybackStatus,
+    /// Emit volume
+    EmitVolumeStatus,
+    /// Emit metadata
+    EmitMetadataStatus,
+    /// Emit seeked position
+    EmitSeekedStatus(i64),
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -525,13 +537,19 @@ impl MprisManager {
         loop {
             let ctx = player_iface_ref.signal_context();
             match rx.next().await {
-                Some(MprisCommand::NotifyPlaybackUpdate) => {
+                Some(MprisCommand::EmitPlaybackStatus) => {
                     player_iface.playback_status_changed(ctx).await?;
-                    player_iface.metadata_changed(ctx).await?;
                 }
-                Some(MprisCommand::NotifyVolumeUpdate) => {
+                Some(MprisCommand::EmitVolumeStatus) => {
                     info!("sending MPRIS volume update signal");
                     player_iface.volume_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitMetadataStatus) => {
+                    player_iface.metadata_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitSeekedStatus(pos)) => {
+                    info!("sending MPRIS seeked signal");
+                    MprisPlayer::seeked(ctx, &pos).await?;
                 }
                 None => break,
             }
