@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fix error in fetching of window size leading to crashes with cover feature
+
+## [1.2.0] - 2024-10-15
+
 ### Added
 
 - Emit MPRIS `Seeked` signal
@@ -14,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Switch to OAuth2 login mechanism
+- Uses librespot 0.5.0 which containts many bugfixes, including:
+  - Files are downloaded via CDN, which should fix playback of some podcasts
+  - Better access point connection handling, hopefully resulting in faster startups
+  - Fix frequent disconnections for some users
 
 ## [1.1.2] - 2024-07-16
 
@@ -205,7 +215,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Albums with more than 50 songs not showing all the songs when viewed in the library
 - Bug that could cause items to not load until the screen is filled on bigger screens
 
-[Unreleased]: https://github.com/hrkfdn/ncspot/compare/v1.1.2...HEAD
+[1.2.0]: https://github.com/hrkfdn/ncspot/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/hrkfdn/ncspot/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/hrkfdn/ncspot/compare/v1.1.0...v1.1.1
 [1.1.0]: https://github.com/hrkfdn/ncspot/compare/v1.0.0...v1.1.0
