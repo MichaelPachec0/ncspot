@@ -2,11 +2,11 @@ use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::{cmp::Ordering, iter::Iterator};
 
-use rand::{seq::IteratorRandom, thread_rng};
+use rand::{rng, seq::IteratorRandom};
 
 use log::{debug, warn};
-use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 use rspotify::model::Id;
+use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 
 use crate::model::playable::Playable;
 use crate::model::track::Track;
@@ -48,7 +48,7 @@ impl Playlist {
     }
 
     pub fn has_track(&self, track_id: &str) -> bool {
-        self.tracks.as_ref().map_or(false, |tracks| {
+        self.tracks.as_ref().is_some_and(|tracks| {
             tracks
                 .iter()
                 .any(|track| track.id() == Some(track_id.to_string()))
@@ -57,7 +57,7 @@ impl Playlist {
 
     pub fn delete_track(&mut self, index: usize, spotify: Spotify, library: &Library) -> bool {
         let playable = self.tracks.as_ref().unwrap()[index].clone();
-        debug!("deleting track: {} {:?}", index, playable);
+        debug!("deleting track: {index} {playable:?}");
 
         if playable.track().map(|t| t.is_local) == Some(true) {
             warn!("track is a local file, can't delete");
@@ -295,7 +295,7 @@ impl ListItem for Playlist {
             .collect::<HashSet<_>>()
             .into_iter()
             // spotify allows at max 5 seed items, so choose them at random
-            .choose_multiple(&mut thread_rng(), MAX_SEEDS);
+            .choose_multiple(&mut rng(), MAX_SEEDS);
 
         if track_ids.is_empty() {
             return None;

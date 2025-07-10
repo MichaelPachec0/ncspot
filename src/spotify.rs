@@ -13,8 +13,8 @@ use librespot_playback::audio_backend;
 use librespot_playback::audio_backend::SinkBuilder;
 use librespot_playback::config::Bitrate;
 use librespot_playback::config::PlayerConfig;
-use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::mixer::MixerConfig;
+use librespot_playback::mixer::softmixer::SoftMixer;
 use librespot_playback::player::Player;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
@@ -29,6 +29,7 @@ use crate::model::playable::Playable;
 use crate::mpris::{MprisCommand, MprisManager};
 use crate::spotify_api::WebApi;
 use crate::spotify_worker::{Worker, WorkerCommand};
+use crate::traits::ListItem;
 
 /// One percent of the maximum supported [Player] volume, used when setting the volume to a certain
 /// percent.
@@ -135,7 +136,7 @@ impl Spotify {
         };
         match env::var("http_proxy") {
             Ok(proxy) => {
-                info!("Setting HTTP proxy {}", proxy);
+                info!("Setting HTTP proxy {proxy}");
                 session_config.proxy = Url::parse(&proxy).ok();
             }
             Err(_) => debug!("No HTTP proxy set"),
@@ -167,10 +168,9 @@ impl Spotify {
         credentials: Credentials,
     ) -> Result<Session, librespot_core::Error> {
         let librespot_cache_path = config::cache_path("librespot");
-        let audio_cache_path = if let Some(false) = cfg.values().audio_cache {
-            None
-        } else {
-            Some(librespot_cache_path.join("files"))
+        let audio_cache_path = match cfg.values().audio_cache {
+            Some(false) => None,
+            _ => Some(librespot_cache_path.join("files")),
         };
         let cache = Cache::new(
             Some(librespot_cache_path.clone()),
@@ -204,11 +204,14 @@ impl Spotify {
 
         let backend_name = backend.0;
 
-        info!("Initializing audio backend {}", backend_name);
+        info!("Initializing audio backend {backend_name}");
         if backend_name == "pulseaudio" {
-            env::set_var("PULSE_PROP_application.name", "ncspot");
-            env::set_var("PULSE_PROP_stream.description", "ncurses Spotify client");
-            env::set_var("PULSE_PROP_media.role", "music");
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { env::set_var("PULSE_PROP_application.name", "ncspot") };
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { env::set_var("PULSE_PROP_stream.description", "ncurses Spotify client") };
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { env::set_var("PULSE_PROP_media.role", "music") };
         }
 
         Ok(backend.1)
@@ -313,7 +316,14 @@ impl Spotify {
     /// Load `track` into the [Player]. Start playing immediately if
     /// `start_playing` is true. Start playing from `position_ms` in the song.
     pub fn load(&self, track: &Playable, start_playing: bool, position_ms: u32) {
-        info!("loading track: {:?}", track);
+        info!("loading track: {track:?}");
+
+        if !track.is_playable() {
+            warn!("track {track:?} can not be played, skipping..");
+            self.events.send(Event::Player(PlayerEvent::FinishedTrack));
+            return;
+        }
+
         self.send_worker(WorkerCommand::Load(
             track.clone(),
             start_playing,
@@ -375,25 +385,25 @@ impl Spotify {
     /// Send an [MprisCommand] to the mpris thread.
     #[cfg(feature = "mpris")]
     fn send_mpris(&self, cmd: MprisCommand) {
-        debug!("Sending mpris command: {:?}", cmd);
-        if let Some(mpris_manager) = self.mpris.lock().unwrap().as_ref() {
-            mpris_manager.send(cmd);
-        } else {
-            warn!("mpris context is unitialized");
+        debug!("Sending mpris command: {cmd:?}");
+        match self.mpris.lock().unwrap().as_ref() {
+            Some(mpris_manager) => {
+                mpris_manager.send(cmd);
+            }
+            _ => {
+                warn!("mpris context is unitialized");
+            }
         }
     }
 
     /// Send a [WorkerCommand] to the worker thread.
     fn send_worker(&self, cmd: WorkerCommand) {
-        info!("sending command to worker: {:?}", cmd);
+        info!("sending command to worker: {cmd:?}");
         let channel = self.channel.read().unwrap();
         match channel.as_ref() {
             Some(channel) => {
                 if let Err(e) = channel.send(cmd) {
-                    error!(
-                        "can't send command to spotify worker: {}, dropping command",
-                        e
-                    );
+                    error!("can't send command to spotify worker: {e}, dropping command");
                 }
             }
             None => error!("no channel to worker available"),
@@ -447,7 +457,7 @@ impl Spotify {
     /// Set the current volume of the [Player]. If `notify` is true, also notify MPRIS clients about
     /// the update.
     pub fn set_volume(&self, volume: u16, notify: bool) {
-        info!("setting volume to {}", volume);
+        info!("setting volume to {volume}");
         self.cfg.with_state_mut(|s| s.volume = volume);
         self.send_worker(WorkerCommand::SetVolume(volume));
         // HACK: This is a bit of a hack to prevent duplicate update signals when updating from the

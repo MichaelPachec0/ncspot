@@ -45,13 +45,12 @@ pub fn ms_to_hms(duration: u32) -> String {
 
 pub fn cache_path_for_url(url: String) -> std::path::PathBuf {
     let mut path = crate::config::cache_path("covers");
-    path.push(url.split('/').last().unwrap());
+    path.push(url.split('/').next_back().unwrap());
     path
 }
 
 pub fn download(url: String, path: std::path::PathBuf) -> Result<(), std::io::Error> {
-    let mut resp = reqwest::blocking::get(url)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let mut resp = reqwest::blocking::get(url).map_err(std::io::Error::other)?;
 
     std::fs::create_dir_all(path.parent().unwrap())?;
     let mut file = std::fs::File::create(path)?;

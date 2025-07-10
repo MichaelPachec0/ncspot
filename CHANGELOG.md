@@ -5,7 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0]
+
+### Added
+
+- Automatically find free port for OAuth2 login flow
+
+### Fixed
+
+- Skip unplayable tracks
+- Queue UI correctly plays a track when clicking on an already selected item
+- Swap foreground and background colors for command line input
+- Do not crash due to unavailable tracks in queue
+- Do not fail when receiving playables of unknown types
+
+## [1.2.2]
+
+### Added
+
+- `%artist` formatting option to only show single artist name
+- Build release for aarch64 on Linux
+
+### Removed
+
+- Support for basic password managers as OAuth2 is now the only supported authentication flow
+
+### Fixed
+
+- Missing automatic man page generation for subcommands
+- Bug causing forced password reset after using `ncpsot`
+
+## [1.2.1] - 2024-10-31
 
 ### Fixed
 
@@ -215,6 +245,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Albums with more than 50 songs not showing all the songs when viewed in the library
 - Bug that could cause items to not load until the screen is filled on bigger screens
 
+[1.3.0]: https://github.com/hrkfdn/ncspot/compare/v1.2.2...v1.3.0
+[1.2.2]: https://github.com/hrkfdn/ncspot/compare/v1.2.1...v1.2.2
+[1.2.1]: https://github.com/hrkfdn/ncspot/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/hrkfdn/ncspot/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/hrkfdn/ncspot/compare/v1.1.1...v1.1.2
 [1.1.1]: https://github.com/hrkfdn/ncspot/compare/v1.1.0...v1.1.1

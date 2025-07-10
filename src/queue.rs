@@ -13,6 +13,7 @@ use crate::library::Library;
 use crate::model::playable::Playable;
 use crate::spotify::PlayerEvent;
 use crate::spotify::Spotify;
+use crate::traits::ListItem;
 
 /// Repeat behavior for the [Queue].
 #[derive(Display, Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -158,7 +159,7 @@ impl Queue {
     }
 
     /// Append `tracks` after the currently playing item, taking into account
-    /// shuffle status. Returns the amount of added items.
+    /// shuffle status. Returns the first index(in `self.queue`) of added items.
     pub fn append_next(&self, tracks: &Vec<Playable>) -> usize {
         let mut q = self.queue.write().unwrap();
 
@@ -188,7 +189,7 @@ impl Queue {
     pub fn remove(&self, index: usize) {
         {
             let mut q = self.queue.write().unwrap();
-            if q.len() == 0 {
+            if q.is_empty() {
                 info!("queue is empty");
                 return;
             }
@@ -281,8 +282,8 @@ impl Queue {
         let queue_length = self.queue.read().unwrap().len();
         // The length of the queue must be bigger than 0 or gen_range panics!
         if queue_length > 0 && shuffle_index && self.get_shuffle() {
-            let mut rng = rand::thread_rng();
-            index = rng.gen_range(0..queue_length);
+            let mut rng = rand::rng();
+            index = rng.random_range(0..queue_length);
         }
 
         if let Some(track) = &self.queue.read().unwrap().get(index) {
@@ -346,7 +347,8 @@ impl Queue {
         self.spotify.stop();
     }
 
-    /// Play the next song in the queue.
+    /// Play the next song in the queue. Stops playback if there are no playable tracks
+    /// remaining.
     ///
     /// `manual`: If this is true, normal queue logic like repeat will not be
     /// used, and the next track will actually be played. This should be used
@@ -358,14 +360,19 @@ impl Queue {
 
         if repeat == RepeatSetting::RepeatTrack && !manual {
             if let Some(index) = current {
-                self.play(index, false, false);
+                if q[index].is_playable() {
+                    self.play(index, false, false);
+                }
             }
         } else if let Some(index) = self.next_index() {
             self.play(index, false, false);
             if repeat == RepeatSetting::RepeatTrack && manual {
                 self.set_repeat(RepeatSetting::RepeatPlaylist);
             }
-        } else if repeat == RepeatSetting::RepeatPlaylist && q.len() > 0 {
+        } else if repeat == RepeatSetting::RepeatPlaylist
+            && !q.is_empty()
+            && q.iter().any(|track| track.is_playable())
+        {
             let random_order = self.random_order.read().unwrap();
             self.play(
                 random_order.as_ref().map(|o| o[0]).unwrap_or(0),
@@ -385,7 +392,7 @@ impl Queue {
 
         if let Some(index) = self.previous_index() {
             self.play(index, false, false);
-        } else if repeat == RepeatSetting::RepeatPlaylist && q.len() > 0 {
+        } else if repeat == RepeatSetting::RepeatPlaylist && !q.is_empty() {
             if self.get_shuffle() {
                 let random_order = self.random_order.read().unwrap();
                 self.play(
@@ -432,7 +439,7 @@ impl Queue {
             random.remove(current);
         }
 
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         random.shuffle(&mut rng);
         order.extend(random);
 
@@ -457,7 +464,7 @@ impl Queue {
             QueueEvent::PreloadTrackRequest => {
                 if let Some(next_index) = self.next_index() {
                     let track = self.queue.read().unwrap()[next_index].clone();
-                    debug!("Preloading track {} as requested by librespot", track);
+                    debug!("Preloading track {track} as requested by librespot");
                     self.spotify.preload(&track);
                 }
             }
@@ -487,7 +494,7 @@ pub fn send_notification(summary_txt: &str, body_txt: &str, cover_url: Option<St
         let path = crate::utils::cache_path_for_url(u.to_string());
         if !path.exists() {
             if let Err(e) = crate::utils::download(u, path.clone()) {
-                log::error!("Failed to download cover: {}", e);
+                log::error!("Failed to download cover: {e}");
             }
         }
         n.icon(path.to_str().unwrap());
@@ -505,6 +512,6 @@ pub fn send_notification(summary_txt: &str, body_txt: &str, cover_url: Option<St
             #[cfg(all(unix, not(target_os = "macos")))]
             info!("Created notification: {}", handle.id());
         }
-        Err(e) => log::error!("Failed to send notification cover: {}", e),
+        Err(e) => log::error!("Failed to send notification cover: {e}"),
     }
 }

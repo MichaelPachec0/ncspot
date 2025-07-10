@@ -10,14 +10,14 @@ use librespot_core::token::Token;
 use librespot_playback::mixer::Mixer;
 use librespot_playback::player::{Player, PlayerEvent as LibrespotPlayerEvent};
 use log::{debug, error, info, warn};
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::sync::mpsc::Sender;
 use std::time::Duration;
 use std::{pin::Pin, time::SystemTime};
 use tokio::sync::mpsc;
 use tokio::time;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 #[derive(Debug)]
 pub(crate) enum WorkerCommand {
@@ -94,7 +94,7 @@ impl Worker {
                     Some(WorkerCommand::Load(playable, start_playing, position_ms)) => {
                         match SpotifyId::from_uri(&playable.uri()) {
                             Ok(id) => {
-                                info!("player loading track: {:?}", id);
+                                info!("player loading track: {id:?}");
                                 if !id.is_playable() {
                                     warn!("track is not playable");
                                     self.events.send(Event::Player(PlayerEvent::FinishedTrack));
@@ -103,7 +103,7 @@ impl Worker {
                                 }
                             }
                             Err(e) => {
-                                error!("error parsing uri: {:?}", e);
+                                error!("error parsing uri: {e:?}");
                                 self.events.send(Event::Player(PlayerEvent::FinishedTrack));
                             }
                         }
@@ -128,7 +128,7 @@ impl Worker {
                     }
                     Some(WorkerCommand::Preload(playable)) => {
                         if let Ok(id) = SpotifyId::from_uri(&playable.uri()) {
-                            debug!("Preloading {:?}", id);
+                            debug!("Preloading {id:?}");
                             self.player.preload(id);
                         }
                     }

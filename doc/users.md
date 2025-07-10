@@ -182,7 +182,7 @@ Note: \<FOO\> - mandatory arg; [BAR] - optional arg
 | `exec` \<CMD\>                                                   | Execute a command in the system shell.<br/>\* Command output is printed to the terminal, so redirection (`2> /dev/null`) may be necessary.                                                                                                                      |
 | `noop`                                                           | Do nothing. Useful for disabling default keybindings. See [custom keybindings](#custom-keybindings).                                                                                                                                                            |
 | `reload`                                                         | Reload the configuration from disk. See [Configuration](#configuration).                                                                                                                                                                                        |
-| `reconnect`                                                      | Reconnect to Spotify (useful when session has expired or connection was lost                                                                                                                                                                                    |
+| `reconnect`                                                      | Reconnect to Spotify (useful when session has expired or connection was lost)                                                                                                                                                                                   |
 | `add [current]`                                                  | Add selected track to playlist, if `current` is passed the currently playing track will be added                                                                                                                                                                |
 | `save [current]`                                                 | Save selected item, if `current` is passed the currently playing item will be saved                                                                                                                                                                             |
 
@@ -361,8 +361,9 @@ It's possible to customize how tracks are shown in Queue/Library views and the
 statusbar, whereas `statusbar_format` will hold the statusbar formatting and
 `[track_format]` the formatting for tracks in list views.
 If you don't define `center` for example, the default value will be used.
-Available options for tracks: `%artists`, `%title`, `%album`, `%saved`,
-`%duration`
+Available options for tracks: `%artists`, `%artist`, `%title`, `%album`, `%saved`,
+`%duration`.
+`%artists` will show all contributing artists, while `%artist` only shows the first listed artist.
 
 Default configuration:
 
@@ -451,25 +452,13 @@ cover_max_scale = 2
 ```
 
 ## Authentication
-`ncspot` prompts for a Spotify username and password on first launch, uses this
-to generate an OAuth token, and stores it to disk.
+`ncspot` uses OAuth2 for authentication. When launched for the first time, a link will be generated
+that can be opened in any browser. After logging in on the displayed page, you can start to use
+`ncspot`. The OAuth2 flow is the only supported one, as username/password authentication has been
+removed by Spotify.
 
 The credentials are stored in `librespot/credentials.json` in the user's cache directory. Run
 `ncspot info` to show the location of this directory.
 
 The `logout` command can be used to remove cached credentials. See
 [Vim-Like Commands](#vim-like-commands).
-
-### Using a Password Manager
-If you would like ncspot to retrieve your login data from command results,
-i.e. because you use a password manager like `pass`, you can add the following
-configuration:
-
-```toml
-[credentials]
-username_cmd = "echo username"
-password_cmd = "pass spotify.com/username"
-```
-
-Do note that this is only required for the initial login or when your credential
-token has expired.

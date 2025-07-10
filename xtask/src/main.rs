@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 use std::{env, fs};
 
+use clap::ArgMatches;
 use clap::builder::PathBufValueParser;
 use clap::error::{Error, ErrorKind};
-use clap::ArgMatches;
 use clap_complete::Shell;
 use ncspot::{AUTHOR, BIN_NAME};
 
@@ -34,7 +34,7 @@ type DynError = Box<dyn std::error::Error>;
 
 fn main() {
     if let Err(e) = try_main() {
-        eprintln!("{}", e);
+        eprintln!("{e}");
         std::process::exit(-1);
     }
 }
@@ -61,7 +61,7 @@ automation.",
                     .long("output")
                     .value_name("PATH")
                     .default_value("misc")
-                    .help("Output directory for the generated man page.")
+                    .help("Output directory for the generated man pages.")
                     .value_parser(PathBufValueParser::new())])
                 .about("Automatic man page generation."),
             clap::Command::new("generate-shell-completion")
@@ -110,15 +110,12 @@ fn generate_manpage(subcommand_arguments: &ArgMatches) -> Result<(), DynError> {
         .get_one::<PathBuf>("output")
         .unwrap_or(&default_output_directory);
     let cmd = ncspot::program_arguments();
-    let man = clap_mangen::Man::new(cmd);
-    let mut buffer: Vec<u8> = Default::default();
 
     if *output_directory == default_output_directory {
         fs::create_dir_all(DEFAULT_OUTPUT_DIRECTORY)?;
     }
 
-    man.render(&mut buffer)?;
-    std::fs::write(output_directory.join("ncspot.1"), buffer)?;
+    clap_mangen::generate_to(cmd, output_directory)?;
 
     Ok(())
 }
@@ -139,7 +136,7 @@ fn generate_shell_completion(subcommand_arguments: &ArgMatches) -> Result<(), Dy
                     "elvish" => Shell::Elvish,
                     "powershell" => Shell::PowerShell,
                     _ => {
-                        eprintln!("Unrecognized shell: {}", shell);
+                        eprintln!("Unrecognized shell: {shell}");
                         std::process::exit(-1);
                     }
                 })

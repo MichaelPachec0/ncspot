@@ -4,9 +4,9 @@ use std::sync::{Arc, RwLock};
 use crate::config;
 use crate::utils::ms_to_hms;
 use chrono::{DateTime, Utc};
+use rspotify::model::Id;
 use rspotify::model::album::FullAlbum;
 use rspotify::model::track::{FullTrack, SavedTrack, SimplifiedTrack};
-use rspotify::model::Id;
 
 use crate::library::Library;
 use crate::model::album::Album;
@@ -336,7 +336,7 @@ impl ListItem for Track {
 
     #[inline]
     fn is_playable(&self) -> bool {
-        true
+        self.is_playable == Some(true)
     }
 
     fn as_listitem(&self) -> Box<dyn ListItem> {

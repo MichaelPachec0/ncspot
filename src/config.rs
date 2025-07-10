@@ -12,7 +12,7 @@ use platform_dirs::AppDirs;
 use crate::command::{SortDirection, SortKey};
 use crate::model::playable::Playable;
 use crate::queue;
-use crate::serialization::{Serializer, CBOR, TOML};
+use crate::serialization::{CBOR, Serializer, TOML};
 
 pub const CACHE_VERSION: u16 = 1;
 pub const DEFAULT_COMMAND_KEY: char = ':';
@@ -100,15 +100,7 @@ pub struct ConfigValues {
     pub statusbar_format: Option<String>,
     pub library_tabs: Option<Vec<LibraryTab>>,
     pub hide_display_names: Option<bool>,
-    pub credentials: Option<Credentials>,
     pub ap_port: Option<u16>,
-}
-
-/// Commands used to obtain user credentials automatically.
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-pub struct Credentials {
-    pub username_cmd: Option<String>,
-    pub password_cmd: Option<String>,
 }
 
 /// The ncspot theme.
@@ -265,7 +257,7 @@ impl Config {
         let path = config_path(USER_STATE_FILE_NAME);
         debug!("saving user state to {}", path.display());
         if let Err(e) = CBOR.write(path, &*self.state()) {
-            error!("Could not save user state: {}", e);
+            error!("Could not save user state: {e}");
         }
     }
 

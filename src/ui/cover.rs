@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 
 use cursive::theme::{ColorStyle, ColorType, PaletteColor};
 use cursive::{Cursive, Printer, Vec2, View};
-use ioctl_rs::{ioctl, TIOCGWINSZ};
+use ioctl_rs::{TIOCGWINSZ, ioctl};
 use log::{debug, error};
 
 use crate::command::{Command, GotoMode};
@@ -38,10 +38,7 @@ impl CoverView {
             query
         };
 
-        debug!(
-            "Determined window dimensions: {}x{}, {}x{}",
-            xpixels, ypixels, cols, rows
-        );
+        debug!("Determined window dimensions: {xpixels}x{ypixels}, {cols}x{rows}");
 
         // Determine font size, considering max scale to prevent tiny covers on HiDPI screens
         let scale = config.values().cover_max_scale.unwrap_or(1.0);
@@ -117,14 +114,17 @@ impl CoverView {
         draw_offset.x += (draw_size.x - size.x) / 2;
         draw_offset.y += (draw_size.y - size.y) - (draw_size.y - size.y) / 2;
 
-        let cmd = format!("{{\"action\":\"add\",\"scaler\":\"fit_contain\",\"identifier\":\"cover\",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"path\":\"{}\"}}\n",
-            draw_offset.x, draw_offset.y,
-            size.x, size.y,
+        let cmd = format!(
+            "{{\"action\":\"add\",\"scaler\":\"fit_contain\",\"identifier\":\"cover\",\"x\":{},\"y\":{},\"width\":{},\"height\":{},\"path\":\"{}\"}}\n",
+            draw_offset.x,
+            draw_offset.y,
+            size.x,
+            size.y,
             path.to_str().unwrap()
         );
 
         if let Err(e) = self.run_ueberzug_cmd(&cmd) {
-            error!("Failed to run Ueberzug: {}", e);
+            error!("Failed to run Ueberzug: {e}");
             return;
         }
 
@@ -141,7 +141,7 @@ impl CoverView {
 
         let cmd = "{\"action\": \"remove\", \"identifier\": \"cover\"}\n";
         if let Err(e) = self.run_ueberzug_cmd(cmd) {
-            error!("Failed to run Ueberzug: {}", e);
+            error!("Failed to run Ueberzug: {e}");
         }
     }
 
@@ -181,7 +181,7 @@ impl CoverView {
         let loading_thread = self.loading.clone();
         std::thread::spawn(move || {
             if let Err(e) = crate::utils::download(url.clone(), path.clone()) {
-                error!("Failed to download cover: {}", e);
+                error!("Failed to download cover: {e}");
             }
             let mut loading = loading_thread.write().unwrap();
             loading.remove(&url.clone());

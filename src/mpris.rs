@@ -6,11 +6,11 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
-use zbus::object_server::SignalContext;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, Value};
-use zbus::{interface, ConnectionBuilder};
+use zbus::{connection, interface};
 
 use crate::application::ASYNC_RUNTIME;
 use crate::library::Library;
@@ -274,10 +274,10 @@ impl MprisPlayer {
     }
 
     #[zbus(property)]
-    fn set_volume(&self, mut volume: f64) {
+    fn set_volume(&self, volume: f64) {
         log::info!("set volume: {volume}");
-        volume = volume.clamp(0.0, 1.0);
-        let vol = (VOLUME_PERCENT as f64) * volume * 100.0;
+        let clamped = volume.clamp(0.0, 1.0);
+        let vol = (VOLUME_PERCENT as f64) * clamped * 100.0;
         self.spotify.set_volume(vol as u16, false);
         self.event.trigger();
     }
@@ -318,7 +318,7 @@ impl MprisPlayer {
     }
 
     #[zbus(signal)]
-    async fn seeked(context: &SignalContext<'_>, position: &i64) -> zbus::Result<()>;
+    async fn seeked(context: &SignalEmitter<'_>, position: &i64) -> zbus::Result<()>;
 
     fn next(&self) {
         self.queue.next(true)
@@ -521,7 +521,7 @@ impl MprisManager {
         root: MprisRoot,
         player: MprisPlayer,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
-        let conn = ConnectionBuilder::session()?
+        let conn = connection::Builder::session()?
             .name(instance_bus_name())?
             .serve_at("/org/mpris/MediaPlayer2", root)?
             .serve_at("/org/mpris/MediaPlayer2", player)?
@@ -535,7 +535,7 @@ impl MprisManager {
         let player_iface = player_iface_ref.get().await;
 
         loop {
-            let ctx = player_iface_ref.signal_context();
+            let ctx = player_iface_ref.signal_emitter();
             match rx.next().await {
                 Some(MprisCommand::EmitPlaybackStatus) => {
                     player_iface.playback_status_changed(ctx).await?;

@@ -5,8 +5,8 @@ use log::{debug, error, info};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::runtime::Handle;
 use tokio::sync::watch::{Receiver, Sender};
-use tokio_stream::wrappers::WatchStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::WatchStream;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::events::{Event, EventManager};
@@ -77,7 +77,7 @@ impl IpcSocket {
         loop {
             match listener.accept().await {
                 Ok((stream, sockaddr)) => {
-                    debug!("Connection from {:?}", sockaddr);
+                    debug!("Connection from {sockaddr:?}");
                     tokio::spawn(Self::stream_handler(
                         stream,
                         ev.clone(),

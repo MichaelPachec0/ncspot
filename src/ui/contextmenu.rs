@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use cursive::Cursive;
 use cursive::view::{Margins, ViewWrapper};
 use cursive::views::{Dialog, NamedView, ScrollView, SelectView};
-use cursive::Cursive;
 
 use crate::commands::CommandResult;
 use crate::ext_traits::SelectViewExt;
@@ -351,7 +351,7 @@ impl ContextMenu {
 
 impl ViewExt for AddToPlaylistMenu {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
-        log::info!("playlist command: {:?}", cmd);
+        log::info!("playlist command: {cmd:?}");
         handle_move_command::<Playlist>(&mut self.dialog, s, cmd, "addplaylist_select")
     }
 }
@@ -364,7 +364,7 @@ impl ViewExt for ContextMenu {
 
 impl ViewExt for SelectArtistMenu {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
-        log::info!("artist move command: {:?}", cmd);
+        log::info!("artist move command: {cmd:?}");
         handle_move_command::<Artist>(&mut self.dialog, s, cmd, "artist_select")
     }
 }
