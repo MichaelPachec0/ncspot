@@ -277,16 +277,16 @@ impl ContextMenu {
             );
         }
 
-        if let Some(ref a) = album {
-            if let Some(savestatus) = a.is_saved(&library) {
-                content.add_item(
-                    match savestatus {
-                        true => "Unsave album",
-                        false => "Save album",
-                    },
-                    ContextMenuAction::ToggleSavedStatus(a.as_listitem()),
-                );
-            }
+        if let Some(ref a) = album
+            && let Some(savestatus) = a.is_saved(&library)
+        {
+            content.add_item(
+                match savestatus {
+                    true => "Unsave album",
+                    false => "Save album",
+                },
+                ContextMenuAction::ToggleSavedStatus(a.as_listitem()),
+            );
         }
 
         // open detail view of artist/album
