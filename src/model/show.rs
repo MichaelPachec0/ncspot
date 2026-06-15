@@ -15,7 +15,6 @@ pub struct Show {
     pub id: String,
     pub uri: String,
     pub name: String,
-    pub publisher: String,
     pub description: String,
     pub cover_url: Option<String>,
     pub episodes: Option<Vec<Episode>>,
@@ -43,7 +42,6 @@ impl From<&SimplifiedShow> for Show {
             id: show.id.id().to_string(),
             uri: show.id.uri(),
             name: show.name.clone(),
-            publisher: show.publisher.clone(),
             description: show.description.clone(),
             cover_url: show.images.first().map(|i| i.url.clone()),
             episodes: None,
@@ -57,7 +55,6 @@ impl From<&FullShow> for Show {
             id: show.id.id().to_string(),
             uri: show.id.uri(),
             name: show.name.clone(),
-            publisher: show.publisher.clone(),
             description: show.description.clone(),
             cover_url: show.images.first().map(|i| i.url.clone()),
             episodes: None,
@@ -67,7 +64,7 @@ impl From<&FullShow> for Show {
 
 impl fmt::Display for Show {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{} - {}", self.publisher, self.name)
+        write!(f, "{}", self.name)
     }
 }
 
@@ -102,7 +99,7 @@ impl ListItem for Show {
             .unwrap_or(&Vec::new())
             .iter()
             .map(|ep| Playable::Episode(ep.clone()))
-            .collect();
+            .collect::<Vec<_>>();
 
         let index = queue.append_next(&playables);
         queue.play(index, true, true);
