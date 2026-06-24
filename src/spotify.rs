@@ -35,6 +35,11 @@ use crate::traits::ListItem;
 /// percent.
 pub const VOLUME_PERCENT: u16 = ((u16::MAX as f64) * 1.0 / 100.0) as u16;
 
+/// How long to wait before retrying after a failed session connection. This avoids hammering DNS
+/// when the network is briefly unavailable (e.g. just after suspend/resume), while still
+/// recovering automatically once connectivity returns.
+const SESSION_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 /// Events sent by the [Player].
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub enum PlayerEvent {
@@ -261,9 +266,39 @@ impl Spotify {
             ..Default::default()
         };
 
-        let session = Self::create_session(&cfg, credentials)
-            .await
-            .expect("Could not create session");
+        let session = match Self::create_session(&cfg, credentials).await {
+            Ok(session) => session,
+            Err(e) => {
+                // A transient DNS/network failure here is common right after a dropped
+                // connection, suspend/resume, or a network change — exactly when the worker
+                // gets restarted. Previously this used `.expect()`, so such a hiccup panicked
+                // the worker task *before* it could request another restart, leaving a dangling
+                // command channel behind. The result was that every later playback command was
+                // silently dropped and the app appeared frozen until restarted.
+                //
+                // Instead, recover: back off briefly (so we don't hammer DNS while the network
+                // is down) and ask the application to restart the worker, which retries the
+                // connection.
+                error!("Could not create session: {e}. Retrying in {SESSION_RETRY_DELAY:?}.");
+
+                // Unblock startup immediately. `Spotify::new` waits on `user_rx` only to learn
+                // the username, so drop the sender now rather than after the back-off; otherwise
+                // the main thread (and the UI) would block for SESSION_RETRY_DELAY on a failed
+                // first connection.
+                drop(user_tx);
+
+                // Stop accepting commands into a channel whose worker will never drain them, so
+                // they surface as a logged "no channel" error instead of being silently buffered
+                // and then dropped when this task returns.
+                *worker_channel.write().unwrap() = None;
+
+                // Back off in the background (this task is now detached from startup) before
+                // asking the application to restart the worker.
+                tokio::time::sleep(SESSION_RETRY_DELAY).await;
+                events.send(Event::SessionDied);
+                return;
+            }
+        };
         user_tx.map(|tx| tx.send(session.username()));
 
         let mixer_factory_opt = librespot_playback::mixer::find(Some(SoftMixer::NAME));
