@@ -1,6 +1,12 @@
 use serde::Deserialize;
 
 use crate::config::Config;
+
+const USER_AGENT: &str = concat!(
+    "ncspot/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/hrkfdn/ncspot)"
+);
 use crate::lyrics::lrc::parse_lrc;
 use crate::lyrics::model::{Lyrics, ProviderId, TrackMeta};
 use crate::lyrics::provider::LyricsProvider;
@@ -97,7 +103,10 @@ impl LyricsProvider for Netease {
     }
 
     fn fetch(&self, track: &TrackMeta) -> anyhow::Result<Option<Lyrics>> {
-        let client = reqwest::blocking::Client::new();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent(USER_AGENT)
+            .build()?;
         let search = client
             .get("https://music.163.com/api/search/get")
             .query(&[

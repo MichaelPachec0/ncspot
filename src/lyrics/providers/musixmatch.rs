@@ -50,6 +50,7 @@ impl LyricsProvider for Musixmatch {
         let duration_sec = (track.duration_ms / 1000).to_string();
         let client = reqwest::blocking::Client::builder()
             .user_agent(USER_AGENT)
+            .timeout(std::time::Duration::from_secs(10))
             .build()?;
         let mut req = client
             .get("https://apic-desktop.musixmatch.com/ws/1.1/macro.subtitles.get")
@@ -69,7 +70,10 @@ impl LyricsProvider for Musixmatch {
             let spotify_id = format!("spotify:track:{id}");
             req = req.query(&[("track_spotify_id", spotify_id.as_str())]);
         }
-        let resp = req.send()?;
+        let resp = req.send().map_err(|e| anyhow::anyhow!(
+            "musixmatch request failed ({})",
+            if e.is_timeout() { "timeout" } else if e.is_connect() { "connect" } else { "transport" }
+        ))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(None);
@@ -77,7 +81,7 @@ impl LyricsProvider for Musixmatch {
         if !status.is_success() {
             return Ok(None);
         }
-        let text = resp.text()?;
+        let text = resp.text().map_err(|_| anyhow::anyhow!("musixmatch response read failed"))?;
         // Detect captcha / throttle responses (Musixmatch returns 200 with a
         // captcha page or a JSON error when the token is rate-limited).
         if text.contains("\"captcha\"") || text.contains("\"status_code\":401") {

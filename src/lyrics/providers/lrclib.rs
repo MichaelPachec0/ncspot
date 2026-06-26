@@ -53,7 +53,10 @@ impl LyricsProvider for Lrclib {
     }
 
     fn fetch(&self, track: &TrackMeta) -> anyhow::Result<Option<Lyrics>> {
-        let client = reqwest::blocking::Client::builder().user_agent(USER_AGENT).build()?;
+        let client = reqwest::blocking::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
         let mut req = client
             .get("https://lrclib.net/api/get")
             .query(&[

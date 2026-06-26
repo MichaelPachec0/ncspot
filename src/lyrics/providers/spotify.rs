@@ -48,14 +48,21 @@ impl LyricsProvider for SpotifyProvider {
         let Some(id_str) = &track.spotify_id else { return Ok(None) };
         let Some(session) = self.spotify.session() else { return Ok(None) };
         let track_id = SpotifyId::from_base62(id_str)?;
-        let fetched = crate::application::ASYNC_RUNTIME
-            .get()
-            .unwrap()
-            .block_on(LibrespotLyrics::get(&session, &track_id));
+        let fetched = crate::application::ASYNC_RUNTIME.get().unwrap().block_on(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                LibrespotLyrics::get(&session, &track_id),
+            )
+            .await
+        });
         match fetched {
-            Ok(lib) => Ok(Some(from_librespot(&lib))),
-            Err(e) => {
+            Ok(Ok(lib)) => Ok(Some(from_librespot(&lib))),
+            Ok(Err(e)) => {
                 log::debug!("spotify lyrics fetch failed for {id_str}: {e}");
+                Ok(None)
+            }
+            Err(_elapsed) => {
+                log::debug!("spotify lyrics fetch timed out for {id_str}");
                 Ok(None)
             }
         }
