@@ -481,6 +481,7 @@ impl CommandManager {
         kb.insert("F8".into(), vec![Command::Focus("cover".into())]);
         kb.insert("F9".into(), vec![Command::Focus("lyrics".into())]);
         kb.insert("?".into(), vec![Command::Help]);
+        kb.insert("Esc".into(), vec![Command::Back]);
         kb.insert("Backspace".into(), vec![Command::Back]);
 
         kb.insert("o".into(), vec![Command::Open(TargetMode::Selected)]);
