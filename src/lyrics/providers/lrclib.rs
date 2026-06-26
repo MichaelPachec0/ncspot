@@ -46,8 +46,10 @@ impl LyricsProvider for Lrclib {
         ProviderId::Lrclib
     }
 
-    fn enabled(&self, _cfg: &Config) -> bool {
-        true // refined in Task 9 once [lyrics] config exists
+    fn enabled(&self, cfg: &Config) -> bool {
+        let lyrics = cfg.values().lyrics.clone().unwrap_or_default();
+        lyrics.enabled.unwrap_or(true)
+            && lyrics.provider_order().contains(&ProviderId::Lrclib)
     }
 
     fn fetch(&self, track: &TrackMeta) -> anyhow::Result<Option<Lyrics>> {
