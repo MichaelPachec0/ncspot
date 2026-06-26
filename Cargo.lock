@@ -2471,6 +2471,7 @@ dependencies = [
  "ioctl-rs",
  "libc",
  "librespot-core",
+ "librespot-metadata",
  "librespot-oauth",
  "librespot-playback",
  "librespot-protocol",
