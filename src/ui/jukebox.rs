@@ -72,21 +72,85 @@ impl JukeboxView {
         printer.print((x, y), msg);
     }
 
-    fn draw_arc(printer: &Printer, color: ColorStyle, x1: usize, x2: usize, track_row: usize) {
+    /// Distinct colours for non-active branches (the active branch is drawn in
+    /// `jukebox_branch`, i.e. red). Cycled by edge index to give the "web" look.
+    fn edge_colors() -> Vec<ColorStyle> {
+        use cursive::theme::{BaseColor, Color};
+        [
+            BaseColor::Cyan,
+            BaseColor::Green,
+            BaseColor::Yellow,
+            BaseColor::Magenta,
+            BaseColor::Blue,
+        ]
+        .into_iter()
+        .map(|c| {
+            ColorStyle::new(
+                ColorType::Color(Color::Dark(c)),
+                ColorType::Palette(PaletteColor::Background),
+            )
+        })
+        .collect()
+    }
+
+    /// Row at which a branch's bracket apex sits: longer branches arc higher, so the
+    /// stacked brackets spread out instead of overlapping on one row.
+    fn apex_row(track_row: usize, span: usize, width: usize) -> usize {
         if track_row < 2 {
-            return;
+            return 0;
         }
-        let (lo, hi) = (x1.min(x2), x1.max(x2));
-        let arc_row = track_row - 2;
+        let max_lift = track_row - 1;
+        let lift = 1 + span * max_lift.saturating_sub(1) / width.max(1);
+        track_row.saturating_sub(lift).max(1)
+    }
+
+    /// A single branch bracket (╭──╮) at `apex`, in `color`.
+    fn draw_bracket(printer: &Printer, color: ColorStyle, lo: usize, hi: usize, apex: usize) {
         printer.with_color(color, |p| {
-            p.print((lo, arc_row), "╭");
-            p.print((hi, arc_row), "╮");
-            for x in (lo + 1)..hi {
-                p.print((x, arc_row), "─");
+            if lo == hi {
+                p.print((lo, apex), "│");
+                return;
             }
-            p.print((lo, track_row - 1), "│");
-            p.print((hi, track_row - 1), "▼");
+            p.print((lo, apex), "╭");
+            p.print((hi, apex), "╮");
+            for x in (lo + 1)..hi {
+                p.print((x, apex), "─");
+            }
         });
+    }
+
+    /// Draw every branch as a colour-cycled bracket over a horizontal track, with the
+    /// active branch overlaid in `branch` (red) and a ▼ at its destination.
+    fn draw_branches_linear(
+        printer: &Printer,
+        state: &SongState,
+        branch: ColorStyle,
+        total: usize,
+        width: usize,
+        track_row: usize,
+    ) {
+        let palette = Self::edge_colors();
+        let mut edge_i = 0usize;
+        for b in &state.graph.beats {
+            for e in &b.neighbours {
+                let x1 = Self::x_of(e.source, total, width);
+                let x2 = Self::x_of(e.destination, total, width);
+                let (lo, hi) = (x1.min(x2), x1.max(x2));
+                let apex = Self::apex_row(track_row, hi - lo, width);
+                Self::draw_bracket(printer, palette[edge_i % palette.len()], lo, hi, apex);
+                edge_i += 1;
+            }
+        }
+        if let Some(edge) = state.last_branch {
+            let x1 = Self::x_of(edge.source, total, width);
+            let x2 = Self::x_of(edge.destination, total, width);
+            let (lo, hi) = (x1.min(x2), x1.max(x2));
+            let apex = Self::apex_row(track_row, hi - lo, width);
+            Self::draw_bracket(printer, branch, lo, hi, apex);
+            if track_row >= 1 {
+                printer.with_color(branch, |p| p.print((x2, track_row - 1), "▼"));
+            }
+        }
     }
 
     fn draw_line(printer: &Printer, color: ColorStyle, a: (usize, usize), b: (usize, usize)) {
@@ -135,7 +199,6 @@ impl JukeboxView {
             ColorType::Palette(PaletteColor::Background),
         );
         let normal = ColorStyle::primary();
-        let secondary = ColorStyle::secondary();
 
         let status = if self.jukebox.is_enabled() { "▶" } else { "⏸" };
         printer.print((0, 0), &format!("Eternal Jukebox {status}  {}", state.track_title));
@@ -146,17 +209,8 @@ impl JukeboxView {
             let x = Self::x_of(i, total, w);
             printer.with_color(normal, |p| p.print((x, track_row), "─"));
         }
-        for b in &state.graph.beats {
-            if !b.neighbours.is_empty() {
-                let x = Self::x_of(b.index, total, w);
-                printer.with_color(secondary, |p| p.print((x, track_row - 1), "·"));
-            }
-        }
-        if let Some(edge) = state.last_branch {
-            let x1 = Self::x_of(edge.source, total, w);
-            let x2 = Self::x_of(edge.destination, total, w);
-            Self::draw_arc(printer, branch, x1, x2, track_row);
-        }
+
+        Self::draw_branches_linear(printer, state, branch, total, w, track_row);
 
         let cx = Self::x_of(state.current_beat, total, w);
         printer.with_color(cursor, |p| {
@@ -211,6 +265,15 @@ impl JukeboxView {
             let ch = if state.graph.beats[i].neighbours.is_empty() { "·" } else { "◦" };
             printer.with_color(normal, |p| p.print((x, y), ch));
         }
+        // All branches as colour-cycled chords; active branch overlaid in red.
+        let palette = Self::edge_colors();
+        let mut edge_i = 0usize;
+        for b in &state.graph.beats {
+            for e in &b.neighbours {
+                Self::draw_line(printer, palette[edge_i % palette.len()], pos(e.source), pos(e.destination));
+                edge_i += 1;
+            }
+        }
         if let Some(edge) = state.last_branch {
             Self::draw_line(printer, branch, pos(edge.source), pos(edge.destination));
         }
@@ -263,8 +326,21 @@ impl JukeboxView {
         for i in 0..total {
             printer.with_color(normal, |p| p.print((x_of(i), track_row), "─"));
         }
+        // All branches as colour-cycled brackets; active branch overlaid in red.
+        let palette = Self::edge_colors();
+        let mut edge_i = 0usize;
+        for b in &state.graph.beats {
+            for e in &b.neighbours {
+                let (lo, hi) = (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
+                let apex = Self::apex_row(track_row, hi - lo, left_w);
+                Self::draw_bracket(printer, palette[edge_i % palette.len()], lo, hi, apex);
+                edge_i += 1;
+            }
+        }
         if let Some(edge) = state.last_branch {
-            Self::draw_arc(printer, branch, x_of(edge.source), x_of(edge.destination), track_row);
+            let (lo, hi) = (x_of(edge.source).min(x_of(edge.destination)), x_of(edge.source).max(x_of(edge.destination)));
+            let apex = Self::apex_row(track_row, hi - lo, left_w);
+            Self::draw_bracket(printer, branch, lo, hi, apex);
         }
         let cx = x_of(state.current_beat);
         printer.with_color(cursor, |p| {
