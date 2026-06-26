@@ -13,17 +13,45 @@ use crate::jukebox::{Jukebox, SongState, ViewMode};
 use crate::queue::Queue;
 use crate::traits::ViewExt;
 
+#[cfg(feature = "jukebox-graphics")]
+const MAX_PX: usize = 1600;
+
+#[cfg(feature = "jukebox-graphics")]
+#[derive(Clone, PartialEq)]
+struct ImageRequest {
+    offset: Vec2,
+    size: Vec2, // cells
+    key: crate::jukebox::render::RenderKey,
+}
+
 pub struct JukeboxView {
     jukebox: Arc<Jukebox>,
     #[allow(dead_code)]
     queue: Arc<Queue>,
     cfg: Arc<Config>,
     selected_beat: RwLock<Option<usize>>,
+    #[cfg(feature = "jukebox-graphics")]
+    font_size: Vec2,
+    #[cfg(feature = "jukebox-graphics")]
+    desired: RwLock<Option<ImageRequest>>,
+    #[cfg(feature = "jukebox-graphics")]
+    rendered: RwLock<Option<ImageRequest>>,
 }
 
 impl JukeboxView {
     pub fn new(jukebox: Arc<Jukebox>, queue: Arc<Queue>, cfg: Arc<Config>) -> Self {
-        Self { jukebox, queue, cfg, selected_beat: RwLock::new(None) }
+        Self {
+            jukebox,
+            queue,
+            cfg,
+            selected_beat: RwLock::new(None),
+            #[cfg(feature = "jukebox-graphics")]
+            font_size: crate::ui::image_render::font_size(),
+            #[cfg(feature = "jukebox-graphics")]
+            desired: RwLock::new(None),
+            #[cfg(feature = "jukebox-graphics")]
+            rendered: RwLock::new(None),
+        }
     }
 
     /// Whether to draw the full branch web for `layout`, and the cap on branches drawn
@@ -374,12 +402,16 @@ impl JukeboxView {
             p.print((cx, track_row + 1), "▲");
         });
 
+        self.draw_split_panel(printer, state, left_w, total);
+    }
+
+    fn draw_split_panel(&self, printer: &Printer, state: &SongState, left_w: usize, total: usize) {
         let px = left_w + 2;
+        let panel_w = 22usize;
         let title: String = state.track_title.chars().take(panel_w - 2).collect();
         printer.print((px, 1), "Now Playing");
         printer.print((px, 2), &title);
         printer.print((px, 4), &format!("Beat   {}/{}", state.current_beat + 1, total));
-        printer.print((px, 9), &format!("Played {}", state.beats_played));
         printer.print((px, 5), &format!("Branch {:.0}%", state.branch_chance * 100.0));
         printer.print((px, 6), &format!("Jumps  {}", state.jumps));
         let mins = state.listen_time_ms / 60000;
@@ -388,19 +420,124 @@ impl JukeboxView {
         if state.bouncing {
             printer.print((px, 8), "[bounce]");
         }
+        printer.print((px, 9), &format!("Played {}", state.beats_played));
+    }
+
+    #[cfg(feature = "jukebox-graphics")]
+    fn want_graphics(&self) -> bool {
+        self.jukebox.graphics_enabled() && crate::ui::image_render::terminal_supports_graphics()
+    }
+
+    #[cfg(feature = "jukebox-graphics")]
+    fn draw_graphics(&self, printer: &Printer, state: &SongState) {
+        let w = printer.size.x;
+        let h = printer.size.y;
+        if w == 0 || h < 2 || state.graph.beats.is_empty() {
+            *self.desired.write().unwrap() = None;
+            self.draw_linear(printer, state);
+            return;
+        }
+        let mode = self.jukebox.view_mode();
+        let total = state.graph.beats.len();
+
+        let (region, layout_name) = match mode {
+            ViewMode::Split => {
+                let left_w = w.saturating_sub(22 + 1);
+                for y in 0..h {
+                    printer.print((left_w, y), "│");
+                }
+                self.draw_split_panel(printer, state, left_w, total);
+                (Vec2::new(left_w, h), "split")
+            }
+            ViewMode::Radial => {
+                printer.print((0, h - 1), &Self::stats_line(state));
+                (Vec2::new(w, h - 1), "radial")
+            }
+            ViewMode::Linear => {
+                printer.print((0, h - 1), &Self::stats_line(state));
+                (Vec2::new(w, h - 1), "linear")
+            }
+        };
+
+        for y in 0..region.y {
+            printer.print_hline((0, y), region.x, " ");
+        }
+
+        let (show_web, max) = self.branch_render(layout_name);
+        let key = crate::jukebox::render::render_key(
+            state,
+            mode,
+            true,
+            (region.x, region.y),
+            self.jukebox.is_enabled(),
+            show_web,
+            max,
+        );
+        *self.desired.write().unwrap() =
+            Some(ImageRequest { offset: printer.offset, size: region, key });
+    }
+
+    #[cfg(feature = "jukebox-graphics")]
+    pub fn render_to_terminal(&self) {
+        let desired = self.desired.read().unwrap().clone();
+        let mut rendered = self.rendered.write().unwrap();
+        if *rendered == desired {
+            return;
+        }
+        if let Some(old) = rendered.as_ref() {
+            crate::ui::image_render::clear_terminal_area(old.offset, old.size);
+        }
+        if let Some(req) = desired.as_ref()
+            && let Some(state) = self.jukebox.state()
+        {
+            let size_px = (
+                (req.size.x * self.font_size.x).min(MAX_PX) as u32,
+                (req.size.y * self.font_size.y).min(MAX_PX) as u32,
+            );
+            let img = crate::jukebox::render::render(
+                &state,
+                req.key.mode,
+                size_px,
+                req.key.show_web,
+                req.key.max,
+            );
+            if let Err(e) = blit_image(&img, req.offset, req.size) {
+                log::warn!("jukebox graphics blit failed: {e}");
+            }
+        }
+        *rendered = desired;
     }
 }
 
 impl View for JukeboxView {
     fn draw(&self, printer: &Printer<'_, '_>) {
         let Some(state) = self.jukebox.state() else {
+            #[cfg(feature = "jukebox-graphics")]
+            {
+                *self.desired.write().unwrap() = None;
+            }
             Self::draw_status(printer, "Jukebox is off. Run :jukeboxtoggle to start.");
             return;
         };
         if state.no_analysis {
+            #[cfg(feature = "jukebox-graphics")]
+            {
+                *self.desired.write().unwrap() = None;
+            }
             Self::draw_status(printer, "No analysis available for this track.");
             return;
         }
+
+        #[cfg(feature = "jukebox-graphics")]
+        if self.want_graphics() {
+            self.draw_graphics(printer, &state);
+            return;
+        }
+        #[cfg(feature = "jukebox-graphics")]
+        {
+            *self.desired.write().unwrap() = None;
+        }
+
         match self.jukebox.view_mode() {
             ViewMode::Linear => self.draw_linear(printer, &state),
             ViewMode::Radial => self.draw_radial(printer, &state),
@@ -454,6 +591,16 @@ impl ViewExt for JukeboxView {
         "Jukebox".to_string()
     }
 
+    fn on_leave(&self) {
+        #[cfg(feature = "jukebox-graphics")]
+        {
+            if let Some(old) = self.rendered.write().unwrap().take() {
+                crate::ui::image_render::clear_terminal_area(old.offset, old.size);
+            }
+            *self.desired.write().unwrap() = None;
+        }
+    }
+
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         match cmd {
             Command::JukeboxViewCycle => {
@@ -483,4 +630,23 @@ impl ViewExt for JukeboxView {
             _ => Ok(CommandResult::Ignored),
         }
     }
+}
+
+#[cfg(feature = "jukebox-graphics")]
+fn blit_image(img: &image::RgbaImage, offset: Vec2, size: Vec2) -> Result<(), viuer::ViuError> {
+    let config = viuer::Config {
+        x: u16::try_from(offset.x)
+            .map_err(|_| viuer::ViuError::InvalidConfiguration("x too large".into()))?,
+        y: i16::try_from(offset.y)
+            .map_err(|_| viuer::ViuError::InvalidConfiguration("y too large".into()))?,
+        width: Some(size.x as u32),
+        height: Some(size.y as u32),
+        absolute_offset: true,
+        restore_cursor: true,
+        use_kitty: crate::ui::image_render::can_use_kitty_graphics(),
+        use_sixel: !crate::ui::image_render::is_iterm_terminal(),
+        ..Default::default()
+    };
+    let dynimg = image::DynamicImage::ImageRgba8(img.clone());
+    viuer::print(&dynimg, &config).map(|_| ())
 }

@@ -304,6 +304,11 @@ impl Application {
                 .call_on_name("cover", |view: &mut ui::cover::CoverView| {
                     view.render_to_terminal();
                 });
+            #[cfg(feature = "jukebox-graphics")]
+            self.cursive
+                .call_on_name("jukebox", |view: &mut ui::jukebox::JukeboxView| {
+                    view.render_to_terminal();
+                });
             #[cfg(unix)]
             for signal in signals.pending() {
                 if signal == SIGTERM || signal == SIGHUP {

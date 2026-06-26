@@ -40,6 +40,9 @@ pub fn terminal_supports_graphics() -> bool {
     can_use_kitty_graphics() || is_iterm_terminal()
 }
 
+// Currently only the cover renderer fits an externally-sized image to cells; the jukebox
+// renderer sizes its own image. Kept here as a shared helper for both.
+#[cfg_attr(not(feature = "cover"), allow(dead_code))]
 pub fn fit_image_to_cells(
     available_size: Vec2,
     font_size: Vec2,
