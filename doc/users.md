@@ -198,7 +198,9 @@ When built with the `jukebox-graphics` feature, the visualizer can render as a r
 (smooth circle, anti-aliased branches) on terminals that support the kitty graphics protocol,
 iTerm2, or sixel. Toggle it at runtime with <kbd>g</kbd> or `:jukeboxgraphics`; it falls back
 to the ASCII renderer when off or unsupported. Set the startup default with `[jukebox]
-graphics` (default `true` when the feature is compiled).
+graphics` (default `true` when the feature is compiled). The image panel uses your theme's
+background colour; if you keep the default `TerminalDefault` background it falls back to
+black, so set `[theme] background` to a concrete colour if you want the panel to blend.
 
 ### Vim-Like Commands
 You can open a Vim-style command prompt using <kbd>:</kbd>, and close it at any

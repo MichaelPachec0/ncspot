@@ -22,6 +22,44 @@ struct ImageRequest {
     offset: Vec2,
     size: Vec2, // cells
     key: crate::jukebox::render::RenderKey,
+    bg: [u8; 4], // opaque image background, from the theme
+}
+
+/// Convert a cursive theme colour to opaque RGBA for the image background. Concrete colours
+/// map directly; terminal-palette colours use standard ANSI approximations; `TerminalDefault`
+/// (whose real RGB is unknown to us) falls back to black, a safe dark backdrop.
+#[cfg(feature = "jukebox-graphics")]
+fn theme_bg_rgba(color: cursive::theme::Color) -> [u8; 4] {
+    use cursive::theme::{BaseColor, Color};
+    let base = |b: BaseColor, light: bool| -> [u8; 3] {
+        match (b, light) {
+            (BaseColor::Black, false) => [0, 0, 0],
+            (BaseColor::Red, false) => [205, 0, 0],
+            (BaseColor::Green, false) => [0, 205, 0],
+            (BaseColor::Yellow, false) => [205, 205, 0],
+            (BaseColor::Blue, false) => [0, 0, 238],
+            (BaseColor::Magenta, false) => [205, 0, 205],
+            (BaseColor::Cyan, false) => [0, 205, 205],
+            (BaseColor::White, false) => [229, 229, 229],
+            (BaseColor::Black, true) => [127, 127, 127],
+            (BaseColor::Red, true) => [255, 0, 0],
+            (BaseColor::Green, true) => [0, 255, 0],
+            (BaseColor::Yellow, true) => [255, 255, 0],
+            (BaseColor::Blue, true) => [92, 92, 255],
+            (BaseColor::Magenta, true) => [255, 0, 255],
+            (BaseColor::Cyan, true) => [0, 255, 255],
+            (BaseColor::White, true) => [255, 255, 255],
+        }
+    };
+    let low = |v: u8| ((v as u16 * 51).min(255)) as u8;
+    let [r, g, b] = match color {
+        Color::Rgb(r, g, b) => [r, g, b],
+        Color::RgbLowRes(r, g, b) => [low(r), low(g), low(b)],
+        Color::Dark(c) => base(c, false),
+        Color::Light(c) => base(c, true),
+        Color::TerminalDefault => [0, 0, 0],
+    };
+    [r, g, b, 255]
 }
 
 pub struct JukeboxView {
@@ -477,8 +515,9 @@ impl JukeboxView {
             show_web,
             max,
         );
+        let bg = theme_bg_rgba(printer.theme.palette[PaletteColor::Background]);
         *self.desired.write().unwrap() =
-            Some(ImageRequest { offset: printer.offset, size: region, key });
+            Some(ImageRequest { offset: printer.offset, size: region, key, bg });
     }
 
     #[cfg(feature = "jukebox-graphics")]
@@ -518,6 +557,7 @@ impl JukeboxView {
                         size_px,
                         req.key.show_web,
                         req.key.max,
+                        req.bg,
                     );
                     if let Err(e) = blit_image(&img, req.offset, req.size) {
                         log::warn!("jukebox graphics blit failed: {e}");

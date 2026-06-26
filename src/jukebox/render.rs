@@ -154,10 +154,6 @@ use crate::jukebox::{SongState, ViewMode};
 
 const SS: u32 = 2; // supersample factor
 
-/// Opaque background so a freshly blitted image fully covers the previous one (no flicker)
-/// without a delete-then-redraw clear between frames.
-const BACKGROUND: [u8; 4] = [0, 0, 0, 255];
-
 // Full-intensity branch colours (not dimmed in graphics mode).
 const PALETTE: [[u8; 4]; 5] = [
     [0, 200, 200, 255],  // cyan
@@ -224,16 +220,20 @@ fn non_active_edges(state: &SongState, show_web: bool, max: usize) -> Vec<(usize
     out
 }
 
+/// `bg` is the opaque background colour (RGBA): a freshly blitted image fully covers the
+/// previous one without a delete-then-redraw clear. Threaded from the cursive theme so the
+/// panel matches the terminal background.
 pub fn render(
     state: &SongState,
     mode: ViewMode,
     size_px: (u32, u32),
     show_web: bool,
     max: usize,
+    bg: [u8; 4],
 ) -> RgbaImage {
     let (w, h) = (size_px.0.max(1), size_px.1.max(1));
     let (bw, bh) = (w * SS, h * SS);
-    let mut img = RgbaImage::from_pixel(bw, bh, Rgba(BACKGROUND));
+    let mut img = RgbaImage::from_pixel(bw, bh, Rgba(bg));
 
     if !state.graph.beats.is_empty() {
         match mode {
@@ -343,21 +343,21 @@ mod render_tests {
 
     #[test]
     fn render_produces_requested_dimensions() {
-        let img = render(&state_with_active_branch(), ViewMode::Radial, (120, 60), true, 0);
+        let img = render(&state_with_active_branch(), ViewMode::Radial, (120, 60), true, 0, [0, 0, 0, 255]);
         assert_eq!(img.dimensions(), (120, 60));
     }
 
     #[test]
     fn render_is_non_empty() {
-        let img = render(&state_with_active_branch(), ViewMode::Radial, (120, 60), true, 0);
+        let img = render(&state_with_active_branch(), ViewMode::Radial, (120, 60), true, 0, [0, 0, 0, 255]);
         assert!(img.pixels().any(|p| p.0[3] > 0));
     }
 
     #[test]
     fn render_is_deterministic() {
         let s = state_with_active_branch();
-        let a = render(&s, ViewMode::Linear, (120, 40), true, 0);
-        let b = render(&s, ViewMode::Linear, (120, 40), true, 0);
+        let a = render(&s, ViewMode::Linear, (120, 40), true, 0, [0, 0, 0, 255]);
+        let b = render(&s, ViewMode::Linear, (120, 40), true, 0, [0, 0, 0, 255]);
         assert_eq!(a.into_raw(), b.into_raw());
     }
 
