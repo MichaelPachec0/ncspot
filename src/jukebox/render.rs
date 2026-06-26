@@ -154,15 +154,20 @@ use crate::jukebox::{SongState, ViewMode};
 
 const SS: u32 = 2; // supersample factor
 
+/// Opaque background so a freshly blitted image fully covers the previous one (no flicker)
+/// without a delete-then-redraw clear between frames.
+const BACKGROUND: [u8; 4] = [0, 0, 0, 255];
+
+// Full-intensity branch colours (not dimmed in graphics mode).
 const PALETTE: [[u8; 4]; 5] = [
-    [0, 110, 110, 200], // dim cyan
-    [0, 110, 0, 200],   // dim green
-    [120, 95, 0, 200],  // dim amber
-    [110, 0, 110, 200], // dim magenta
-    [60, 60, 140, 200], // dim blue
+    [0, 200, 200, 255],  // cyan
+    [0, 200, 0, 255],    // green
+    [225, 175, 0, 255],  // amber
+    [200, 0, 200, 255],  // magenta
+    [90, 90, 235, 255],  // blue
 ];
-const ACTIVE: [u8; 4] = [220, 40, 40, 255]; // red (matches jukebox_branch intent)
-const CURSOR: [u8; 4] = [60, 220, 90, 255]; // green (matches jukebox_cursor intent)
+const ACTIVE: [u8; 4] = [235, 45, 45, 255]; // red (matches jukebox_branch intent)
+const CURSOR: [u8; 4] = [60, 225, 95, 255]; // green (matches jukebox_cursor intent)
 const BEAT: [u8; 4] = [150, 150, 150, 255];
 const BEAT_BRANCH: [u8; 4] = [205, 205, 205, 255];
 
@@ -228,7 +233,7 @@ pub fn render(
 ) -> RgbaImage {
     let (w, h) = (size_px.0.max(1), size_px.1.max(1));
     let (bw, bh) = (w * SS, h * SS);
-    let mut img = RgbaImage::new(bw, bh);
+    let mut img = RgbaImage::from_pixel(bw, bh, Rgba(BACKGROUND));
 
     if !state.graph.beats.is_empty() {
         match mode {

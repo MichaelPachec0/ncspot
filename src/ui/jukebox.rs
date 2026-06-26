@@ -36,6 +36,8 @@ pub struct JukeboxView {
     desired: RwLock<Option<ImageRequest>>,
     #[cfg(feature = "jukebox-graphics")]
     rendered: RwLock<Option<ImageRequest>>,
+    #[cfg(feature = "jukebox-graphics")]
+    blit_count: std::sync::atomic::AtomicU32,
 }
 
 impl JukeboxView {
@@ -51,6 +53,8 @@ impl JukeboxView {
             desired: RwLock::new(None),
             #[cfg(feature = "jukebox-graphics")]
             rendered: RwLock::new(None),
+            #[cfg(feature = "jukebox-graphics")]
+            blit_count: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -479,30 +483,51 @@ impl JukeboxView {
 
     #[cfg(feature = "jukebox-graphics")]
     pub fn render_to_terminal(&self) {
+        use std::sync::atomic::Ordering;
+
         let desired = self.desired.read().unwrap().clone();
         let mut rendered = self.rendered.write().unwrap();
         if *rendered == desired {
             return;
         }
-        if let Some(old) = rendered.as_ref() {
-            crate::ui::image_render::clear_terminal_area(old.offset, old.size);
-        }
-        if let Some(req) = desired.as_ref()
-            && let Some(state) = self.jukebox.state()
-        {
-            let size_px = (
-                (req.size.x * self.font_size.x).min(MAX_PX) as u32,
-                (req.size.y * self.font_size.y).min(MAX_PX) as u32,
-            );
-            let img = crate::jukebox::render::render(
-                &state,
-                req.key.mode,
-                size_px,
-                req.key.show_web,
-                req.key.max,
-            );
-            if let Err(e) = blit_image(&img, req.offset, req.size) {
-                log::warn!("jukebox graphics blit failed: {e}");
+
+        // The image has an opaque background, so a new blit at the same rect fully covers the
+        // previous one — no clear needed (clearing every beat is what caused the flicker).
+        // Only clear (delete all images) when the rect changes, when leaving graphics, or
+        // periodically to flush accumulated kitty images.
+        let rect_changed = match (rendered.as_ref(), desired.as_ref()) {
+            (Some(o), Some(n)) => o.offset != n.offset || o.size != n.size,
+            _ => true,
+        };
+
+        match desired.as_ref() {
+            Some(req) => {
+                let n = self.blit_count.fetch_add(1, Ordering::Relaxed);
+                if rect_changed || n.is_multiple_of(48) {
+                    let clear = rendered.as_ref().unwrap_or(req);
+                    crate::ui::image_render::clear_terminal_area(clear.offset, clear.size);
+                }
+                if let Some(state) = self.jukebox.state() {
+                    let size_px = (
+                        (req.size.x * self.font_size.x).min(MAX_PX) as u32,
+                        (req.size.y * self.font_size.y).min(MAX_PX) as u32,
+                    );
+                    let img = crate::jukebox::render::render(
+                        &state,
+                        req.key.mode,
+                        size_px,
+                        req.key.show_web,
+                        req.key.max,
+                    );
+                    if let Err(e) = blit_image(&img, req.offset, req.size) {
+                        log::warn!("jukebox graphics blit failed: {e}");
+                    }
+                }
+            }
+            None => {
+                if let Some(old) = rendered.as_ref() {
+                    crate::ui::image_render::clear_terminal_area(old.offset, old.size);
+                }
             }
         }
         *rendered = desired;
