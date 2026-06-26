@@ -103,24 +103,21 @@ impl JukeboxView {
         printer.print((x, y), msg);
     }
 
-    /// Distinct colours for non-active branches (the active branch is drawn in
-    /// `jukebox_branch`, i.e. red). Cycled by edge index to give the "web" look.
+    /// Distinct, intentionally dim colours for non-active branches (the active branch is
+    /// drawn brightly in `jukebox_branch`, i.e. red). Cycled by edge index to give the
+    /// "web" look without competing with the active branch. Truecolor terminals (kitty,
+    /// etc.) render these exactly; 256-colour terminals map to the nearest shade.
     fn edge_colors() -> Vec<ColorStyle> {
-        use cursive::theme::{BaseColor, Color};
+        use cursive::theme::Color;
         [
-            BaseColor::Cyan,
-            BaseColor::Green,
-            BaseColor::Yellow,
-            BaseColor::Magenta,
-            BaseColor::Blue,
+            Color::Rgb(0, 80, 80),    // dim cyan
+            Color::Rgb(0, 80, 0),     // dim green
+            Color::Rgb(90, 70, 0),    // dim amber
+            Color::Rgb(80, 0, 80),    // dim magenta
+            Color::Rgb(40, 40, 100),  // dim blue
         ]
         .into_iter()
-        .map(|c| {
-            ColorStyle::new(
-                ColorType::Color(Color::Dark(c)),
-                ColorType::Palette(PaletteColor::Background),
-            )
-        })
+        .map(|c| ColorStyle::new(ColorType::Color(c), ColorType::Palette(PaletteColor::Background)))
         .collect()
     }
 
@@ -270,8 +267,13 @@ impl JukeboxView {
         }
         let cx = w as f64 / 2.0;
         let cy = h as f64 / 2.0;
-        let rx = (w as f64 / 2.0 - 2.0).max(1.0);
-        let ry = (h as f64 / 2.0 - 2.0).max(1.0);
+        // Terminal cells are ~twice as tall as wide, so a round circle needs the column
+        // radius to be ~2x the row radius. Pick the largest round radius that fits both.
+        const CELL_ASPECT: f64 = 2.0;
+        let r_rows = (h as f64 / 2.0 - 1.0).max(1.0);
+        let r_cols = (w as f64 / 2.0 - 1.0).max(1.0);
+        let ry = r_rows.min(r_cols / CELL_ASPECT);
+        let rx = ry * CELL_ASPECT;
         let pos = |i: usize| -> (usize, usize) {
             let ang = std::f64::consts::TAU * i as f64 / total as f64 - std::f64::consts::FRAC_PI_2;
             let x = (cx + rx * ang.cos()).round().clamp(0.0, (w - 1) as f64) as usize;
