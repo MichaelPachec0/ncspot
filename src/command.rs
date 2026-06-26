@@ -164,6 +164,7 @@ pub enum Command {
     LyricsRefetch,
     LyricsCopyLine,
     LyricsCopyAll,
+    JukeboxToggle,
 }
 
 impl fmt::Display for Command {
@@ -235,7 +236,8 @@ impl fmt::Display for Command {
             | Self::LyricsProviderCycle
             | Self::LyricsRefetch
             | Self::LyricsCopyLine
-            | Self::LyricsCopyAll => vec![],
+            | Self::LyricsCopyAll
+            | Self::JukeboxToggle => vec![],
         };
         repr_tokens.append(&mut extras_args);
         write!(f, "{}", repr_tokens.join(" "))
@@ -296,6 +298,7 @@ impl Command {
             Self::LyricsRefetch => "lyricsrefetch",
             Self::LyricsCopyLine => "lyricscopyline",
             Self::LyricsCopyAll => "lyricscopyall",
+            Self::JukeboxToggle => "jukeboxtoggle",
         }
     }
 }
@@ -810,6 +813,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "lyricsrefetch" => Command::LyricsRefetch,
                 "lyricscopyline" => Command::LyricsCopyLine,
                 "lyricscopyall" => Command::LyricsCopyAll,
+                "jukeboxtoggle" => Command::JukeboxToggle,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),

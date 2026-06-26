@@ -177,12 +177,26 @@ impl Application {
             None
         };
 
+        let jukebox_analysis = Arc::new(crate::jukebox::analysis::AnalysisManager::new(
+            vec![Box::new(crate::jukebox::analysis::SpclientSource {
+                spotify: Arc::new(spotify.clone()),
+            })],
+            crate::jukebox::analysis::AnalysisCache::new(crate::config::cache_path("jukebox")),
+        ));
+        let jukebox = crate::jukebox::Jukebox::new(
+            queue.clone(),
+            jukebox_analysis,
+            event_manager.clone(),
+            configuration.clone(),
+        );
+
         let mut cmd_manager = CommandManager::new(
             spotify.clone(),
             queue.clone(),
             library.clone(),
             configuration.clone(),
             event_manager.clone(),
+            jukebox.clone(),
         );
 
         cmd_manager.register_all();

@@ -43,6 +43,7 @@ pub struct CommandManager {
     library: Arc<Library>,
     config: Arc<Config>,
     events: EventManager,
+    jukebox: Arc<crate::jukebox::Jukebox>,
 }
 
 impl CommandManager {
@@ -52,6 +53,7 @@ impl CommandManager {
         library: Arc<Library>,
         config: Arc<Config>,
         events: EventManager,
+        jukebox: Arc<crate::jukebox::Jukebox>,
     ) -> Self {
         let bindings = RefCell::new(Self::get_bindings(&config));
         Self {
@@ -62,6 +64,7 @@ impl CommandManager {
             library,
             config,
             events,
+            jukebox,
         }
     }
 
@@ -109,6 +112,11 @@ impl CommandManager {
     ) -> Result<Option<String>, String> {
         match cmd {
             Command::Noop => Ok(None),
+            Command::JukeboxToggle => {
+                let on = self.jukebox.toggle();
+                info!("Jukebox {}", if on { "enabled" } else { "disabled" });
+                Ok(None)
+            }
             Command::Quit => {
                 let queue = self.queue.queue.read().unwrap();
                 self.config.with_state_mut(move |s| {
