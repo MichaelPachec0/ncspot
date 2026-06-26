@@ -8,6 +8,7 @@ use cursive::{Printer, Vec2, View};
 use crate::command::Command;
 use crate::commands::CommandResult;
 use crate::config::Config;
+use crate::jukebox::graph::Edge;
 use crate::jukebox::{Jukebox, SongState, ViewMode};
 use crate::queue::Queue;
 use crate::traits::ViewExt;
@@ -16,7 +17,6 @@ pub struct JukeboxView {
     jukebox: Arc<Jukebox>,
     #[allow(dead_code)]
     queue: Arc<Queue>,
-    #[allow(dead_code)]
     cfg: Arc<Config>,
     selected_beat: RwLock<Option<usize>>,
 }
@@ -24,6 +24,37 @@ pub struct JukeboxView {
 impl JukeboxView {
     pub fn new(jukebox: Arc<Jukebox>, queue: Arc<Queue>, cfg: Arc<Config>) -> Self {
         Self { jukebox, queue, cfg, selected_beat: RwLock::new(None) }
+    }
+
+    /// Whether to draw the full branch web for `layout`, and the cap on branches drawn
+    /// (0 = unlimited). Read live from `[jukebox]` config each draw.
+    fn branch_render(&self, layout: &str) -> (bool, usize) {
+        let jb = self.cfg.values().jukebox.clone().unwrap_or_default();
+        let show_all = jb.show_all_branches.unwrap_or(true);
+        let layouts = jb.branch_layouts.unwrap_or_else(|| {
+            vec!["linear".to_string(), "radial".to_string(), "split".to_string()]
+        });
+        let show_web = show_all && layouts.iter().any(|l| l == layout);
+        (show_web, jb.max_branches_drawn.unwrap_or(0))
+    }
+
+    /// The non-active branch edges to draw (respecting the layout toggle and cap), each
+    /// paired with a palette index. Empty when the web is disabled for this layout.
+    fn web_edges(state: &SongState, show_web: bool, max: usize) -> Vec<(usize, Edge)> {
+        if !show_web {
+            return Vec::new();
+        }
+        let mut out: Vec<(usize, Edge)> = Vec::new();
+        for b in &state.graph.beats {
+            for e in &b.neighbours {
+                if max != 0 && out.len() >= max {
+                    return out;
+                }
+                let i = out.len();
+                out.push((i, *e));
+            }
+        }
+        out
     }
 
     fn x_of(beat: usize, total: usize, width: usize) -> usize {
@@ -128,18 +159,15 @@ impl JukeboxView {
         total: usize,
         width: usize,
         track_row: usize,
+        edges: &[(usize, Edge)],
     ) {
         let palette = Self::edge_colors();
-        let mut edge_i = 0usize;
-        for b in &state.graph.beats {
-            for e in &b.neighbours {
-                let x1 = Self::x_of(e.source, total, width);
-                let x2 = Self::x_of(e.destination, total, width);
-                let (lo, hi) = (x1.min(x2), x1.max(x2));
-                let apex = Self::apex_row(track_row, hi - lo, width);
-                Self::draw_bracket(printer, palette[edge_i % palette.len()], lo, hi, apex);
-                edge_i += 1;
-            }
+        for &(i, e) in edges {
+            let x1 = Self::x_of(e.source, total, width);
+            let x2 = Self::x_of(e.destination, total, width);
+            let (lo, hi) = (x1.min(x2), x1.max(x2));
+            let apex = Self::apex_row(track_row, hi - lo, width);
+            Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex);
         }
         if let Some(edge) = state.last_branch {
             let x1 = Self::x_of(edge.source, total, width);
@@ -210,7 +238,9 @@ impl JukeboxView {
             printer.with_color(normal, |p| p.print((x, track_row), "─"));
         }
 
-        Self::draw_branches_linear(printer, state, branch, total, w, track_row);
+        let (show_web, max) = self.branch_render("linear");
+        let edges = Self::web_edges(state, show_web, max);
+        Self::draw_branches_linear(printer, state, branch, total, w, track_row, &edges);
 
         let cx = Self::x_of(state.current_beat, total, w);
         printer.with_color(cursor, |p| {
@@ -266,13 +296,10 @@ impl JukeboxView {
             printer.with_color(normal, |p| p.print((x, y), ch));
         }
         // All branches as colour-cycled chords; active branch overlaid in red.
+        let (show_web, max) = self.branch_render("radial");
         let palette = Self::edge_colors();
-        let mut edge_i = 0usize;
-        for b in &state.graph.beats {
-            for e in &b.neighbours {
-                Self::draw_line(printer, palette[edge_i % palette.len()], pos(e.source), pos(e.destination));
-                edge_i += 1;
-            }
+        for (i, e) in Self::web_edges(state, show_web, max) {
+            Self::draw_line(printer, palette[i % palette.len()], pos(e.source), pos(e.destination));
         }
         if let Some(edge) = state.last_branch {
             Self::draw_line(printer, branch, pos(edge.source), pos(edge.destination));
@@ -327,15 +354,12 @@ impl JukeboxView {
             printer.with_color(normal, |p| p.print((x_of(i), track_row), "─"));
         }
         // All branches as colour-cycled brackets; active branch overlaid in red.
+        let (show_web, max) = self.branch_render("split");
         let palette = Self::edge_colors();
-        let mut edge_i = 0usize;
-        for b in &state.graph.beats {
-            for e in &b.neighbours {
-                let (lo, hi) = (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
-                let apex = Self::apex_row(track_row, hi - lo, left_w);
-                Self::draw_bracket(printer, palette[edge_i % palette.len()], lo, hi, apex);
-                edge_i += 1;
-            }
+        for (i, e) in Self::web_edges(state, show_web, max) {
+            let (lo, hi) = (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
+            let apex = Self::apex_row(track_row, hi - lo, left_w);
+            Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex);
         }
         if let Some(edge) = state.last_branch {
             let (lo, hi) = (x_of(edge.source).min(x_of(edge.destination)), x_of(edge.source).max(x_of(edge.destination)));

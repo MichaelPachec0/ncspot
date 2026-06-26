@@ -148,6 +148,10 @@ pub struct JukeboxConfig {
     pub max_play_time_secs: Option<u64>,
     pub analysis_sources: Option<Vec<String>>,
     pub eternalbox_url: Option<String>,
+    // Visualizer dials.
+    pub show_all_branches: Option<bool>,
+    pub max_branches_drawn: Option<usize>,
+    pub branch_layouts: Option<Vec<String>>,
 }
 
 impl JukeboxConfig {

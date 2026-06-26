@@ -594,6 +594,17 @@ analysis_sources = ["spclient", "eternalbox"]
 
 # Base URL of the eternalbox fallback instance.
 eternalbox_url = "https://eternalbox.dev"
+
+# Visualizer: draw the full branch graph ("web"). false = only the active branch.
+show_all_branches = true
+
+# Cap how many branches are drawn (0 = unlimited). Lower this to reduce clutter on
+# songs with many branches.
+max_branches_drawn = 0
+
+# Which layouts draw the full web; others show only the active branch.
+# Valid values: "linear", "radial", "split". (The radial layout reads cleanest when dense.)
+branch_layouts = ["linear", "radial", "split"]
 ```
 
 Analysis comes from Spotify's internal client endpoint first; if that has no data for a track,
