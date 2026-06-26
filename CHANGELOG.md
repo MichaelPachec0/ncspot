@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Draw cover art directly in supported terminals using terminal image
   protocols, falling back to block rendering when unsupported
+- Eternal Jukebox mode (<kbd>F10</kbd> / `:jukeboxtoggle`): play the current
+  track endlessly by seeking between similar beats, with a three-layout TUI
+  visualizer, a live settings modal, and a configurable eternalbox fallback
 
 ### Fixed
 

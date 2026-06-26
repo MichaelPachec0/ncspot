@@ -74,6 +74,7 @@ playback depending on your desktop environment settings. Have a look at the
 | <kbd>F3</kbd>     | Library (See [specific commands](#library)).                                  |
 | <kbd>F8</kbd>     | Album Art (if built with the `cover` feature).                                |
 | <kbd>F9</kbd>     | Lyrics (See [specific commands](#lyrics)).                                    |
+| <kbd>F10</kbd>    | Jukebox (See [specific commands](#jukebox)).                                  |
 | <kbd>/</kbd>      | Open a Vim-like search bar (See [specific commands](#vim-like-search-bar)).   |
 | <kbd>:</kbd>      | Open a Vim-like command prompt (See [specific commands](#vim-like-commands)). |
 | <kbd>Escape</kbd> | Close Vim-like search bar, command prompt, or Search screen.                  |
@@ -171,6 +172,25 @@ The underlying commands (`lyricsscrollup`, `lyricsscrolldown`, `lyricsoffset`, `
 `lyricsrefetch`, `lyricscopyline`, `lyricscopyall`) can be bound to any key via `[keybindings]`.
 Each interaction can be individually disabled via the `allow_*` fields in `[lyrics]`
 (see [Lyrics settings](#lyrics-settings)).
+
+### Jukebox
+The Eternal Jukebox plays the current track endlessly by seeking between similar-sounding
+beats. Toggle it from anywhere with `:jukeboxtoggle`, and open the visualizer with
+<kbd>F10</kbd> or `:focus jukebox`. These keys are active while the jukebox screen is focused.
+
+| Key                          | Command                                                       |
+|------------------------------|---------------------------------------------------------------|
+| <kbd>h</kbd> / <kbd>←</kbd> | Move the beat cursor left.                                     |
+| <kbd>l</kbd> / <kbd>→</kbd> | Move the beat cursor right.                                    |
+| <kbd>Enter</kbd>             | Seek to the selected beat.                                     |
+| <kbd>v</kbd>                 | Cycle the layout (linear track → radial ring → split panel).  |
+| <kbd>b</kbd>                 | Toggle "bounce" (repeat the current section).                 |
+| <kbd>i</kbd>                 | Toggle endless mode.                                           |
+
+The underlying commands (`jukeboxtoggle`, `jukeboxview`, `jukeboxbounce`, `jukeboxseek`,
+`jukeboxsettings`) can be bound to any key via `[keybindings]`. Analysis is fetched from
+Spotify's internal client endpoint, with a configurable eternalbox.dev fallback; tracks
+without analysis (local files, podcasts) cannot be jukeboxed. See [Jukebox settings](#jukebox-settings).
 
 ### Vim-Like Commands
 You can open a Vim-style command prompt using <kbd>:</kbd>, and close it at any
@@ -288,6 +308,7 @@ Possible configuration values are:
 | `[theme]`                       | Custom theme                                                   | See [custom theme](#theming)                                                          |                     |
 | `[keybindings]`                 | Custom keybindings                                             | See [custom keybindings](#custom-keybindings)                                         |                     |
 | `[lyrics]`                      | Lyrics feature settings                                        | See [lyrics settings](#lyrics-settings)                                               |                     |
+| `[jukebox]`                     | Eternal Jukebox settings                                       | See [jukebox settings](#jukebox-settings)                                             |                     |
 | `ap_port`                       | Set ap-port for librespot (for restrictive firewalls)          | `80`, `443`, `4070`                                                                   |                     |
 
 1. If built with the `cover` feature.
@@ -526,6 +547,58 @@ example, to bind <kbd>p</kbd> to cycle providers and <kbd>r</kbd> to re-fetch:
 "p" = "lyricsprovider"
 "r" = "lyricsrefetch"
 ```
+
+### Jukebox Settings
+The Eternal Jukebox finds pathways through similar beats of a song and plays a never-ending,
+ever-changing version of it. Open the jukebox screen with <kbd>F10</kbd> or `:focus jukebox`,
+and toggle endless mode with `:jukeboxtoggle`. All settings are optional; the defaults match
+the original. They can also be tuned live for the session via the in-app settings modal
+(`:jukeboxsettings`).
+
+```toml
+[jukebox]
+# Set to true to start with endless mode already on.
+enabled = false
+
+# Maximum allowed "distance" between two beats for a branch. Higher = more branches.
+branch_similarity_threshold = 30
+
+# Ignore the fixed threshold and pick one dynamically to hit a target branch count.
+dynamic_threshold = false
+
+# Branch probability ramps from min to max, rising by the ramp value each non-branching beat.
+min_branch_probability = 0.18
+max_branch_probability = 0.5
+branch_probability_ramp = 0.018
+
+# Only add branches that go backward in the song.
+only_backward_branches = false
+
+# Only add long branches (covering at least a fifth of the song).
+only_long_branches = false
+
+# Remove consecutive branches of the same length.
+remove_sequential_branches = false
+
+# Add the best long backward branch at the last branch point (helps avoid short loops).
+add_last_branch = true
+
+# Always branch at the last possible point so the song keeps looping.
+always_follow_last_branch = true
+
+# Stop branching after this many seconds of jukebox playback (0 = never stop).
+max_play_time_secs = 0
+
+# Order of analysis sources to try. Valid values: "spclient", "eternalbox".
+analysis_sources = ["spclient", "eternalbox"]
+
+# Base URL of the eternalbox fallback instance.
+eternalbox_url = "https://eternalbox.dev"
+```
+
+Analysis comes from Spotify's internal client endpoint first; if that has no data for a track,
+the configurable eternalbox instance is tried (it only serves songs it has already analyzed).
+Tracks without analysis, such as local files and podcasts, cannot be jukeboxed.
 
 ## Authentication
 `ncspot` uses OAuth2 for authentication. When launched for the first time, a link will be generated
