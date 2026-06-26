@@ -2459,6 +2459,7 @@ dependencies = [
 name = "ncspot"
 version = "1.3.4"
 dependencies = [
+ "anyhow",
  "arboard",
  "chrono",
  "clap",
@@ -3681,6 +3682,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
