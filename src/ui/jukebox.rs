@@ -13,8 +13,10 @@ use crate::jukebox::{Jukebox, SongState, ViewMode};
 use crate::queue::Queue;
 use crate::traits::ViewExt;
 
+/// Default cap on the blitted image's longest edge, in pixels. Larger = sharper but heavier
+/// to transmit each frame. Overridable via `[jukebox] graphics_max_px`.
 #[cfg(feature = "jukebox-graphics")]
-const MAX_PX: usize = 720;
+const DEFAULT_MAX_PX: usize = 1280;
 
 /// Minimum interval between image blits. Each blit writes the whole image to the terminal
 /// synchronously in the UI loop, so an uncapped rate (e.g. during rapid branching) starves
@@ -567,11 +569,19 @@ impl JukeboxView {
                     crate::ui::image_render::clear_terminal_area(clear.offset, clear.size);
                 }
                 if let Some(state) = self.jukebox.state() {
-                    // Cap the longest edge to MAX_PX while preserving aspect (independent
+                    // Cap the longest edge to max_px while preserving aspect (independent
                     // capping would distort the circle); viuer scales it to the cell box.
+                    let max_px = self
+                        .cfg
+                        .values()
+                        .jukebox
+                        .as_ref()
+                        .and_then(|j| j.graphics_max_px)
+                        .unwrap_or(DEFAULT_MAX_PX)
+                        .max(1);
                     let px_w = (req.size.x * self.font_size.x).max(1);
                     let px_h = (req.size.y * self.font_size.y).max(1);
-                    let scale = (MAX_PX as f64 / px_w.max(px_h) as f64).min(1.0);
+                    let scale = (max_px as f64 / px_w.max(px_h) as f64).min(1.0);
                     let size_px = (
                         ((px_w as f64 * scale) as u32).max(1),
                         ((px_h as f64 * scale) as u32).max(1),

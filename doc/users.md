@@ -620,6 +620,11 @@ branch_layouts = ["linear", "radial", "split"]
 # feature). Renders the visualizer as a real image on kitty/iTerm2/sixel terminals.
 # Toggle live with `g` / :jukeboxgraphics.
 graphics = true
+
+# Maximum pixel size (longest edge) of the rendered graphics image. Larger is sharper but
+# heavier to transmit each frame: raise it if the image looks soft, lower it if input feels
+# laggy while in graphics mode.
+graphics_max_px = 1280
 ```
 
 Analysis comes from Spotify's internal client endpoint first; if that has no data for a track,
