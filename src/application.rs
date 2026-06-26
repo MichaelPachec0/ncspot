@@ -207,6 +207,7 @@ impl Application {
                 Box::new(crate::lyrics::providers::spotify::SpotifyProvider {
                     spotify: Arc::new(spotify.clone()),
                 }),
+                Box::new(crate::lyrics::providers::netease::Netease),
             ],
             crate::lyrics::cache::LyricsCache::new(crate::config::cache_path("lyrics")),
         ));
