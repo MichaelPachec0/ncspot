@@ -102,6 +102,7 @@ pub struct ConfigValues {
     pub hide_display_names: Option<bool>,
     pub ap_port: Option<u16>,
     pub lyrics: Option<LyricsConfig>,
+    pub jukebox: Option<JukeboxConfig>,
 }
 
 /// Configuration for the lyrics feature.
@@ -126,6 +127,35 @@ impl LyricsConfig {
         match &self.providers {
             Some(list) => list.iter().filter_map(|s| ProviderId::from_str(s)).collect(),
             None => vec![ProviderId::Lrclib, ProviderId::Spotify, ProviderId::Netease, ProviderId::Musixmatch],
+        }
+    }
+}
+
+/// Configuration for the Eternal Jukebox feature.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct JukeboxConfig {
+    pub enabled: Option<bool>,
+    pub branch_similarity_threshold: Option<u32>,
+    pub dynamic_threshold: Option<bool>,
+    pub min_branch_probability: Option<f64>,
+    pub max_branch_probability: Option<f64>,
+    pub branch_probability_ramp: Option<f64>,
+    pub only_backward_branches: Option<bool>,
+    pub only_long_branches: Option<bool>,
+    pub remove_sequential_branches: Option<bool>,
+    pub add_last_branch: Option<bool>,
+    pub always_follow_last_branch: Option<bool>,
+    pub max_play_time_secs: Option<u64>,
+    pub analysis_sources: Option<Vec<String>>,
+    pub eternalbox_url: Option<String>,
+}
+
+impl JukeboxConfig {
+    /// Ordered analysis source ids, defaulting to spclient then the eternalbox fallback.
+    pub fn analysis_source_order(&self) -> Vec<String> {
+        match &self.analysis_sources {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec!["spclient".to_string(), "eternalbox".to_string()],
         }
     }
 }
@@ -418,5 +448,17 @@ mod lyrics_cfg_tests {
             c2.provider_order(),
             vec![crate::lyrics::model::ProviderId::Netease, crate::lyrics::model::ProviderId::Lrclib]
         );
+    }
+
+    #[test]
+    fn jukebox_analysis_source_order_defaults_and_overrides() {
+        let c = crate::config::JukeboxConfig::default();
+        assert_eq!(c.analysis_source_order(), vec!["spclient", "eternalbox"]);
+
+        let c2 = crate::config::JukeboxConfig {
+            analysis_sources: Some(vec!["spclient".into()]),
+            ..Default::default()
+        };
+        assert_eq!(c2.analysis_source_order(), vec!["spclient"]);
     }
 }

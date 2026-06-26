@@ -2469,6 +2469,7 @@ dependencies = [
  "cursive",
  "fern",
  "futures",
+ "http",
  "image",
  "ioctl-rs",
  "libc",
