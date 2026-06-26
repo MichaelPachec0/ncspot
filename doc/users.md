@@ -73,6 +73,7 @@ playback depending on your desktop environment settings. Have a look at the
 | <kbd>F2</kbd>     | Search.                                                                       |
 | <kbd>F3</kbd>     | Library (See [specific commands](#library)).                                  |
 | <kbd>F8</kbd>     | Album Art (if built with the `cover` feature).                                |
+| <kbd>F9</kbd>     | Lyrics (See [specific commands](#lyrics)).                                    |
 | <kbd>/</kbd>      | Open a Vim-like search bar (See [specific commands](#vim-like-search-bar)).   |
 | <kbd>:</kbd>      | Open a Vim-like command prompt (See [specific commands](#vim-like-commands)). |
 | <kbd>Escape</kbd> | Close Vim-like search bar or command prompt.                                  |
@@ -153,6 +154,24 @@ When pressing <kbd>O</kbd>:
 | <kbd>n</kbd> | Previous search occurrence. |
 | <kbd>N</kbd> | Next search occurrence.     |
 
+### Lyrics
+These keys are active only while the lyrics screen is focused (<kbd>F9</kbd> or `:focus lyrics`).
+The `[` and `]` keys override their global volume-change meaning on this screen.
+
+| Key                           | Command                                                                 |
+|-------------------------------|-------------------------------------------------------------------------|
+| <kbd>j</kbd> / <kbd>↓</kbd>  | Scroll down one line (manual override of auto-follow).                  |
+| <kbd>k</kbd> / <kbd>↑</kbd>  | Scroll up one line.                                                     |
+| <kbd>[</kbd>                  | Shift sync offset back by 500 ms.                                       |
+| <kbd>]</kbd>                  | Shift sync offset forward by 500 ms.                                    |
+| <kbd>y</kbd>                  | Copy the current line to the system clipboard.                          |
+| <kbd>Y</kbd>                  | Copy all lyrics to the system clipboard.                                |
+
+The underlying commands (`lyricsscrollup`, `lyricsscrolldown`, `lyricsoffset`, `lyricsprovider`,
+`lyricsrefetch`, `lyricscopyline`, `lyricscopyall`) can be bound to any key via `[keybindings]`.
+Each interaction can be individually disabled via the `allow_*` fields in `[lyrics]`
+(see [Lyrics settings](#lyrics-settings)).
+
 ### Vim-Like Commands
 You can open a Vim-style command prompt using <kbd>:</kbd>, and close it at any
 time with <kbd>Escape</kbd>.
@@ -174,7 +193,7 @@ Note: \<FOO\> - mandatory arg; [BAR] - optional arg
 | `shuffle` [`on`\|`off`]                                          | Enable or disable shuffle. Omit argument to toggle.                                                                                                                                                                                                             |
 | `previous`                                                       | Play the previous track.                                                                                                                                                                                                                                        |
 | `next`                                                           | Play the next track.                                                                                                                                                                                                                                            |
-| `focus` \<SCREEN\>                                               | Switch to a different view.<br/>\* Valid values for SCREEN: `queue`, `search`, `library`, `cover` (if built with the `cover` feature)                                                                                                                           |
+| `focus` \<SCREEN\>                                               | Switch to a different view.<br/>\* Valid values for SCREEN: `queue`, `search`, `library`, `cover` (if built with the `cover` feature), `lyrics`                                                                                                                 |
 | `search` \<SEARCH\>                                              | Search for a song/artist/album/etc.                                                                                                                                                                                                                             |
 | `clear`                                                          | Clear the queue.                                                                                                                                                                                                                                                |
 | `share` \<ITEM\>                                                 | Copy a shareable URL of the item to the system clipboard. Requires the `share_clipboard` feature.<br/>\* Valid values for ITEM: `selected`, `current`                                                                                                           |
@@ -268,6 +287,7 @@ Possible configuration values are:
 | `[notification_format]`         | Set the text displayed in notifications<sup>[4]</sup>          | See [notification formatting](#notification-formatting)                               |                     |
 | `[theme]`                       | Custom theme                                                   | See [custom theme](#theming)                                                          |                     |
 | `[keybindings]`                 | Custom keybindings                                             | See [custom keybindings](#custom-keybindings)                                         |                     |
+| `[lyrics]`                      | Lyrics feature settings                                        | See [lyrics settings](#lyrics-settings)                                               |                     |
 | `ap_port`                       | Set ap-port for librespot (for restrictive firewalls)          | `80`, `443`, `4070`                                                                   |                     |
 
 1. If built with the `cover` feature.
@@ -353,6 +373,8 @@ statusbar_bg = "green"
 cmdline = "light white"
 cmdline_bg = "black"
 search_match = "light red"
+lyrics_highlight = "green"
+lyrics_secondary = "light black"
 ```
 
 More examples can be found in [this pull request](https://github.com/hrkfdn/ncspot/pull/40).
@@ -449,6 +471,60 @@ scaling beyond the image's native resolution, use the config key
 
 ```toml
 cover_max_scale = 2
+```
+
+### Lyrics Settings
+The lyrics feature fetches and displays synced and plain-text lyrics for the currently playing
+track. Open the lyrics screen with <kbd>F9</kbd> or `:focus lyrics`.
+
+```toml
+[lyrics]
+# Set to false to disable the lyrics feature entirely.
+enabled = true
+
+# Provider search order. Remove an entry to skip that provider entirely.
+# Valid values: "lrclib", "spotify", "netease", "musixmatch"
+providers = ["lrclib", "spotify", "netease", "musixmatch"]
+
+# User-supplied Musixmatch token. Musixmatch is skipped unless a non-empty token is set here.
+# musixmatch_token = "your_token_here"
+
+# Show provider-supplied translation lines beneath each original line (when available).
+show_translation = true
+
+# Show provider-supplied romaji lines beneath each original line (when available).
+show_romaji = true
+
+# Perform client-side romanization for Chinese (pinyin) and Korean (Hangul) when
+# the provider supplies no romaji of its own.
+romanize_client_side = true
+
+# Remember the sync offset across track changes and sessions.
+persist_offset = true
+
+# Allow j/k scrolling (manual override of the auto-follow behavior).
+allow_scroll = true
+
+# Allow [ / ] to adjust the sync offset.
+allow_offset = true
+
+# Allow cycling to the next provider via the lyricsprovider command.
+allow_provider_switch = true
+
+# Allow copying lyrics to the clipboard (y / Y keys, or lyricscopyline / lyricscopyall commands).
+allow_copy = true
+```
+
+The `musixmatch_token` field is intentionally optional and opt-in: Musixmatch will not be
+contacted unless you supply a token. Tokens can be obtained from the Musixmatch developer portal.
+
+To rebind any in-page action, use `[keybindings]` with the corresponding command name. For
+example, to bind <kbd>p</kbd> to cycle providers and <kbd>r</kbd> to re-fetch:
+
+```toml
+[keybindings]
+"p" = "lyricsprovider"
+"r" = "lyricsrefetch"
 ```
 
 ## Authentication
