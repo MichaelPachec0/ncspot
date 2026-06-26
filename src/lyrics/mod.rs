@@ -34,6 +34,10 @@ impl LyricsManager {
         raw.replace(['/', '\\'], "_")
     }
 
+    pub fn invalidate(&self, track: &TrackMeta) {
+        self.cache.remove(&Self::cache_key(track));
+    }
+
     pub fn fetch(&self, cfg: &Config, order: &[ProviderId], track: &TrackMeta) -> FetchOutcome {
         let key = Self::cache_key(track);
         if let Some(hit) = self.cache.get(&key) {

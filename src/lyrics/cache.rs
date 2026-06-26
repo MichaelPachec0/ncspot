@@ -35,6 +35,11 @@ impl LyricsCache {
             let _ = std::fs::write(self.path(key), json);
         }
     }
+
+    pub fn remove(&self, key: &str) {
+        self.mem.write().unwrap().remove(key);
+        let _ = std::fs::remove_file(self.path(key));
+    }
 }
 
 #[cfg(test)]
@@ -65,6 +70,25 @@ mod tests {
         let c2 = LyricsCache::new(dir.clone());
         assert_eq!(c2.get("abc"), Some(sample()));
         assert_eq!(c2.get("missing"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_clears_memory_and_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "ncspot-lyrics-test-remove-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Write entry to disk.
+        {
+            let c = LyricsCache::new(dir.clone());
+            c.put("key1", &sample());
+            c.remove("key1");
+        }
+        // Fresh instance (empty memory) must find nothing on disk.
+        let c2 = LyricsCache::new(dir.clone());
+        assert_eq!(c2.get("key1"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

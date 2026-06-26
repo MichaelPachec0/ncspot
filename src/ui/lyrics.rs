@@ -404,6 +404,9 @@ impl ViewExt for LyricsView {
                 Ok(CommandResult::Consumed(None))
             }
             Command::LyricsRefetch => {
+                if let Some(meta) = self.track_meta() {
+                    self.manager.invalidate(&meta);
+                }
                 self.force_refetch();
                 Ok(CommandResult::Consumed(None))
             }
