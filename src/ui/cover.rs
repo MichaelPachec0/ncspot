@@ -1,13 +1,15 @@
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::PathBuf;
 
 use std::sync::{Arc, RwLock};
 
 use cursive::theme::{ColorStyle, ColorType, PaletteColor};
 use cursive::{Cursive, Printer, Vec2, View};
-use ioctl_rs::{TIOCGWINSZ, ioctl};
 use log::{debug, error};
+
+use crate::ui::image_render::{
+    can_use_kitty_graphics, clear_terminal_area, fit_image_to_cells, font_size, is_iterm_terminal,
+};
 
 use crate::command::{Command, GotoMode};
 use crate::commands::CommandResult;
@@ -38,26 +40,7 @@ struct CoverRequest {
 
 impl CoverView {
     pub fn new(queue: Arc<Queue>, library: Arc<Library>, config: &Config) -> Self {
-        // Determine size of window both in pixels and chars
-        let (rows, cols, xpixels, ypixels) = unsafe {
-            let mut query: (u16, u16, u16, u16) = (0, 0, 0, 0);
-            ioctl(1, TIOCGWINSZ, &mut query);
-            query
-        };
-
-        debug!("Determined window dimensions: {xpixels}x{ypixels}, {cols}x{rows}");
-
-        // Determine font size. Some terminals report physical pixels here, but
-        // the aspect ratio is still useful when mapping images to terminal cells.
-        let font_size = if cols == 0 || rows == 0 || xpixels == 0 || ypixels == 0 {
-            Vec2::new(8, 16)
-        } else {
-            Vec2::new(
-                std::cmp::max(1, xpixels / cols) as usize,
-                std::cmp::max(1, ypixels / rows) as usize,
-            )
-        };
-
+        let font_size = font_size();
         debug!("Determined font size: {}x{}", font_size.x, font_size.y);
 
         Self {
@@ -197,63 +180,6 @@ fn render_cover_to_terminal(cover: &CoverRequest) -> Result<(), viuer::ViuError>
         .decode()?;
 
     viuer::print(&image, &config).map(|_| ())
-}
-
-fn is_iterm_terminal() -> bool {
-    std::env::var("TERM_PROGRAM").is_ok_and(|term| term.contains("iTerm"))
-        || std::env::var("LC_TERMINAL").is_ok_and(|term| term.contains("iTerm"))
-}
-
-fn is_apple_terminal() -> bool {
-    std::env::var("TERM_PROGRAM").is_ok_and(|term| term == "Apple_Terminal")
-}
-
-fn can_use_kitty_graphics() -> bool {
-    !is_apple_terminal()
-}
-
-fn fit_image_to_cells(
-    available_size: Vec2,
-    font_size: Vec2,
-    image_width: u32,
-    image_height: u32,
-) -> Vec2 {
-    if available_size.x == 0 || available_size.y == 0 || font_size.x == 0 || font_size.y == 0 {
-        return Vec2::new(0, 0);
-    }
-
-    let image_aspect = image_width as f32 / image_height as f32;
-    let cell_aspect = font_size.x as f32 / font_size.y as f32;
-    let width_for_full_height =
-        (available_size.y as f32 * image_aspect / cell_aspect).floor() as usize;
-
-    if width_for_full_height <= available_size.x {
-        Vec2::new(std::cmp::max(1, width_for_full_height), available_size.y)
-    } else {
-        let height_for_full_width =
-            (available_size.x as f32 * cell_aspect / image_aspect).floor() as usize;
-        Vec2::new(available_size.x, std::cmp::max(1, height_for_full_width))
-    }
-}
-
-fn clear_terminal_area(offset: Vec2, size: Vec2) {
-    let mut stdout = std::io::stdout();
-
-    // Remove stateful Kitty graphics where that protocol is available, then
-    // overwrite the cells used by other protocols/fallbacks.
-    if can_use_kitty_graphics() {
-        let _ = stdout.write_all(b"\x1b_Ga=d,d=A\x1b\\");
-    }
-    for y in offset.y..offset.y + size.y {
-        let _ = write!(
-            stdout,
-            "\x1b[{};{}H{}",
-            y + 1,
-            offset.x + 1,
-            " ".repeat(size.x)
-        );
-    }
-    let _ = stdout.flush();
 }
 
 fn to_u16(value: usize) -> Result<u16, viuer::ViuError> {
