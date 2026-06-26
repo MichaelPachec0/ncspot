@@ -157,6 +157,13 @@ pub enum Command {
     Redraw,
     Execute(String),
     Reconnect,
+    LyricsScrollUp,
+    LyricsScrollDown,
+    LyricsOffset(i64),
+    LyricsProviderCycle,
+    LyricsRefetch,
+    LyricsCopyLine,
+    LyricsCopyAll,
 }
 
 impl fmt::Display for Command {
@@ -199,6 +206,7 @@ impl fmt::Display for Command {
             Self::Sort(key, direction) => vec![key.to_string(), direction.to_string()],
             Self::ShowRecommendations(mode) => vec![mode.to_string()],
             Self::Execute(cmd) => vec![cmd.to_owned()],
+            Self::LyricsOffset(delta) => vec![delta.to_string()],
             Self::Quit
             | Self::TogglePlay
             | Self::Stop
@@ -221,7 +229,13 @@ impl fmt::Display for Command {
             | Self::Noop
             | Self::Logout
             | Self::Reconnect
-            | Self::Redraw => vec![],
+            | Self::Redraw
+            | Self::LyricsScrollUp
+            | Self::LyricsScrollDown
+            | Self::LyricsProviderCycle
+            | Self::LyricsRefetch
+            | Self::LyricsCopyLine
+            | Self::LyricsCopyAll => vec![],
         };
         repr_tokens.append(&mut extras_args);
         write!(f, "{}", repr_tokens.join(" "))
@@ -275,6 +289,13 @@ impl Command {
             Self::Redraw => "redraw",
             Self::Execute(_) => "exec",
             Self::Reconnect => "reconnect",
+            Self::LyricsScrollUp => "lyricsscrollup",
+            Self::LyricsScrollDown => "lyricsscrolldown",
+            Self::LyricsOffset(_) => "lyricsoffset",
+            Self::LyricsProviderCycle => "lyricsprovider",
+            Self::LyricsRefetch => "lyricsrefetch",
+            Self::LyricsCopyLine => "lyricscopyline",
+            Self::LyricsCopyAll => "lyricscopyall",
         }
     }
 }
@@ -780,6 +801,15 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "redraw" => Command::Redraw,
                 "exec" => Command::Execute(args.join(" ")),
                 "reconnect" => Command::Reconnect,
+                "lyricsscrollup" => Command::LyricsScrollUp,
+                "lyricsscrolldown" => Command::LyricsScrollDown,
+                "lyricsoffset" => Command::LyricsOffset(
+                    args.first().and_then(|a| a.parse().ok()).unwrap_or(100),
+                ),
+                "lyricsprovider" => Command::LyricsProviderCycle,
+                "lyricsrefetch" => Command::LyricsRefetch,
+                "lyricscopyline" => Command::LyricsCopyLine,
+                "lyricscopyall" => Command::LyricsCopyAll,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),

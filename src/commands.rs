@@ -316,7 +316,14 @@ impl CommandManager {
             | Command::Jump(_)
             | Command::Insert(_)
             | Command::ShowRecommendations(_)
-            | Command::Sort(_, _) => Err(format!(
+            | Command::Sort(_, _)
+            | Command::LyricsScrollUp
+            | Command::LyricsScrollDown
+            | Command::LyricsOffset(_)
+            | Command::LyricsProviderCycle
+            | Command::LyricsRefetch
+            | Command::LyricsCopyLine
+            | Command::LyricsCopyAll => Err(format!(
                 "The command \"{}\" is unsupported in this view",
                 cmd.basename()
             )),
@@ -472,6 +479,7 @@ impl CommandManager {
         kb.insert("F3".into(), vec![Command::Focus("library".into())]);
         #[cfg(feature = "cover")]
         kb.insert("F8".into(), vec![Command::Focus("cover".into())]);
+        kb.insert("F9".into(), vec![Command::Focus("lyrics".into())]);
         kb.insert("?".into(), vec![Command::Help]);
         kb.insert("Backspace".into(), vec![Command::Back]);
 
