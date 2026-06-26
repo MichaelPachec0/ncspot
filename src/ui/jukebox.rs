@@ -14,7 +14,13 @@ use crate::queue::Queue;
 use crate::traits::ViewExt;
 
 #[cfg(feature = "jukebox-graphics")]
-const MAX_PX: usize = 1600;
+const MAX_PX: usize = 720;
+
+/// Minimum interval between image blits. Each blit writes the whole image to the terminal
+/// synchronously in the UI loop, so an uncapped rate (e.g. during rapid branching) starves
+/// keyboard input. The pending frame is kept and blitted on a later tick.
+#[cfg(feature = "jukebox-graphics")]
+const MIN_BLIT_INTERVAL_MS: u128 = 200;
 
 #[cfg(feature = "jukebox-graphics")]
 #[derive(Clone, PartialEq)]
@@ -76,6 +82,8 @@ pub struct JukeboxView {
     rendered: RwLock<Option<ImageRequest>>,
     #[cfg(feature = "jukebox-graphics")]
     blit_count: std::sync::atomic::AtomicU32,
+    #[cfg(feature = "jukebox-graphics")]
+    last_blit: std::sync::Mutex<std::time::Instant>,
 }
 
 impl JukeboxView {
@@ -93,6 +101,8 @@ impl JukeboxView {
             rendered: RwLock::new(None),
             #[cfg(feature = "jukebox-graphics")]
             blit_count: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(feature = "jukebox-graphics")]
+            last_blit: std::sync::Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -541,15 +551,30 @@ impl JukeboxView {
 
         match desired.as_ref() {
             Some(req) => {
+                // Rate-limit: keep `desired` and blit it on a later tick if we blitted too
+                // recently. Avoids starving keyboard input on fast-changing songs.
+                {
+                    let mut last = self.last_blit.lock().unwrap();
+                    if last.elapsed().as_millis() < MIN_BLIT_INTERVAL_MS {
+                        return;
+                    }
+                    *last = std::time::Instant::now();
+                }
+
                 let n = self.blit_count.fetch_add(1, Ordering::Relaxed);
                 if rect_changed || n.is_multiple_of(48) {
                     let clear = rendered.as_ref().unwrap_or(req);
                     crate::ui::image_render::clear_terminal_area(clear.offset, clear.size);
                 }
                 if let Some(state) = self.jukebox.state() {
+                    // Cap the longest edge to MAX_PX while preserving aspect (independent
+                    // capping would distort the circle); viuer scales it to the cell box.
+                    let px_w = (req.size.x * self.font_size.x).max(1);
+                    let px_h = (req.size.y * self.font_size.y).max(1);
+                    let scale = (MAX_PX as f64 / px_w.max(px_h) as f64).min(1.0);
                     let size_px = (
-                        (req.size.x * self.font_size.x).min(MAX_PX) as u32,
-                        (req.size.y * self.font_size.y).min(MAX_PX) as u32,
+                        ((px_w as f64 * scale) as u32).max(1),
+                        ((px_h as f64 * scale) as u32).max(1),
                     );
                     let img = crate::jukebox::render::render(
                         &state,

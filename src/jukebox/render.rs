@@ -242,7 +242,9 @@ pub fn render(
         }
     }
 
-    image::imageops::resize(&img, w, h, FilterType::Lanczos3)
+    // Triangle (bilinear) is much cheaper than Lanczos3 and, after the 2x supersample, still
+    // smooths the edges well — important because this runs on each beat in the UI loop.
+    image::imageops::resize(&img, w, h, FilterType::Triangle)
 }
 
 fn draw_radial(img: &mut RgbaImage, state: &SongState, w: u32, h: u32, show_web: bool, max: usize) {
