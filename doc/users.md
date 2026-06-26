@@ -76,7 +76,7 @@ playback depending on your desktop environment settings. Have a look at the
 | <kbd>F9</kbd>     | Lyrics (See [specific commands](#lyrics)).                                    |
 | <kbd>/</kbd>      | Open a Vim-like search bar (See [specific commands](#vim-like-search-bar)).   |
 | <kbd>:</kbd>      | Open a Vim-like command prompt (See [specific commands](#vim-like-commands)). |
-| <kbd>Escape</kbd> | Close Vim-like search bar or command prompt.                                  |
+| <kbd>Escape</kbd> | Close Vim-like search bar, command prompt, or Search screen.                  |
 | <kbd>Q</kbd>      | Quit `ncspot`.                                                                |
 | <kbd>g</kbd>      | Go to the top of the current view (Vim motion).                               |
 | <kbd>G</kbd>      | Go to the bottom of the current view (Vim motion).                            |
