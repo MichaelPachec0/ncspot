@@ -178,9 +178,20 @@ impl Application {
         };
 
         let jukebox_analysis = Arc::new(crate::jukebox::analysis::AnalysisManager::new(
-            vec![Box::new(crate::jukebox::analysis::SpclientSource {
-                spotify: Arc::new(spotify.clone()),
-            })],
+            vec![
+                Box::new(crate::jukebox::analysis::SpclientSource {
+                    spotify: Arc::new(spotify.clone()),
+                }),
+                Box::new(crate::jukebox::analysis::EternalboxSource {
+                    base_url: configuration
+                        .values()
+                        .jukebox
+                        .clone()
+                        .unwrap_or_default()
+                        .eternalbox_url
+                        .unwrap_or_else(|| "https://eternalbox.dev".to_string()),
+                }),
+            ],
             crate::jukebox::analysis::AnalysisCache::new(crate::config::cache_path("jukebox")),
         ));
         let jukebox = crate::jukebox::Jukebox::new(

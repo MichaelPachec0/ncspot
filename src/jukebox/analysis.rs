@@ -95,6 +95,48 @@ impl AnalysisSource for SpclientSource {
     }
 }
 
+/// Eternalbox wraps the Spotify analysis under an `analysis` key. The inner object's field
+/// names match `AudioAnalysis`, so it deserializes directly.
+#[derive(serde::Deserialize)]
+struct EternalboxResponse {
+    analysis: AudioAnalysis,
+}
+
+/// Fallback source: a public eternalbox instance (configurable). Serves only already-cached
+/// analyses (non-200 for un-analyzed tracks -> treated as "no analysis").
+pub struct EternalboxSource {
+    pub base_url: String,
+}
+
+impl AnalysisSource for EternalboxSource {
+    fn id(&self) -> &str {
+        "eternalbox"
+    }
+
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn fetch(&self, track_id: &str) -> anyhow::Result<Option<AudioAnalysis>> {
+        let url = format!(
+            "{}/api/analysis/analyse/{track_id}",
+            self.base_url.trim_end_matches('/')
+        );
+        let resp = reqwest::blocking::Client::new()
+            .get(&url)
+            .timeout(Duration::from_secs(10))
+            .send()?;
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let parsed: EternalboxResponse = resp.json()?;
+        if parsed.analysis.beats.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(parsed.analysis))
+    }
+}
+
 pub struct AnalysisManager {
     sources: Vec<Box<dyn AnalysisSource>>,
     cache: AnalysisCache,
@@ -178,6 +220,24 @@ mod tests {
         assert_eq!(c2.get("abc").unwrap().beats.len(), 1);
         assert!(c2.get("missing").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn eternalbox_wrapped_payload_parses() {
+        let json = r#"{
+            "analysis": {
+                "beats": [{"start": 0.0, "duration": 0.5, "confidence": 0.9}],
+                "segments": [{
+                    "start": 0.0, "duration": 0.3, "confidence": 0.6,
+                    "loudness_start": -20.0, "loudness_max": -5.0,
+                    "loudness_max_time": 0.1, "loudness_end": 0.0,
+                    "pitches": [0.1], "timbre": [1.0]
+                }]
+            }
+        }"#;
+        let parsed: EternalboxResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.analysis.beats.len(), 1);
+        assert_eq!(parsed.analysis.segments[0].timbre, vec![1.0]);
     }
 
     #[test]
