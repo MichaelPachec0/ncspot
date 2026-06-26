@@ -2,6 +2,8 @@ pub mod analysis;
 pub mod driver;
 pub mod graph;
 pub mod model;
+#[cfg(feature = "jukebox-graphics")]
+pub mod render;
 pub mod remixer;
 pub mod settings;
 
