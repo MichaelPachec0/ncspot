@@ -101,6 +101,33 @@ pub struct ConfigValues {
     pub library_tabs: Option<Vec<LibraryTab>>,
     pub hide_display_names: Option<bool>,
     pub ap_port: Option<u16>,
+    pub lyrics: Option<LyricsConfig>,
+}
+
+/// Configuration for the lyrics feature.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct LyricsConfig {
+    pub enabled: Option<bool>,
+    pub providers: Option<Vec<String>>,
+    pub musixmatch_token: Option<String>,
+    pub show_translation: Option<bool>,
+    pub show_romaji: Option<bool>,
+    pub romanize_client_side: Option<bool>,
+    pub persist_offset: Option<bool>,
+    pub allow_scroll: Option<bool>,
+    pub allow_offset: Option<bool>,
+    pub allow_provider_switch: Option<bool>,
+    pub allow_copy: Option<bool>,
+}
+
+impl LyricsConfig {
+    pub fn provider_order(&self) -> Vec<crate::lyrics::model::ProviderId> {
+        use crate::lyrics::model::ProviderId;
+        match &self.providers {
+            Some(list) => list.iter().filter_map(|s| ProviderId::from_str(s)).collect(),
+            None => vec![ProviderId::Lrclib, ProviderId::Spotify, ProviderId::Netease, ProviderId::Musixmatch],
+        }
+    }
 }
 
 /// The ncspot theme.
@@ -125,6 +152,8 @@ pub struct ConfigTheme {
     pub cmdline: Option<String>,
     pub cmdline_bg: Option<String>,
     pub search_match: Option<String>,
+    pub lyrics_highlight: Option<String>,
+    pub lyrics_secondary: Option<String>,
 }
 
 /// The ordering that is used when representing a playlist.
@@ -364,5 +393,30 @@ pub fn set_configuration_base_path(base_path: Option<PathBuf>) {
             fs::create_dir_all(&basepath).expect("could not create basepath directory");
         }
         *BASE_PATH.write().unwrap() = Some(basepath);
+    }
+}
+
+#[cfg(test)]
+mod lyrics_cfg_tests {
+    #[test]
+    fn lyrics_provider_order_defaults_and_parses() {
+        let c = crate::config::LyricsConfig::default();
+        assert_eq!(
+            c.provider_order(),
+            vec![
+                crate::lyrics::model::ProviderId::Lrclib,
+                crate::lyrics::model::ProviderId::Spotify,
+                crate::lyrics::model::ProviderId::Netease,
+                crate::lyrics::model::ProviderId::Musixmatch,
+            ]
+        );
+        let c2 = crate::config::LyricsConfig {
+            providers: Some(vec!["netease".into(), "lrclib".into(), "bogus".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            c2.provider_order(),
+            vec![crate::lyrics::model::ProviderId::Netease, crate::lyrics::model::ProviderId::Lrclib]
+        );
     }
 }

@@ -200,6 +200,28 @@ impl Application {
         #[cfg(feature = "cover")]
         let coverview = ui::cover::CoverView::new(queue.clone(), library.clone(), &configuration);
 
+        // Lyrics is not feature-gated; register it unconditionally.
+        let lyrics_manager = Arc::new(crate::lyrics::LyricsManager::new(
+            vec![
+                Box::new(crate::lyrics::providers::lrclib::Lrclib),
+                Box::new(crate::lyrics::providers::spotify::SpotifyProvider {
+                    spotify: Arc::new(spotify.clone()),
+                }),
+                Box::new(crate::lyrics::providers::netease::Netease),
+                Box::new(crate::lyrics::providers::musixmatch::Musixmatch {
+                    token: configuration.values().lyrics.clone().unwrap_or_default()
+                        .musixmatch_token.unwrap_or_default(),
+                }),
+            ],
+            crate::lyrics::cache::LyricsCache::new(crate::config::cache_path("lyrics")),
+        ));
+        let lyricsview = ui::lyrics::LyricsView::new(
+            queue.clone(),
+            configuration.clone(),
+            event_manager.clone(),
+            lyrics_manager,
+        );
+
         let status = ui::statusbar::StatusBar::new(queue.clone(), Arc::clone(&library));
 
         let mut layout =
@@ -210,6 +232,8 @@ impl Application {
 
         #[cfg(feature = "cover")]
         layout.add_screen("cover", coverview.with_name("cover"));
+
+        layout.add_screen("lyrics", lyricsview.with_name("lyrics"));
 
         // initial screen is library
         let initial_screen = configuration

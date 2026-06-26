@@ -81,6 +81,14 @@ pub fn load(theme_cfg: &Option<ConfigTheme>) -> Theme {
         "search_match",
         load_color!(theme_cfg, search_match, Light(Red)),
     );
+    palette.set_color(
+        "lyrics_highlight",
+        load_color!(theme_cfg, lyrics_highlight, Light(Yellow)),
+    );
+    palette.set_color(
+        "lyrics_secondary",
+        load_color!(theme_cfg, lyrics_secondary, Dark(White)),
+    );
 
     Theme {
         shadow: false,

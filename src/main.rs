@@ -19,6 +19,7 @@ mod config;
 mod events;
 mod ext_traits;
 mod library;
+mod lyrics;
 mod model;
 mod panic;
 mod queue;

@@ -67,6 +67,9 @@ pub struct Spotify {
     since: Arc<RwLock<Option<SystemTime>>>,
     /// Channel to send commands to the worker thread.
     channel: Arc<RwLock<Option<mpsc::UnboundedSender<WorkerCommand>>>>,
+    /// The active librespot session, set once the worker has successfully connected and cleared
+    /// when the worker exits. Callers may clone it cheaply (Session is Arc-backed).
+    session: Arc<RwLock<Option<Session>>>,
 }
 
 impl Spotify {
@@ -86,6 +89,7 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(None)),
         };
 
         let (user_tx, user_rx) = oneshot::channel();
@@ -120,6 +124,7 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
+            session: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -132,6 +137,7 @@ impl Spotify {
         let (tx, rx) = mpsc::unbounded_channel();
         *self.channel.write().unwrap() = Some(tx);
         let worker_channel = self.channel.clone();
+        let session_handle = self.session.clone();
         let cfg = self.cfg.clone();
         let events = self.events.clone();
         let volume = self.volume();
@@ -140,6 +146,7 @@ impl Spotify {
         let backend = Self::init_backend(backend_name)?;
         ASYNC_RUNTIME.get().unwrap().spawn(Self::worker(
             worker_channel,
+            session_handle,
             events,
             rx,
             cfg,
@@ -244,6 +251,7 @@ impl Spotify {
     #[allow(clippy::too_many_arguments)]
     async fn worker(
         worker_channel: Arc<RwLock<Option<mpsc::UnboundedSender<WorkerCommand>>>>,
+        session_handle: Arc<RwLock<Option<Session>>>,
         events: EventManager,
         commands: mpsc::UnboundedReceiver<WorkerCommand>,
         cfg: Arc<config::Config>,
@@ -300,6 +308,7 @@ impl Spotify {
             }
         };
         user_tx.map(|tx| tx.send(session.username()));
+        *session_handle.write().unwrap() = Some(session.clone());
 
         let mixer_factory_opt = librespot_playback::mixer::find(Some(SoftMixer::NAME));
         let factory = mixer_factory_opt.expect("could not find softvol mixer factory");
@@ -329,6 +338,7 @@ impl Spotify {
 
         error!("worker thread died, requesting restart");
         *worker_channel.write().unwrap() = None;
+        *session_handle.write().unwrap() = None;
         events.send(Event::SessionDied)
     }
 
@@ -536,6 +546,12 @@ impl Spotify {
     #[cfg(feature = "mpris")]
     pub fn set_mpris(&mut self, mpris: MprisManager) {
         *self.mpris.lock().unwrap() = Some(mpris);
+    }
+
+    /// Return a clone of the current librespot [Session], or `None` if the worker has not yet
+    /// connected (or has exited). [Session] is cheaply cloneable (Arc-backed).
+    pub fn session(&self) -> Option<Session> {
+        self.session.read().unwrap().clone()
     }
 }
 
