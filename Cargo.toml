@@ -126,3 +126,21 @@ It is heavily inspired by ncurses MPD clients, such as ncmpc."""
 license-file = ["LICENSE"]
 priority = "optional"
 section = "sound"
+
+# Pull the librespot CDN-URL fallback fix (librespot-org/librespot#1725, merged as
+# PR #1722) ahead of a crates.io release: on a non-206 fetch response, fall back to
+# the next CDN URL instead of giving up on the first reachable-but-broken edge (e.g.
+# an HTTP 500 from a draining node), which otherwise marks the track Unavailable even
+# though working CDN URLs are in the same storage-resolve response.
+#
+# Pinned to the merge commit on `dev` (still version 0.8.0). All librespot crates are
+# patched to the same rev so they resolve from a single git workspace (avoids a
+# duplicate librespot-core/-protocol from mixing crates.io + git sources). Drop this
+# once a librespot release that includes #1722 is published and the deps are bumped.
+[patch.crates-io]
+librespot-audio = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
+librespot-core = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
+librespot-metadata = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
+librespot-oauth = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
+librespot-playback = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
+librespot-protocol = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }

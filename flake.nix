@@ -69,8 +69,21 @@
 
           src = lib.cleanSource ./.;
 
-          # Reuse the committed lockfile; no vendor hash to keep in sync.
-          cargoLock.lockFile = ./Cargo.lock;
+          # Reuse the committed lockfile. The librespot-* crates are pinned to a git
+          # rev via [patch.crates-io] (see Cargo.toml) to pull the unreleased CDN-URL
+          # fallback fix; git sources need an explicit output hash here. All six share
+          # one git rev, so the hashes are identical.
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "librespot-audio-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+              "librespot-core-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+              "librespot-metadata-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+              "librespot-oauth-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+              "librespot-playback-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+              "librespot-protocol-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+            };
+          };
 
           inherit nativeBuildInputs buildInputs;
 
