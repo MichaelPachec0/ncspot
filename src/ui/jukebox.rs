@@ -24,6 +24,11 @@ const DEFAULT_MAX_PX: usize = 1280;
 #[cfg(feature = "jukebox-graphics")]
 const MIN_BLIT_INTERVAL_MS: u128 = 200;
 
+/// Fixed kitty image/placement id for the jukebox (distinct value to avoid colliding with
+/// auto-assigned ids). Reusing it makes each frame replace the previous in place.
+#[cfg(feature = "jukebox-graphics")]
+const JUKEBOX_KITTY_ID: u32 = 0x6E63_7370; // "ncsp"
+
 #[cfg(feature = "jukebox-graphics")]
 #[derive(Clone, PartialEq)]
 struct ImageRequest {
@@ -542,10 +547,9 @@ impl JukeboxView {
             return;
         }
 
-        // The image has an opaque background, so a new blit at the same rect fully covers the
-        // previous one — no clear needed (clearing every beat is what caused the flicker).
-        // Only clear (delete all images) when the rect changes, when leaving graphics, or
-        // periodically to flush accumulated kitty images.
+        let kitty = crate::ui::image_render::can_use_kitty_graphics();
+        // viuer (sixel/iTerm) draws an opaque image over the previous one, so it only needs a
+        // clear on rect change / periodically to flush accumulated kitty-less images.
         let rect_changed = match (rendered.as_ref(), desired.as_ref()) {
             (Some(o), Some(n)) => o.offset != n.offset || o.size != n.size,
             _ => true,
@@ -563,14 +567,9 @@ impl JukeboxView {
                     *last = std::time::Instant::now();
                 }
 
-                let n = self.blit_count.fetch_add(1, Ordering::Relaxed);
-                if rect_changed || n.is_multiple_of(48) {
-                    let clear = rendered.as_ref().unwrap_or(req);
-                    crate::ui::image_render::clear_terminal_area(clear.offset, clear.size);
-                }
                 if let Some(state) = self.jukebox.state() {
                     // Cap the longest edge to max_px while preserving aspect (independent
-                    // capping would distort the circle); viuer scales it to the cell box.
+                    // capping would distort the circle); the terminal scales it to the cell box.
                     let max_px = self
                         .cfg
                         .values()
@@ -586,21 +585,66 @@ impl JukeboxView {
                         ((px_w as f64 * scale) as u32).max(1),
                         ((px_h as f64 * scale) as u32).max(1),
                     );
+                    // kitty replaces the image in place, so a transparent background lets the
+                    // graph blend with the terminal; viuer needs an opaque cover.
+                    let bg = if kitty { [0, 0, 0, 0] } else { req.bg };
                     let img = crate::jukebox::render::render(
                         &state,
                         req.key.mode,
                         size_px,
                         req.key.show_web,
                         req.key.max,
-                        req.bg,
+                        bg,
                     );
-                    if let Err(e) = blit_image(&img, req.offset, req.size) {
-                        log::warn!("jukebox graphics blit failed: {e}");
+
+                    if kitty {
+                        // PNG + a fixed image/placement id: each frame replaces the previous
+                        // in place — flicker-free, no accumulation, tiny payload. On a
+                        // rect change, drop the old placement first so nothing lingers.
+                        if rect_changed {
+                            crate::ui::image_render::delete_kitty_image(JUKEBOX_KITTY_ID);
+                        }
+                        let mut png = Vec::new();
+                        let encoder = image::codecs::png::PngEncoder::new_with_quality(
+                            &mut png,
+                            image::codecs::png::CompressionType::Fast,
+                            image::codecs::png::FilterType::NoFilter,
+                        );
+                        use image::ImageEncoder;
+                        if encoder
+                            .write_image(
+                                img.as_raw(),
+                                img.width(),
+                                img.height(),
+                                image::ExtendedColorType::Rgba8,
+                            )
+                            .is_ok()
+                            && let Err(e) = crate::ui::image_render::blit_kitty_png(
+                                &png,
+                                req.offset,
+                                req.size.x,
+                                req.size.y,
+                                JUKEBOX_KITTY_ID,
+                            )
+                        {
+                            log::warn!("jukebox kitty blit failed: {e}");
+                        }
+                    } else {
+                        let n = self.blit_count.fetch_add(1, Ordering::Relaxed);
+                        if rect_changed || n.is_multiple_of(48) {
+                            let clear = rendered.as_ref().unwrap_or(req);
+                            crate::ui::image_render::clear_terminal_area(clear.offset, clear.size);
+                        }
+                        if let Err(e) = blit_image(&img, req.offset, req.size) {
+                            log::warn!("jukebox graphics blit failed: {e}");
+                        }
                     }
                 }
             }
             None => {
-                if let Some(old) = rendered.as_ref() {
+                if kitty {
+                    crate::ui::image_render::delete_kitty_image(JUKEBOX_KITTY_ID);
+                } else if let Some(old) = rendered.as_ref() {
                     crate::ui::image_render::clear_terminal_area(old.offset, old.size);
                 }
             }
@@ -695,7 +739,11 @@ impl ViewExt for JukeboxView {
         #[cfg(feature = "jukebox-graphics")]
         {
             if let Some(old) = self.rendered.write().unwrap().take() {
-                crate::ui::image_render::clear_terminal_area(old.offset, old.size);
+                if crate::ui::image_render::can_use_kitty_graphics() {
+                    crate::ui::image_render::delete_kitty_image(JUKEBOX_KITTY_ID);
+                } else {
+                    crate::ui::image_render::clear_terminal_area(old.offset, old.size);
+                }
             }
             *self.desired.write().unwrap() = None;
         }

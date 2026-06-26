@@ -80,6 +80,51 @@ pub fn clear_terminal_area(offset: Vec2, size: Vec2) {
     let _ = stdout.flush();
 }
 
+/// Transmit-and-display a PNG via the kitty graphics protocol at `offset`, scaled to
+/// `cols`x`rows` cells. Using a fixed `id` for both the image id and placement id means each
+/// call REPLACES the previous frame in place — flicker-free, no accumulation, no clearing.
+/// PNG keeps the payload tiny (the graph is mostly solid background), so this stays cheap
+/// even at high resolution. `q=2` suppresses kitty's responses so they don't reach stdin.
+#[cfg(feature = "jukebox-graphics")]
+pub fn blit_kitty_png(png: &[u8], offset: Vec2, cols: usize, rows: usize, id: u32) -> std::io::Result<()> {
+    use base64::Engine;
+
+    let data = base64::engine::general_purpose::STANDARD.encode(png);
+    let bytes = data.as_bytes();
+    let mut out = std::io::stdout().lock();
+
+    // Save cursor, move to the image's top-left, draw, restore cursor.
+    write!(out, "\x1b7\x1b[{};{}H", offset.y + 1, offset.x + 1)?;
+
+    // Chunk the base64 payload: <=4096 bytes per escape, all but the last a multiple of 4.
+    let mut i = 0;
+    let mut first = true;
+    while i < bytes.len() {
+        let end = (i + 4096).min(bytes.len());
+        let last = end == bytes.len();
+        let m = u8::from(!last);
+        if first {
+            write!(out, "\x1b_Ga=T,f=100,q=2,i={id},p={id},c={cols},r={rows},m={m};")?;
+            first = false;
+        } else {
+            write!(out, "\x1b_Gm={m};")?;
+        }
+        out.write_all(&bytes[i..end])?;
+        write!(out, "\x1b\\")?;
+        i = end;
+    }
+    write!(out, "\x1b8")?;
+    out.flush()
+}
+
+/// Delete the kitty image (and its data) with the given id.
+#[cfg(feature = "jukebox-graphics")]
+pub fn delete_kitty_image(id: u32) {
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b_Ga=d,d=I,i={id}\x1b\\");
+    let _ = out.flush();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
