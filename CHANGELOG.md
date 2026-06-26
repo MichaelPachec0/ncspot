@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Eternal Jukebox mode (<kbd>F10</kbd> / `:jukeboxtoggle`): play the current
   track endlessly by seeking between similar beats, with a three-layout TUI
   visualizer, a live settings modal, and a configurable eternalbox fallback
+- Optional graphical jukebox visualizer (`jukebox-graphics` feature): renders
+  the beat graph as an image on kitty/iTerm2/sixel terminals, toggled with
+  <kbd>g</kbd> / `:jukeboxgraphics`
 
 ### Fixed
 

@@ -186,11 +186,19 @@ beats. Toggle it from anywhere with `:jukeboxtoggle`, and open the visualizer wi
 | <kbd>v</kbd>                 | Cycle the layout (linear track → radial ring → split panel).  |
 | <kbd>b</kbd>                 | Toggle "bounce" (repeat the current section).                 |
 | <kbd>i</kbd>                 | Toggle endless mode.                                           |
+| <kbd>g</kbd>                 | Toggle the graphics backend (image vs ASCII), if compiled in. |
 
 The underlying commands (`jukeboxtoggle`, `jukeboxview`, `jukeboxbounce`, `jukeboxseek`,
-`jukeboxsettings`) can be bound to any key via `[keybindings]`. Analysis is fetched from
-Spotify's internal client endpoint, with a configurable eternalbox.dev fallback; tracks
-without analysis (local files, podcasts) cannot be jukeboxed. See [Jukebox settings](#jukebox-settings).
+`jukeboxsettings`, `jukeboxgraphics`) can be bound to any key via `[keybindings]`. Analysis is
+fetched from Spotify's internal client endpoint, with a configurable eternalbox.dev fallback;
+tracks without analysis (local files, podcasts) cannot be jukeboxed. See
+[Jukebox settings](#jukebox-settings).
+
+When built with the `jukebox-graphics` feature, the visualizer can render as a real image
+(smooth circle, anti-aliased branches) on terminals that support the kitty graphics protocol,
+iTerm2, or sixel. Toggle it at runtime with <kbd>g</kbd> or `:jukeboxgraphics`; it falls back
+to the ASCII renderer when off or unsupported. Set the startup default with `[jukebox]
+graphics` (default `true` when the feature is compiled).
 
 ### Vim-Like Commands
 You can open a Vim-style command prompt using <kbd>:</kbd>, and close it at any
@@ -605,6 +613,11 @@ max_branches_drawn = 0
 # Which layouts draw the full web; others show only the active branch.
 # Valid values: "linear", "radial", "split". (The radial layout reads cleanest when dense.)
 branch_layouts = ["linear", "radial", "split"]
+
+# Default graphics backend on/off at startup (only when built with the jukebox-graphics
+# feature). Renders the visualizer as a real image on kitty/iTerm2/sixel terminals.
+# Toggle live with `g` / :jukeboxgraphics.
+graphics = true
 ```
 
 Analysis comes from Spotify's internal client endpoint first; if that has no data for a track,
