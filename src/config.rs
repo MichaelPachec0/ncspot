@@ -152,6 +152,7 @@ pub struct JukeboxConfig {
     pub show_all_branches: Option<bool>,
     pub max_branches_drawn: Option<usize>,
     pub branch_layouts: Option<Vec<String>>,
+    pub graphics: Option<bool>,
 }
 
 impl JukeboxConfig {

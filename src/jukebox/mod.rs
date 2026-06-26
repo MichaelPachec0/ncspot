@@ -57,6 +57,7 @@ pub struct SongState {
 
 struct JukeboxInner {
     enabled: AtomicBool,
+    graphics: AtomicBool,
     bouncing: AtomicBool,
     rebuild: AtomicBool,
     view_mode: RwLock<ViewMode>,
@@ -66,9 +67,10 @@ struct JukeboxInner {
 }
 
 impl JukeboxInner {
-    fn new(settings: JukeboxSettings, enabled: bool) -> Self {
+    fn new(settings: JukeboxSettings, enabled: bool, graphics: bool) -> Self {
         Self {
             enabled: AtomicBool::new(enabled),
+            graphics: AtomicBool::new(graphics),
             bouncing: AtomicBool::new(false),
             rebuild: AtomicBool::new(false),
             view_mode: RwLock::new(ViewMode::Linear),
@@ -93,7 +95,8 @@ impl Jukebox {
         let jb_cfg = cfg.values().jukebox.clone().unwrap_or_default();
         let settings = JukeboxSettings::from_config(&jb_cfg);
         let enabled = jb_cfg.enabled.unwrap_or(false);
-        let inner = Arc::new(JukeboxInner::new(settings, enabled));
+        let graphics = jb_cfg.graphics.unwrap_or(true);
+        let inner = Arc::new(JukeboxInner::new(settings, enabled, graphics));
 
         let loop_inner = inner.clone();
         std::thread::Builder::new()
@@ -130,6 +133,14 @@ impl Jukebox {
         *g = g.next();
         *g
     }
+    pub fn graphics_enabled(&self) -> bool {
+        self.inner.graphics.load(Ordering::Relaxed)
+    }
+    pub fn toggle_graphics(&self) -> bool {
+        let new = !self.graphics_enabled();
+        self.inner.graphics.store(new, Ordering::Relaxed);
+        new
+    }
     pub fn state(&self) -> Option<SongState> {
         self.inner.state.read().unwrap().clone()
     }
@@ -144,7 +155,7 @@ impl Jukebox {
     #[cfg(test)]
     fn test_instance() -> Self {
         Self {
-            inner: Arc::new(JukeboxInner::new(JukeboxSettings::default(), false)),
+            inner: Arc::new(JukeboxInner::new(JukeboxSettings::default(), false, false)),
         }
     }
 }
@@ -331,5 +342,13 @@ mod tests {
         let j = Jukebox::test_instance();
         j.request_seek_to_beat(7);
         assert_eq!(*j.inner.seek_request.lock().unwrap(), Some(7));
+    }
+
+    #[test]
+    fn toggle_graphics_flips() {
+        let j = Jukebox::test_instance();
+        assert!(!j.graphics_enabled());
+        assert!(j.toggle_graphics());
+        assert!(j.graphics_enabled());
     }
 }

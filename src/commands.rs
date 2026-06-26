@@ -335,7 +335,8 @@ impl CommandManager {
             | Command::JukeboxViewCycle
             | Command::JukeboxBounce
             | Command::JukeboxSeekToBeat
-            | Command::JukeboxSettings => Err(format!(
+            | Command::JukeboxSettings
+            | Command::JukeboxGraphics => Err(format!(
                 "The command \"{}\" is unsupported in this view",
                 cmd.basename()
             )),

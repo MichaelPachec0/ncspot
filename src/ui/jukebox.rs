@@ -432,6 +432,10 @@ impl View for JukeboxView {
                 self.jukebox.cycle_view_mode();
                 EventResult::Consumed(None)
             }
+            Event::Char('g') => {
+                self.jukebox.toggle_graphics();
+                EventResult::Consumed(None)
+            }
             Event::Char('b') => {
                 self.jukebox.toggle_bounce();
                 EventResult::Consumed(None)
@@ -470,6 +474,10 @@ impl ViewExt for JukeboxView {
             }
             Command::JukeboxSettings => {
                 crate::ui::jukebox_settings::open_settings_modal(s, self.jukebox.clone());
+                Ok(CommandResult::Consumed(None))
+            }
+            Command::JukeboxGraphics => {
+                self.jukebox.toggle_graphics();
                 Ok(CommandResult::Consumed(None))
             }
             _ => Ok(CommandResult::Ignored),

@@ -169,6 +169,7 @@ pub enum Command {
     JukeboxBounce,
     JukeboxSeekToBeat,
     JukeboxSettings,
+    JukeboxGraphics,
 }
 
 impl fmt::Display for Command {
@@ -245,7 +246,8 @@ impl fmt::Display for Command {
             | Self::JukeboxViewCycle
             | Self::JukeboxBounce
             | Self::JukeboxSeekToBeat
-            | Self::JukeboxSettings => vec![],
+            | Self::JukeboxSettings
+            | Self::JukeboxGraphics => vec![],
         };
         repr_tokens.append(&mut extras_args);
         write!(f, "{}", repr_tokens.join(" "))
@@ -311,6 +313,7 @@ impl Command {
             Self::JukeboxBounce => "jukeboxbounce",
             Self::JukeboxSeekToBeat => "jukeboxseek",
             Self::JukeboxSettings => "jukeboxsettings",
+            Self::JukeboxGraphics => "jukeboxgraphics",
         }
     }
 }
@@ -830,6 +833,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "jukeboxbounce" => Command::JukeboxBounce,
                 "jukeboxseek" => Command::JukeboxSeekToBeat,
                 "jukeboxsettings" => Command::JukeboxSettings,
+                "jukeboxgraphics" => Command::JukeboxGraphics,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),
