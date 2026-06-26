@@ -152,6 +152,8 @@ pub struct ConfigTheme {
     pub cmdline: Option<String>,
     pub cmdline_bg: Option<String>,
     pub search_match: Option<String>,
+    pub lyrics_highlight: Option<String>,
+    pub lyrics_secondary: Option<String>,
 }
 
 /// The ordering that is used when representing a playlist.
