@@ -6,6 +6,8 @@ pub mod artist;
 pub mod browse;
 pub mod contextmenu;
 pub mod help;
+pub mod jukebox;
+pub mod jukebox_settings;
 pub mod layout;
 pub mod library;
 pub mod listview;

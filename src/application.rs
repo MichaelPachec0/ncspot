@@ -236,6 +236,9 @@ impl Application {
             lyrics_manager,
         );
 
+        let jukeboxview =
+            ui::jukebox::JukeboxView::new(jukebox.clone(), queue.clone(), configuration.clone());
+
         let status = ui::statusbar::StatusBar::new(queue.clone(), Arc::clone(&library));
 
         let mut layout =
@@ -248,6 +251,8 @@ impl Application {
         layout.add_screen("cover", coverview.with_name("cover"));
 
         layout.add_screen("lyrics", lyricsview.with_name("lyrics"));
+
+        layout.add_screen("jukebox", jukeboxview.with_name("jukebox"));
 
         // initial screen is library
         let initial_screen = configuration

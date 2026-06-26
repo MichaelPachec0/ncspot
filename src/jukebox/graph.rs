@@ -32,8 +32,8 @@ pub struct SongGraph {
 
 fn euclidean(a: &[f64], b: &[f64]) -> f64 {
     let mut sum = 0.0;
-    for i in 0..a.len() {
-        let d = b.get(i).copied().unwrap_or(0.0) - a[i];
+    for (i, &av) in a.iter().enumerate() {
+        let d = b.get(i).copied().unwrap_or(0.0) - av;
         sum += d * d;
     }
     sum.sqrt()
@@ -229,16 +229,16 @@ impl GraphGenerator<'_> {
                 let delta = beat_index as i64 - n.destination as i64;
                 if delta > 0 && n.distance < max_branch_distance {
                     let percent = (delta as f64 * 100.0) / n_beats;
-                    if best.map_or(true, |(p, _, _)| percent > p) {
+                    if best.is_none_or(|(p, _, _)| percent > p) {
                         best = Some((percent, beat_index, *n));
                     }
                 }
             }
         }
-        if let Some((_, beat_index, edge)) = best {
-            if edge.distance > threshold {
-                graph.beats[beat_index].neighbours.push(edge);
-            }
+        if let Some((_, beat_index, edge)) = best
+            && edge.distance > threshold
+        {
+            graph.beats[beat_index].neighbours.push(edge);
         }
     }
 

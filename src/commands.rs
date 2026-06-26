@@ -331,7 +331,11 @@ impl CommandManager {
             | Command::LyricsProviderCycle
             | Command::LyricsRefetch
             | Command::LyricsCopyLine
-            | Command::LyricsCopyAll => Err(format!(
+            | Command::LyricsCopyAll
+            | Command::JukeboxViewCycle
+            | Command::JukeboxBounce
+            | Command::JukeboxSeekToBeat
+            | Command::JukeboxSettings => Err(format!(
                 "The command \"{}\" is unsupported in this view",
                 cmd.basename()
             )),
@@ -488,6 +492,7 @@ impl CommandManager {
         #[cfg(feature = "cover")]
         kb.insert("F8".into(), vec![Command::Focus("cover".into())]);
         kb.insert("F9".into(), vec![Command::Focus("lyrics".into())]);
+        kb.insert("F10".into(), vec![Command::Focus("jukebox".into())]);
         kb.insert("?".into(), vec![Command::Help]);
         kb.insert("Esc".into(), vec![Command::Back]);
         kb.insert("Backspace".into(), vec![Command::Back]);

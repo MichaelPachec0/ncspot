@@ -184,6 +184,8 @@ pub struct ConfigTheme {
     pub search_match: Option<String>,
     pub lyrics_highlight: Option<String>,
     pub lyrics_secondary: Option<String>,
+    pub jukebox_branch: Option<String>,
+    pub jukebox_cursor: Option<String>,
 }
 
 /// The ordering that is used when representing a playlist.

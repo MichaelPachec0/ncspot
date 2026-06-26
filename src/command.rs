@@ -165,6 +165,10 @@ pub enum Command {
     LyricsCopyLine,
     LyricsCopyAll,
     JukeboxToggle,
+    JukeboxViewCycle,
+    JukeboxBounce,
+    JukeboxSeekToBeat,
+    JukeboxSettings,
 }
 
 impl fmt::Display for Command {
@@ -237,7 +241,11 @@ impl fmt::Display for Command {
             | Self::LyricsRefetch
             | Self::LyricsCopyLine
             | Self::LyricsCopyAll
-            | Self::JukeboxToggle => vec![],
+            | Self::JukeboxToggle
+            | Self::JukeboxViewCycle
+            | Self::JukeboxBounce
+            | Self::JukeboxSeekToBeat
+            | Self::JukeboxSettings => vec![],
         };
         repr_tokens.append(&mut extras_args);
         write!(f, "{}", repr_tokens.join(" "))
@@ -299,6 +307,10 @@ impl Command {
             Self::LyricsCopyLine => "lyricscopyline",
             Self::LyricsCopyAll => "lyricscopyall",
             Self::JukeboxToggle => "jukeboxtoggle",
+            Self::JukeboxViewCycle => "jukeboxview",
+            Self::JukeboxBounce => "jukeboxbounce",
+            Self::JukeboxSeekToBeat => "jukeboxseek",
+            Self::JukeboxSettings => "jukeboxsettings",
         }
     }
 }
@@ -814,6 +826,10 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "lyricscopyline" => Command::LyricsCopyLine,
                 "lyricscopyall" => Command::LyricsCopyAll,
                 "jukeboxtoggle" => Command::JukeboxToggle,
+                "jukeboxview" => Command::JukeboxViewCycle,
+                "jukeboxbounce" => Command::JukeboxBounce,
+                "jukeboxseek" => Command::JukeboxSeekToBeat,
+                "jukeboxsettings" => Command::JukeboxSettings,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),

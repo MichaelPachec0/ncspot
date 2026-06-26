@@ -113,9 +113,6 @@ impl Jukebox {
         self.set_enabled(new);
         new
     }
-    pub fn set_bouncing(&self, on: bool) {
-        self.inner.bouncing.store(on, Ordering::Relaxed);
-    }
     pub fn toggle_bounce(&self) {
         let new = !self.inner.bouncing.load(Ordering::Relaxed);
         self.inner.bouncing.store(new, Ordering::Relaxed);
@@ -140,10 +137,6 @@ impl Jukebox {
     pub fn apply_settings(&self, settings: JukeboxSettings) {
         *self.inner.settings.write().unwrap() = settings;
         self.inner.rebuild.store(true, Ordering::Relaxed);
-    }
-    pub fn reload_settings(&self, cfg: &Config) {
-        let s = JukeboxSettings::from_config(&cfg.values().jukebox.clone().unwrap_or_default());
-        self.apply_settings(s);
     }
 
     #[cfg(test)]
@@ -262,14 +255,13 @@ fn run_driver_loop(
             }
         }
 
-        if inner.rebuild.swap(false, Ordering::Relaxed) {
-            if let Some(id) = current_track_id.clone() {
-                if let Some((d, g)) = build_driver(&inner, &analysis, &cfg, &id, seed | 2) {
-                    driver = Some(d);
-                    current_graph = g;
-                    started = Instant::now();
-                }
-            }
+        if inner.rebuild.swap(false, Ordering::Relaxed)
+            && let Some(id) = current_track_id.clone()
+            && let Some((d, g)) = build_driver(&inner, &analysis, &cfg, &id, seed | 2)
+        {
+            driver = Some(d);
+            current_graph = g;
+            started = Instant::now();
         }
 
         let Some(d) = driver.as_mut() else {
@@ -277,11 +269,11 @@ fn run_driver_loop(
         };
         d.set_bouncing(inner.bouncing.load(Ordering::Relaxed));
 
-        if let Some(beat) = inner.seek_request.lock().unwrap().take() {
-            if let Some(b) = d.graph().beats.get(beat) {
-                spotify.seek(b.start_ms.max(0.0) as u32);
-                seek_cooldown = 3;
-            }
+        if let Some(beat) = inner.seek_request.lock().unwrap().take()
+            && let Some(b) = d.graph().beats.get(beat)
+        {
+            spotify.seek(b.start_ms.max(0.0) as u32);
+            seek_cooldown = 3;
         }
 
         if seek_cooldown > 0 {
