@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use cursive::Cursive;
 use cursive::traits::{Nameable, Resizable, Scrollable};
-use cursive::views::{Checkbox, Dialog, EditView, ListView};
+use cursive::views::{Checkbox, Dialog, EditView, ListView, SelectView};
 
 use crate::config::Config;
 use crate::jukebox::Jukebox;
@@ -15,8 +15,16 @@ fn num_field(value: impl std::fmt::Display) -> impl cursive::View {
     EditView::new().content(value.to_string()).fixed_width(10)
 }
 
-fn text_field(value: &str) -> impl cursive::View {
-    EditView::new().content(value).fixed_width(28)
+/// A dropdown of `options`, with `current` pre-selected. The selected value is the option
+/// string, read back in `collect_settings` and parsed into the enum.
+fn enum_select(options: &[&'static str], current: &str) -> SelectView<&'static str> {
+    let sel = options.iter().position(|o| o.eq_ignore_ascii_case(current)).unwrap_or(0);
+    let mut sv = SelectView::<&'static str>::new().popup();
+    for opt in options {
+        sv.add_item(*opt, *opt);
+    }
+    let _ = sv.set_selection(sel);
+    sv
 }
 
 /// Build and show the jukebox settings modal, pre-filled from the live settings. Apply
@@ -81,24 +89,31 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
         num_field(cur.anti_loop.threshold).with_name("jb_loop_threshold"),
     );
     list.add_child(
-        "Identity (edge/destination/distance)",
-        text_field(cur.anti_loop.identity.as_str()).with_name("jb_loop_identity"),
+        "Identity",
+        enum_select(&["edge", "destination", "distance"], cur.anti_loop.identity.as_str())
+            .with_name("jb_loop_identity"),
     );
     list.add_child(
-        "Count (consecutive/cumulative)",
-        text_field(cur.anti_loop.count_mode.as_str()).with_name("jb_loop_count"),
+        "Count mode",
+        enum_select(&["consecutive", "cumulative"], cur.anti_loop.count_mode.as_str())
+            .with_name("jb_loop_count"),
     );
     list.add_child(
-        "Skip (different_else_continue/continue/different_only)",
-        text_field(cur.anti_loop.skip_action.as_str()).with_name("jb_loop_skip"),
+        "Skip action",
+        enum_select(
+            &["different_else_continue", "continue", "different_only"],
+            cur.anti_loop.skip_action.as_str(),
+        )
+        .with_name("jb_loop_skip"),
     );
     list.add_child(
         "Break last branch",
         Checkbox::new().with_checked(cur.anti_loop.break_last_branch).with_name("jb_break_last"),
     );
     list.add_child(
-        "Counter (reset/retire)",
-        text_field(cur.anti_loop.counter.as_str()).with_name("jb_loop_counter"),
+        "Counter",
+        enum_select(&["reset", "retire"], cur.anti_loop.counter.as_str())
+            .with_name("jb_loop_counter"),
     );
 
     let apply_jukebox = jukebox.clone();
@@ -143,8 +158,11 @@ fn read_bool(s: &mut Cursive, name: &str, fallback: bool) -> bool {
     s.call_on_name(name, |v: &mut Checkbox| v.is_checked()).unwrap_or(fallback)
 }
 
-fn read_str(s: &mut Cursive, name: &str) -> Option<String> {
-    s.call_on_name(name, |v: &mut EditView| v.get_content().to_string())
+fn read_enum<T>(s: &mut Cursive, name: &str, parse: fn(&str) -> T, fallback: T) -> T {
+    s.call_on_name(name, |v: &mut SelectView<&'static str>| v.selection())
+        .flatten()
+        .map(|val| parse(*val))
+        .unwrap_or(fallback)
 }
 
 fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
@@ -163,19 +181,16 @@ fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
         anti_loop: AntiLoopSettings {
             enabled: read_bool(s, "jb_break_loops", cur.anti_loop.enabled),
             threshold: read_num::<usize>(s, "jb_loop_threshold", cur.anti_loop.threshold).max(1),
-            identity: read_str(s, "jb_loop_identity")
-                .map(|t| LoopIdentity::parse(&t))
-                .unwrap_or(cur.anti_loop.identity),
-            count_mode: read_str(s, "jb_loop_count")
-                .map(|t| LoopCountMode::parse(&t))
-                .unwrap_or(cur.anti_loop.count_mode),
-            skip_action: read_str(s, "jb_loop_skip")
-                .map(|t| LoopSkipAction::parse(&t))
-                .unwrap_or(cur.anti_loop.skip_action),
+            identity: read_enum(s, "jb_loop_identity", LoopIdentity::parse, cur.anti_loop.identity),
+            count_mode: read_enum(s, "jb_loop_count", LoopCountMode::parse, cur.anti_loop.count_mode),
+            skip_action: read_enum(
+                s,
+                "jb_loop_skip",
+                LoopSkipAction::parse,
+                cur.anti_loop.skip_action,
+            ),
             break_last_branch: read_bool(s, "jb_break_last", cur.anti_loop.break_last_branch),
-            counter: read_str(s, "jb_loop_counter")
-                .map(|t| LoopCounter::parse(&t))
-                .unwrap_or(cur.anti_loop.counter),
+            counter: read_enum(s, "jb_loop_counter", LoopCounter::parse, cur.anti_loop.counter),
         },
     }
 }
