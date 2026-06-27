@@ -154,6 +154,14 @@ pub struct JukeboxConfig {
     pub branch_layouts: Option<Vec<String>>,
     pub graphics: Option<bool>,
     pub graphics_max_px: Option<usize>,
+    // Anti-loop.
+    pub break_loops: Option<bool>,
+    pub loop_threshold: Option<usize>,
+    pub loop_identity: Option<String>,
+    pub loop_count_mode: Option<String>,
+    pub loop_skip_action: Option<String>,
+    pub break_last_branch: Option<bool>,
+    pub loop_counter: Option<String>,
 }
 
 impl JukeboxConfig {

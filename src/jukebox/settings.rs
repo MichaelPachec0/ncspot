@@ -1,5 +1,129 @@
 use crate::config::JukeboxConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopIdentity {
+    Edge,
+    Destination,
+    Distance,
+}
+impl LoopIdentity {
+    fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "destination" => Self::Destination,
+            "distance" => Self::Distance,
+            "edge" => Self::Edge,
+            other => {
+                log::debug!("unknown loop_identity '{other}', using edge");
+                Self::Edge
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopCountMode {
+    Consecutive,
+    Cumulative,
+}
+impl LoopCountMode {
+    fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "cumulative" => Self::Cumulative,
+            "consecutive" => Self::Consecutive,
+            other => {
+                log::debug!("unknown loop_count_mode '{other}', using consecutive");
+                Self::Consecutive
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopSkipAction {
+    DifferentElseContinue,
+    Continue,
+    DifferentOnly,
+}
+impl LoopSkipAction {
+    fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "continue" => Self::Continue,
+            "different_only" => Self::DifferentOnly,
+            "different_else_continue" => Self::DifferentElseContinue,
+            other => {
+                log::debug!("unknown loop_skip_action '{other}', using different_else_continue");
+                Self::DifferentElseContinue
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopCounter {
+    Reset,
+    Retire,
+}
+impl LoopCounter {
+    fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "retire" => Self::Retire,
+            "reset" => Self::Reset,
+            other => {
+                log::debug!("unknown loop_counter '{other}', using reset");
+                Self::Reset
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AntiLoopSettings {
+    pub enabled: bool,
+    pub threshold: usize,
+    pub identity: LoopIdentity,
+    pub count_mode: LoopCountMode,
+    pub skip_action: LoopSkipAction,
+    pub break_last_branch: bool,
+    pub counter: LoopCounter,
+}
+
+impl Default for AntiLoopSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: 4,
+            identity: LoopIdentity::Edge,
+            count_mode: LoopCountMode::Consecutive,
+            skip_action: LoopSkipAction::DifferentElseContinue,
+            break_last_branch: false,
+            counter: LoopCounter::Reset,
+        }
+    }
+}
+
+impl AntiLoopSettings {
+    pub fn from_config(c: &JukeboxConfig) -> Self {
+        let d = Self::default();
+        Self {
+            enabled: c.break_loops.unwrap_or(d.enabled),
+            threshold: c.loop_threshold.unwrap_or(d.threshold).max(1),
+            identity: c.loop_identity.as_deref().map(LoopIdentity::parse).unwrap_or(d.identity),
+            count_mode: c
+                .loop_count_mode
+                .as_deref()
+                .map(LoopCountMode::parse)
+                .unwrap_or(d.count_mode),
+            skip_action: c
+                .loop_skip_action
+                .as_deref()
+                .map(LoopSkipAction::parse)
+                .unwrap_or(d.skip_action),
+            break_last_branch: c.break_last_branch.unwrap_or(d.break_last_branch),
+            counter: c.loop_counter.as_deref().map(LoopCounter::parse).unwrap_or(d.counter),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct JukeboxSettings {
     pub max_branch_distance: u32,
@@ -13,6 +137,7 @@ pub struct JukeboxSettings {
     pub add_last_branch: bool,
     pub always_follow_last_branch: bool,
     pub max_play_time_secs: u64,
+    pub anti_loop: AntiLoopSettings,
 }
 
 impl JukeboxSettings {
@@ -38,6 +163,7 @@ impl JukeboxSettings {
                 .always_follow_last_branch
                 .unwrap_or(d.always_follow_last_branch),
             max_play_time_secs: c.max_play_time_secs.unwrap_or(d.max_play_time_secs),
+            anti_loop: AntiLoopSettings::from_config(c),
         }
     }
 }
@@ -56,6 +182,7 @@ impl Default for JukeboxSettings {
             add_last_branch: true,
             always_follow_last_branch: true,
             max_play_time_secs: 0,
+            anti_loop: AntiLoopSettings::default(),
         }
     }
 }
@@ -79,5 +206,51 @@ mod tests {
         let s = JukeboxSettings::from_config(&c);
         assert_eq!(s.max_branch_distance, 50);
         assert_eq!(s.min_branch_probability, 0.18); // untouched
+    }
+
+    #[test]
+    fn anti_loop_defaults_off() {
+        let s = JukeboxSettings::from_config(&JukeboxConfig::default());
+        assert!(!s.anti_loop.enabled);
+        assert_eq!(s.anti_loop.threshold, 4);
+        assert_eq!(s.anti_loop.identity, LoopIdentity::Edge);
+        assert_eq!(s.anti_loop.count_mode, LoopCountMode::Consecutive);
+        assert_eq!(s.anti_loop.skip_action, LoopSkipAction::DifferentElseContinue);
+        assert!(!s.anti_loop.break_last_branch);
+        assert_eq!(s.anti_loop.counter, LoopCounter::Reset);
+    }
+
+    #[test]
+    fn anti_loop_parses_config() {
+        let c = JukeboxConfig {
+            break_loops: Some(true),
+            loop_threshold: Some(2),
+            loop_identity: Some("distance".into()),
+            loop_count_mode: Some("cumulative".into()),
+            loop_skip_action: Some("continue".into()),
+            break_last_branch: Some(true),
+            loop_counter: Some("retire".into()),
+            ..Default::default()
+        };
+        let s = JukeboxSettings::from_config(&c);
+        assert!(s.anti_loop.enabled);
+        assert_eq!(s.anti_loop.threshold, 2);
+        assert_eq!(s.anti_loop.identity, LoopIdentity::Distance);
+        assert_eq!(s.anti_loop.count_mode, LoopCountMode::Cumulative);
+        assert_eq!(s.anti_loop.skip_action, LoopSkipAction::Continue);
+        assert!(s.anti_loop.break_last_branch);
+        assert_eq!(s.anti_loop.counter, LoopCounter::Retire);
+    }
+
+    #[test]
+    fn anti_loop_unknown_strings_and_zero_threshold_fall_back() {
+        let c = JukeboxConfig {
+            loop_identity: Some("bogus".into()),
+            loop_threshold: Some(0),
+            ..Default::default()
+        };
+        let s = JukeboxSettings::from_config(&c);
+        assert_eq!(s.anti_loop.identity, LoopIdentity::Edge);
+        assert_eq!(s.anti_loop.threshold, 1); // clamped to >= 1
     }
 }

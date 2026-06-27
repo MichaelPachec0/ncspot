@@ -103,5 +103,6 @@ fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
         add_last_branch: read_bool(s, "jb_last", cur.add_last_branch),
         always_follow_last_branch: read_bool(s, "jb_follow", cur.always_follow_last_branch),
         max_play_time_secs: read_num(s, "jb_maxtime", cur.max_play_time_secs),
+        anti_loop: cur.anti_loop,
     }
 }
