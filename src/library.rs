@@ -182,6 +182,9 @@ impl Library {
                 &config::cache_path(CACHE_PLAYLISTS),
                 &self.playlists.read().unwrap(),
             );
+            #[cfg(feature = "mpris")]
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged);
         }
     }
 
@@ -376,6 +379,11 @@ impl Library {
 
         // trigger redraw
         self.trigger_redraw();
+
+        // Notify MPRIS clients that the playlist set has been refreshed.
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged);
     }
 
     /// Fetch the artists from the web API and save them to the local library.
@@ -884,6 +892,10 @@ impl Library {
             &config::cache_path(CACHE_PLAYLISTS),
             &self.playlists.read().unwrap(),
         );
+
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged);
     }
 
     /// Check whether `show` is already in the user's library.

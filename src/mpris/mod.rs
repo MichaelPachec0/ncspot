@@ -2,11 +2,12 @@
 
 mod metadata;
 mod player;
+mod playlists;
 mod root;
 mod tracklist;
 
 use std::error::Error;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use log::info;
 use tokio::sync::mpsc;
@@ -23,6 +24,7 @@ use crate::spotify::Spotify;
 
 use metadata::build_metadata;
 use player::MprisPlayer;
+use playlists::MprisPlaylists;
 use root::MprisRoot;
 use tracklist::MprisTrackList;
 
@@ -56,6 +58,8 @@ pub enum MprisCommand {
     EmitTrackRemoved(u64),
     /// The metadata of the entry with this stable id changed.
     EmitTrackMetadataChanged(u64),
+    /// The library's playlist set changed; notify MPRIS clients.
+    EmitPlaylistChanged,
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -80,16 +84,22 @@ impl MprisManager {
             spotify: spotify.clone(),
         };
         let tracklist = MprisTrackList {
+            queue: queue.clone(),
+            library: library.clone(),
+            spotify: spotify.clone(),
+        };
+        let playlist_iface = MprisPlaylists {
             queue,
             library,
             spotify,
+            active_playlist_id: Arc::new(Mutex::new(None)),
         };
 
         let (tx, rx) = mpsc::unbounded_channel::<MprisCommand>();
 
         ASYNC_RUNTIME.get().unwrap().spawn(async {
             let result =
-                Self::serve(UnboundedReceiverStream::new(rx), root, player, tracklist).await;
+                Self::serve(UnboundedReceiverStream::new(rx), root, player, tracklist, playlist_iface).await;
             if let Err(e) = result {
                 log::error!("MPRIS error: {e}");
             }
@@ -103,12 +113,14 @@ impl MprisManager {
         root: MprisRoot,
         player: MprisPlayer,
         tracklist: MprisTrackList,
+        playlist_iface: MprisPlaylists,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
         let conn = connection::Builder::session()?
             .name(instance_bus_name())?
             .serve_at("/org/mpris/MediaPlayer2", root)?
             .serve_at("/org/mpris/MediaPlayer2", player)?
             .serve_at("/org/mpris/MediaPlayer2", tracklist)?
+            .serve_at("/org/mpris/MediaPlayer2", playlist_iface)?
             .build()
             .await?;
 
@@ -119,6 +131,9 @@ impl MprisManager {
         let player_iface = player_iface_ref.get().await;
         let tracklist_iface_ref = object_server
             .interface::<_, MprisTrackList>("/org/mpris/MediaPlayer2")
+            .await?;
+        let playlists_iface_ref = object_server
+            .interface::<_, MprisPlaylists>("/org/mpris/MediaPlayer2")
             .await?;
 
         loop {
@@ -206,6 +221,26 @@ impl MprisManager {
                             )
                             .await?;
                         }
+                    }
+                }
+                Some(MprisCommand::EmitPlaylistChanged) => {
+                    let pl_ctx = playlists_iface_ref.signal_emitter();
+                    let pl = playlists_iface_ref.get().await;
+                    // Emit PlaylistChanged for the first playlist to notify clients that
+                    // the library has refreshed.  Avoid holding the RwLockReadGuard
+                    // across the await point.
+                    let first = {
+                        let guard = pl.library.playlists.read().unwrap();
+                        guard.first().map(|p| {
+                            (
+                                playlists::playlist_path_for_id(&p.id),
+                                p.name.clone(),
+                                String::new(),
+                            )
+                        })
+                    };
+                    if let Some(tuple) = first {
+                        MprisPlaylists::playlist_changed(pl_ctx, tuple).await?;
                     }
                 }
                 None => break,
