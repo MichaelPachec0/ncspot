@@ -12,14 +12,14 @@ use crate::spotify::Spotify;
 
 /// Build the D-Bus object path for a playlist with the given Spotify ID.
 pub(super) fn playlist_path_for_id(id: &str) -> OwnedObjectPath {
-    OwnedObjectPath::try_from(format!("/org/ncspot/playlists/{id}"))
-        .unwrap_or_else(|_| OwnedObjectPath::try_from("/org/ncspot/playlists/_").unwrap())
+    OwnedObjectPath::try_from(format!("/org/ncspot/playlist/{id}"))
+        .unwrap_or_else(|_| OwnedObjectPath::try_from("/org/ncspot/playlist/_").unwrap())
 }
 
-/// Parse `/org/ncspot/playlists/<id>` → `id`.
+/// Parse `/org/ncspot/playlist/<id>` → `id`.
 pub(crate) fn parse_playlist_path(path: &ObjectPath<'_>) -> Option<String> {
     path.as_str()
-        .strip_prefix("/org/ncspot/playlists/")
+        .strip_prefix("/org/ncspot/playlist/")
         .map(str::to_string)
 }
 
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_parse_playlist_path_ok() {
-        let p = ObjectPath::from_static_str_unchecked("/org/ncspot/playlists/abc123");
+        let p = ObjectPath::from_static_str_unchecked("/org/ncspot/playlist/abc123");
         assert_eq!(parse_playlist_path(&p), Some("abc123".to_string()));
     }
 
