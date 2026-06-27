@@ -600,6 +600,24 @@ always_follow_last_branch = true
 # Stop branching after this many seconds of jukebox playback (0 = never stop).
 max_play_time_secs = 0
 
+# Anti-loop: skip a branch once it has been taken too many times, to break short loops.
+break_loops = false
+# Take a branch this many times before skipping it.
+loop_threshold = 4
+# What counts as "the same branch": "edge" (source->dest), "destination", or "distance".
+loop_identity = "edge"
+# How repeats are counted: "consecutive" (resets when a different branch is taken) or
+# "cumulative" (lifetime total per branch).
+loop_count_mode = "consecutive"
+# On limit: "different_else_continue" (take another branch, else continue), "continue"
+# (always continue past it), or "different_only" (only ever substitute another branch).
+loop_skip_action = "different_else_continue"
+# Whether the forced eternal "last branch" can be skipped too (true can let the song end).
+break_last_branch = false
+# After a skip: "reset" the counter (loop can re-form) or "retire" the branch for the track
+# (cumulative only).
+loop_counter = "reset"
+
 # Order of analysis sources to try. Valid values: "spclient", "eternalbox".
 analysis_sources = ["spclient", "eternalbox"]
 
@@ -628,6 +646,10 @@ graphics = true
 # raise the sixel/iTerm2 cap.
 # graphics_max_px = 1280
 ```
+
+With `break_loops` on, the jukebox tracks how often each branch is taken and, once a branch
+hits `loop_threshold`, skips it to break short loops. A future `loop_count_mode = "cycle"`
+(not yet implemented) would detect whole repeating beat-cycles rather than single branches.
 
 Analysis comes from Spotify's internal client endpoint first; if that has no data for a track,
 the configurable eternalbox instance is tried (it only serves songs it has already analyzed).

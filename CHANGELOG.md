@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Optional graphical jukebox visualizer (`jukebox-graphics` feature): renders
   the beat graph as an image on kitty/iTerm2/sixel terminals, toggled with
   <kbd>g</kbd> / `:jukeboxgraphics`
+- Jukebox anti-loop (`[jukebox] break_loops`): skip an over-used branch to break
+  short loops, with tunable threshold, branch identity, counting, and skip action
 
 ### Fixed
 
