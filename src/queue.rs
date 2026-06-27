@@ -43,6 +43,11 @@ pub struct Queue {
     /// The playback order of the queue, as indices into `self.queue`.
     random_order: RwLock<Option<Vec<usize>>>,
     current_track: RwLock<Option<usize>>,
+    /// Stable per-entry ids, aligned 1:1 with `self.queue`. Runtime-only; not
+    /// persisted. Used by MPRIS to address duplicate queue entries uniquely.
+    ids: RwLock<Vec<u64>>,
+    /// Monotonic source of new entry ids.
+    id_counter: std::sync::atomic::AtomicU64,
     spotify: Spotify,
     cfg: Arc<Config>,
     library: Arc<Library>,
@@ -51,12 +56,18 @@ pub struct Queue {
 impl Queue {
     pub fn new(spotify: Spotify, cfg: Arc<Config>, library: Arc<Library>) -> Self {
         let queue_state = cfg.state().queuestate.clone();
+        let id_counter = std::sync::atomic::AtomicU64::new(0);
+        let ids = (0..queue_state.queue.len())
+            .map(|_| id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            .collect::<Vec<u64>>();
 
         Self {
             queue: Arc::new(RwLock::new(queue_state.queue)),
             spotify: spotify.clone(),
             current_track: RwLock::new(queue_state.current_track),
             random_order: RwLock::new(queue_state.random_order),
+            ids: RwLock::new(ids),
+            id_counter,
             cfg,
             library,
         }
@@ -123,6 +134,29 @@ impl Queue {
         *self.current_track.read().unwrap()
     }
 
+    fn next_id(&self) -> u64 {
+        self.id_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The stable id of the queue entry at `index`, if any.
+    #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
+    pub fn id_for_index(&self, index: usize) -> Option<u64> {
+        self.ids.read().unwrap().get(index).copied()
+    }
+
+    /// The current index of the entry with stable id `id`, if still present.
+    #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
+    pub fn index_for_id(&self, id: u64) -> Option<usize> {
+        self.ids.read().unwrap().iter().position(|&i| i == id)
+    }
+
+    /// All entry ids in queue order (aligned with `self.queue`).
+    #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
+    pub fn track_ids(&self) -> Vec<u64> {
+        self.ids.read().unwrap().clone()
+    }
+
     /// Insert `track` as the item that should logically follow the currently
     /// playing item, taking into account shuffle status.
     pub fn insert_after_current(&self, track: Playable) {
@@ -141,6 +175,8 @@ impl Queue {
             }
             let mut q = self.queue.write().unwrap();
             q.insert(index + 1, track);
+            let id = self.next_id();
+            self.ids.write().unwrap().insert(index + 1, id);
         } else {
             self.append(track);
         }
@@ -152,9 +188,10 @@ impl Queue {
         if let Some(order) = random_order.as_mut() {
             order.push(order.len());
         }
-
+        let id = self.next_id();
         let mut q = self.queue.write().unwrap();
         q.push(track);
+        self.ids.write().unwrap().push(id);
     }
 
     /// Append `tracks` after the currently playing item, taking into account
@@ -178,6 +215,9 @@ impl Queue {
             q.insert(i, track.clone());
         }
 
+        let new_ids: Vec<u64> = (0..tracks.len()).map(|_| self.next_id()).collect();
+        self.ids.write().unwrap().splice(first..first, new_ids);
+
         first
     }
 
@@ -191,6 +231,7 @@ impl Queue {
                 return;
             }
             q.remove(index);
+            self.ids.write().unwrap().remove(index);
         }
 
         // if the queue is empty stop playback
@@ -238,6 +279,7 @@ impl Queue {
 
         let mut q = self.queue.write().unwrap();
         q.clear();
+        self.ids.write().unwrap().clear();
 
         let mut random_order = self.random_order.write().unwrap();
         if let Some(o) = random_order.as_mut() {
@@ -255,6 +297,9 @@ impl Queue {
         let mut queue = self.queue.write().unwrap();
         let item = queue.remove(from);
         queue.insert(to, item);
+        let mut ids = self.ids.write().unwrap();
+        let id = ids.remove(from);
+        ids.insert(to, id);
 
         // if the currently playing track is affected by the shift, update its
         // index
@@ -561,10 +606,16 @@ mod tests {
         let ev = EventManager::new_for_test();
         let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
         let library = Library::new_for_test(ev, spotify.clone(), cfg.clone());
+        let id_counter = std::sync::atomic::AtomicU64::new(0);
+        let ids = (0..tracks.len())
+            .map(|_| id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            .collect::<Vec<u64>>();
         Queue {
             queue: Arc::new(RwLock::new(tracks)),
             random_order: RwLock::new(None),
             current_track: RwLock::new(current),
+            ids: RwLock::new(ids),
+            id_counter,
             spotify,
             cfg,
             library,
@@ -825,5 +876,54 @@ mod tests {
         q.clear();
         // clear() clears the order contents but leaves it as Some([]).
         assert_eq!(q.get_random_order(), Some(vec![]));
+    }
+
+    #[test]
+    fn test_ids_aligned_after_append() {
+        let q = make_queue(vec![make_track(0), make_track(1)], Some(0));
+        q.append(make_track(2));
+        assert_eq!(q.track_ids().len(), q.len());
+        // ids are unique
+        let mut ids = q.track_ids();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before);
+    }
+
+    #[test]
+    fn test_id_is_stable_across_remove_of_other() {
+        let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(0));
+        let id_of_2 = q.id_for_index(2).unwrap();
+        q.remove(0); // remove the first entry
+        // the entry formerly at index 2 keeps its id, now at index 1
+        assert_eq!(q.index_for_id(id_of_2), Some(1));
+    }
+
+    #[test]
+    fn test_index_for_unknown_id_is_none() {
+        let q = make_queue(vec![make_track(0)], Some(0));
+        assert_eq!(q.index_for_id(99_999), None);
+    }
+
+    #[test]
+    fn test_ids_aligned_after_shift() {
+        let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(0));
+        let id_first = q.id_for_index(0).unwrap();
+        q.shift(0, 2);
+        assert_eq!(q.index_for_id(id_first), Some(2));
+        assert_eq!(q.track_ids().len(), q.len());
+    }
+
+    #[test]
+    fn test_append_next_aligns_ids() {
+        let q = make_queue(vec![make_track(0), make_track(1)], Some(0));
+        q.append_next(&[make_track(2), make_track(3)]);
+        assert_eq!(q.track_ids().len(), q.len());
+        let mut ids = q.track_ids();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before, "ids must stay unique");
     }
 }
