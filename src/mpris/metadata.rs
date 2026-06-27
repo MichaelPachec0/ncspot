@@ -131,16 +131,10 @@ pub fn build_metadata(
             }
         })
         .unwrap_or(0.0);
-    hm.insert(
-        "xesam:userRating".to_string(),
-        Value::F64(saved_rating),
-    );
+    hm.insert("xesam:userRating".to_string(), Value::F64(saved_rating));
 
     // autoRating: mirror saved-track state (0.0/1.0), same source as userRating.
-    hm.insert(
-        "xesam:autoRating".to_string(),
-        Value::F64(saved_rating),
-    );
+    hm.insert("xesam:autoRating".to_string(), Value::F64(saved_rating));
 
     // Episode-only fields.
     if let Some(Playable::Episode(ep)) = playable {

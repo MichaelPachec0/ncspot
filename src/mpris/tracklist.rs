@@ -27,7 +27,11 @@ pub(crate) fn parse_queue_path(path: &ObjectPath<'_>) -> Option<u64> {
 pub(crate) fn resolve_single_playable(spotify: &Spotify, uri: &str) -> Option<Playable> {
     let id = &uri[uri.rfind(':').map(|i| i + 1).unwrap_or(0)..];
     match uri.parse::<UriType>().ok()? {
-        UriType::Track => spotify.api.track(id).ok().map(|t| Playable::Track(Track::from(&t))),
+        UriType::Track => spotify
+            .api
+            .track(id)
+            .ok()
+            .map(|t| Playable::Track(Track::from(&t))),
         UriType::Episode => spotify
             .api
             .episode(id)

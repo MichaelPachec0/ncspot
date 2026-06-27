@@ -15,8 +15,8 @@ use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
 use crate::queue::{Queue, RepeatSetting};
-use crate::spotify::{PlayerEvent, Spotify, VOLUME_PERCENT};
 use crate::spotify::UriType;
+use crate::spotify::{PlayerEvent, Spotify, VOLUME_PERCENT};
 use crate::spotify_url::SpotifyUrl;
 
 pub struct MprisPlayer {

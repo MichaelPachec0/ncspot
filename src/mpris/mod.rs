@@ -102,8 +102,14 @@ impl MprisManager {
         let (tx, rx) = mpsc::unbounded_channel::<MprisCommand>();
 
         ASYNC_RUNTIME.get().unwrap().spawn(async {
-            let result =
-                Self::serve(UnboundedReceiverStream::new(rx), root, player, tracklist, playlist_iface).await;
+            let result = Self::serve(
+                UnboundedReceiverStream::new(rx),
+                root,
+                player,
+                tracklist,
+                playlist_iface,
+            )
+            .await;
             if let Err(e) = result {
                 log::error!("MPRIS error: {e}");
             }
