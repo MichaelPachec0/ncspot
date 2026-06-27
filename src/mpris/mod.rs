@@ -42,9 +42,13 @@ pub(crate) fn no_track_path() -> ObjectPath<'static> {
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
 pub enum MprisCommand {
+    /// Emit playback status
     EmitPlaybackStatus,
+    /// Emit volume
     EmitVolumeStatus,
+    /// Emit metadata
     EmitMetadataStatus,
+    /// Emit seeked position
     EmitSeekedStatus(i64),
     /// Emit a LoopStatus PropertiesChanged signal.
     EmitLoopStatus,

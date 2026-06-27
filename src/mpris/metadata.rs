@@ -121,31 +121,25 @@ pub fn build_metadata(
                 .into(),
         ),
     );
+    let saved_rating: f64 = playable
+        .and_then(|p| p.track())
+        .map(|t| {
+            if library.is_saved_track(&Playable::Track(t)) {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .unwrap_or(0.0);
     hm.insert(
         "xesam:userRating".to_string(),
-        Value::F64(
-            playable
-                .and_then(|p| p.track())
-                .map(|t| match library.is_saved_track(&Playable::Track(t)) {
-                    true => 1.0,
-                    false => 0.0,
-                })
-                .unwrap_or(0.0),
-        ),
+        Value::F64(saved_rating),
     );
 
     // autoRating: mirror saved-track state (0.0/1.0), same source as userRating.
     hm.insert(
         "xesam:autoRating".to_string(),
-        Value::F64(
-            playable
-                .and_then(|p| p.track())
-                .map(|t| match library.is_saved_track(&Playable::Track(t)) {
-                    true => 1.0,
-                    false => 0.0,
-                })
-                .unwrap_or(0.0),
-        ),
+        Value::F64(saved_rating),
     );
 
     // Episode-only fields.

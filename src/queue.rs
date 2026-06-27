@@ -161,7 +161,7 @@ impl Queue {
     /// playing item, taking into account shuffle status.
     pub fn insert_after_current(&self, track: Playable) {
         if let Some(index) = self.get_current_index() {
-            let id = {
+            {
                 let mut random_order = self.random_order.write().unwrap();
                 if let Some(order) = random_order.as_mut() {
                     let next_i = order.iter().position(|&i| i == index).unwrap();
@@ -178,11 +178,10 @@ impl Queue {
                 q.insert(index + 1, track);
                 let id = self.next_id();
                 self.ids.write().unwrap().insert(index + 1, id);
-                id
-            };
-            #[cfg(feature = "mpris")]
-            self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
+                #[cfg(feature = "mpris")]
+                self.spotify
+                    .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
+            }
         } else {
             // No current track — append handles the emit.
             self.append(track);
