@@ -93,7 +93,14 @@ impl Jukebox {
         cfg: Arc<Config>,
     ) -> Arc<Self> {
         let jb_cfg = cfg.values().jukebox.clone().unwrap_or_default();
-        let settings = JukeboxSettings::from_config(&jb_cfg);
+        // Persisted (modal) tuning settings win over the config file once present; the
+        // modal's Reset clears them. The enabled/graphics toggles are intentionally NOT
+        // persisted, so the jukebox always starts disabled.
+        let settings = cfg
+            .state()
+            .jukebox
+            .clone()
+            .unwrap_or_else(|| JukeboxSettings::from_config(&jb_cfg));
         let enabled = jb_cfg.enabled.unwrap_or(false);
         let graphics = jb_cfg.graphics.unwrap_or(true);
         let inner = Arc::new(JukeboxInner::new(settings, enabled, graphics));

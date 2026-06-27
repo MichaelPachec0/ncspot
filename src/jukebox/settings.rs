@@ -1,13 +1,13 @@
 use crate::config::JukeboxConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopIdentity {
     Edge,
     Destination,
     Distance,
 }
 impl LoopIdentity {
-    fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "destination" => Self::Destination,
             "distance" => Self::Distance,
@@ -18,15 +18,22 @@ impl LoopIdentity {
             }
         }
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Edge => "edge",
+            Self::Destination => "destination",
+            Self::Distance => "distance",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopCountMode {
     Consecutive,
     Cumulative,
 }
 impl LoopCountMode {
-    fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "cumulative" => Self::Cumulative,
             "consecutive" => Self::Consecutive,
@@ -36,16 +43,22 @@ impl LoopCountMode {
             }
         }
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Consecutive => "consecutive",
+            Self::Cumulative => "cumulative",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopSkipAction {
     DifferentElseContinue,
     Continue,
     DifferentOnly,
 }
 impl LoopSkipAction {
-    fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "continue" => Self::Continue,
             "different_only" => Self::DifferentOnly,
@@ -56,15 +69,22 @@ impl LoopSkipAction {
             }
         }
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DifferentElseContinue => "different_else_continue",
+            Self::Continue => "continue",
+            Self::DifferentOnly => "different_only",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LoopCounter {
     Reset,
     Retire,
 }
 impl LoopCounter {
-    fn parse(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
             "retire" => Self::Retire,
             "reset" => Self::Reset,
@@ -74,9 +94,15 @@ impl LoopCounter {
             }
         }
     }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::Retire => "retire",
+        }
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AntiLoopSettings {
     pub enabled: bool,
     pub threshold: usize,
@@ -124,7 +150,7 @@ impl AntiLoopSettings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JukeboxSettings {
     pub max_branch_distance: u32,
     pub dynamic_threshold: bool,

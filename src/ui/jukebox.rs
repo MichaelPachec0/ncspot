@@ -795,7 +795,11 @@ impl ViewExt for JukeboxView {
                 Ok(CommandResult::Consumed(None))
             }
             Command::JukeboxSettings => {
-                crate::ui::jukebox_settings::open_settings_modal(s, self.jukebox.clone());
+                crate::ui::jukebox_settings::open_settings_modal(
+                    s,
+                    self.jukebox.clone(),
+                    self.cfg.clone(),
+                );
                 Ok(CommandResult::Consumed(None))
             }
             Command::JukeboxGraphics => {

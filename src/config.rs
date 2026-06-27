@@ -228,6 +228,11 @@ pub struct UserState {
     pub playlist_orders: HashMap<String, SortingOrder>,
     pub cache_version: u16,
     pub playback_state: PlaybackState,
+    /// Jukebox tuning settings persisted from the live settings modal. When present this
+    /// overrides the `[jukebox]` config; the modal's Reset clears it. Never holds the
+    /// endless-mode / graphics on/off toggles, so the jukebox always starts disabled.
+    #[serde(default)]
+    pub jukebox: Option<crate::jukebox::settings::JukeboxSettings>,
 }
 
 impl Default for UserState {
@@ -240,6 +245,7 @@ impl Default for UserState {
             playlist_orders: HashMap::new(),
             cache_version: 0,
             playback_state: PlaybackState::Default,
+            jukebox: None,
         }
     }
 }

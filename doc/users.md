@@ -563,8 +563,12 @@ example, to bind <kbd>p</kbd> to cycle providers and <kbd>r</kbd> to re-fetch:
 The Eternal Jukebox finds pathways through similar beats of a song and plays a never-ending,
 ever-changing version of it. Open the jukebox screen with <kbd>F10</kbd> or `:focus jukebox`,
 and toggle endless mode with `:jukeboxtoggle`. All settings are optional; the defaults match
-the original. They can also be tuned live for the session via the in-app settings modal
-(`:jukeboxsettings`).
+the original. They can also be tuned **live** via the in-app settings modal
+(`:jukeboxsettings`), which now covers the anti-loop options too. Changes made in the modal
+are **persisted** (to the runtime state file, not `config.toml`) and take precedence over
+`config.toml` on the next launch; the modal's **Reset** button clears the persisted values
+and restores your `config.toml`. The endless-mode and graphics on/off toggles are not
+persisted, so the jukebox always starts disabled.
 
 ```toml
 [jukebox]

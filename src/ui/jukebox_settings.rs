@@ -1,19 +1,28 @@
 use std::sync::Arc;
 
 use cursive::Cursive;
-use cursive::traits::{Nameable, Resizable};
+use cursive::traits::{Nameable, Resizable, Scrollable};
 use cursive::views::{Checkbox, Dialog, EditView, ListView};
 
+use crate::config::Config;
 use crate::jukebox::Jukebox;
-use crate::jukebox::settings::JukeboxSettings;
+use crate::jukebox::settings::{
+    AntiLoopSettings, JukeboxSettings, LoopCountMode, LoopCounter, LoopIdentity, LoopSkipAction,
+};
 use crate::ui::modal::Modal;
 
 fn num_field(value: impl std::fmt::Display) -> impl cursive::View {
     EditView::new().content(value.to_string()).fixed_width(10)
 }
 
-/// Build and show the jukebox settings modal, pre-filled from the live settings.
-pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>) {
+fn text_field(value: &str) -> impl cursive::View {
+    EditView::new().content(value).fixed_width(28)
+}
+
+/// Build and show the jukebox settings modal, pre-filled from the live settings. Apply
+/// updates the live settings and persists them; Reset clears the persisted override and
+/// restores the `config.toml` baseline.
+pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Config>) {
     let cur = jukebox.settings();
 
     let mut list = ListView::new();
@@ -62,22 +71,66 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>) {
         Checkbox::new().with_checked(cur.always_follow_last_branch).with_name("jb_follow"),
     );
 
+    list.add_child("─ Anti-loop ─", cursive::views::DummyView);
+    list.add_child(
+        "Break loops",
+        Checkbox::new().with_checked(cur.anti_loop.enabled).with_name("jb_break_loops"),
+    );
+    list.add_child(
+        "Loop threshold",
+        num_field(cur.anti_loop.threshold).with_name("jb_loop_threshold"),
+    );
+    list.add_child(
+        "Identity (edge/destination/distance)",
+        text_field(cur.anti_loop.identity.as_str()).with_name("jb_loop_identity"),
+    );
+    list.add_child(
+        "Count (consecutive/cumulative)",
+        text_field(cur.anti_loop.count_mode.as_str()).with_name("jb_loop_count"),
+    );
+    list.add_child(
+        "Skip (different_else_continue/continue/different_only)",
+        text_field(cur.anti_loop.skip_action.as_str()).with_name("jb_loop_skip"),
+    );
+    list.add_child(
+        "Break last branch",
+        Checkbox::new().with_checked(cur.anti_loop.break_last_branch).with_name("jb_break_last"),
+    );
+    list.add_child(
+        "Counter (reset/retire)",
+        text_field(cur.anti_loop.counter.as_str()).with_name("jb_loop_counter"),
+    );
+
     let apply_jukebox = jukebox.clone();
+    let apply_cfg = cfg.clone();
     let reset_jukebox = jukebox.clone();
-    let dialog = Dialog::around(list)
+    let reset_cfg = cfg.clone();
+    let dialog = Dialog::around(list.scrollable())
         .title("Jukebox Settings")
         .button("Apply", move |s| {
             let new = collect_settings(s, &apply_jukebox.settings());
-            apply_jukebox.apply_settings(new);
+            apply_jukebox.apply_settings(new.clone());
+            persist(&apply_cfg, new);
             s.pop_layer();
         })
         .button("Reset", move |s| {
-            reset_jukebox.apply_settings(JukeboxSettings::default());
+            // Forget the persisted override and restore the config.toml baseline.
+            let base = JukeboxSettings::from_config(
+                &reset_cfg.values().jukebox.clone().unwrap_or_default(),
+            );
+            reset_cfg.with_state_mut(|st| st.jukebox = None);
+            reset_cfg.save_state();
+            reset_jukebox.apply_settings(base);
             s.pop_layer();
         })
         .dismiss_button("Cancel");
 
     s.add_layer(Modal::new(dialog));
+}
+
+fn persist(cfg: &Config, settings: JukeboxSettings) {
+    cfg.with_state_mut(|st| st.jukebox = Some(settings.clone()));
+    cfg.save_state();
 }
 
 fn read_num<T: std::str::FromStr>(s: &mut Cursive, name: &str, fallback: T) -> T {
@@ -88,6 +141,10 @@ fn read_num<T: std::str::FromStr>(s: &mut Cursive, name: &str, fallback: T) -> T
 
 fn read_bool(s: &mut Cursive, name: &str, fallback: bool) -> bool {
     s.call_on_name(name, |v: &mut Checkbox| v.is_checked()).unwrap_or(fallback)
+}
+
+fn read_str(s: &mut Cursive, name: &str) -> Option<String> {
+    s.call_on_name(name, |v: &mut EditView| v.get_content().to_string())
 }
 
 fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
@@ -103,6 +160,22 @@ fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
         add_last_branch: read_bool(s, "jb_last", cur.add_last_branch),
         always_follow_last_branch: read_bool(s, "jb_follow", cur.always_follow_last_branch),
         max_play_time_secs: read_num(s, "jb_maxtime", cur.max_play_time_secs),
-        anti_loop: cur.anti_loop,
+        anti_loop: AntiLoopSettings {
+            enabled: read_bool(s, "jb_break_loops", cur.anti_loop.enabled),
+            threshold: read_num::<usize>(s, "jb_loop_threshold", cur.anti_loop.threshold).max(1),
+            identity: read_str(s, "jb_loop_identity")
+                .map(|t| LoopIdentity::parse(&t))
+                .unwrap_or(cur.anti_loop.identity),
+            count_mode: read_str(s, "jb_loop_count")
+                .map(|t| LoopCountMode::parse(&t))
+                .unwrap_or(cur.anti_loop.count_mode),
+            skip_action: read_str(s, "jb_loop_skip")
+                .map(|t| LoopSkipAction::parse(&t))
+                .unwrap_or(cur.anti_loop.skip_action),
+            break_last_branch: read_bool(s, "jb_break_last", cur.anti_loop.break_last_branch),
+            counter: read_str(s, "jb_loop_counter")
+                .map(|t| LoopCounter::parse(&t))
+                .unwrap_or(cur.anti_loop.counter),
+        },
     }
 }
