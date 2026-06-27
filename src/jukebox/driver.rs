@@ -1,5 +1,31 @@
+use std::collections::HashMap;
+
 use crate::jukebox::graph::{Edge, SongGraph};
-use crate::jukebox::settings::JukeboxSettings;
+use crate::jukebox::settings::{
+    JukeboxSettings, LoopCountMode, LoopCounter, LoopIdentity, LoopSkipAction,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum LoopKey {
+    Edge(usize, usize),
+    Dest(usize),
+    Dist(i64),
+}
+
+fn loop_key(edge: Edge, identity: LoopIdentity) -> LoopKey {
+    match identity {
+        LoopIdentity::Edge => LoopKey::Edge(edge.source, edge.destination),
+        LoopIdentity::Destination => LoopKey::Dest(edge.destination),
+        LoopIdentity::Distance => LoopKey::Dist(edge.source as i64 - edge.destination as i64),
+    }
+}
+
+#[derive(Default)]
+struct LoopState {
+    counts: HashMap<LoopKey, usize>,
+    last_key: Option<LoopKey>,
+    streak: usize,
+}
 
 pub trait RandomSource: Send {
     fn random_unit(&mut self) -> f64;
@@ -65,6 +91,7 @@ pub struct Driver {
     jumps: u64,
     start_ms: u64,
     neighbour_cursor: Vec<usize>,
+    loop_state: LoopState,
 }
 
 impl Driver {
@@ -92,6 +119,7 @@ impl Driver {
             jumps: 0,
             start_ms,
             neighbour_cursor: vec![0; n],
+            loop_state: LoopState::default(),
         }
     }
 
@@ -218,14 +246,134 @@ impl Driver {
         if self.graph.beats[next_index].neighbours.is_empty() {
             return next_index;
         }
-        if self.should_random_branch(next_index) {
-            let edge = self.rotate_neighbour(next_index);
-            self.beats_since_last_branch = 0;
-            self.last_branch = Some(edge);
-            self.jumps += 1;
-            return edge.destination;
+        if !self.should_random_branch(next_index) {
+            return next_index;
         }
-        next_index
+        let edge = self.rotate_neighbour(next_index);
+
+        if !self.settings.anti_loop.enabled {
+            return self.take_branch(edge);
+        }
+
+        let key = loop_key(edge, self.settings.anti_loop.identity);
+        if self.loop_count(key) < self.settings.anti_loop.threshold {
+            return self.take_branch(edge);
+        }
+
+        // Loop limit reached for this branch.
+        let forced = next_index == self.graph.last_branch_point
+            && self.settings.always_follow_last_branch;
+        if forced && !self.settings.anti_loop.break_last_branch {
+            return self.take_branch(edge); // never break the eternal mechanism
+        }
+
+        match self.settings.anti_loop.skip_action {
+            LoopSkipAction::DifferentElseContinue => {
+                if let Some(d) = self.first_under_limit_neighbour(next_index, edge) {
+                    self.on_skip(key);
+                    self.take_branch(d)
+                } else {
+                    self.on_skip(key);
+                    next_index
+                }
+            }
+            LoopSkipAction::Continue => {
+                self.on_skip(key);
+                next_index
+            }
+            LoopSkipAction::DifferentOnly => {
+                if let Some(d) = self.first_under_limit_neighbour(next_index, edge) {
+                    self.on_skip(key);
+                    self.take_branch(d)
+                } else {
+                    self.take_branch(edge)
+                }
+            }
+        }
+    }
+
+    /// Commit to `edge`: update playback state and the anti-loop counters.
+    fn take_branch(&mut self, edge: Edge) -> usize {
+        self.beats_since_last_branch = 0;
+        self.last_branch = Some(edge);
+        self.jumps += 1;
+        self.record_take(edge);
+        edge.destination
+    }
+
+    fn record_take(&mut self, edge: Edge) {
+        if !self.settings.anti_loop.enabled {
+            return;
+        }
+        let key = loop_key(edge, self.settings.anti_loop.identity);
+        match self.settings.anti_loop.count_mode {
+            LoopCountMode::Cumulative => {
+                *self.loop_state.counts.entry(key).or_insert(0) += 1;
+            }
+            LoopCountMode::Consecutive => {
+                if self.loop_state.last_key == Some(key) {
+                    self.loop_state.streak += 1;
+                } else {
+                    self.loop_state.last_key = Some(key);
+                    self.loop_state.streak = 1;
+                }
+            }
+        }
+    }
+
+    fn loop_count(&self, key: LoopKey) -> usize {
+        match self.settings.anti_loop.count_mode {
+            LoopCountMode::Cumulative => self.loop_state.counts.get(&key).copied().unwrap_or(0),
+            LoopCountMode::Consecutive => {
+                if self.loop_state.last_key == Some(key) {
+                    self.loop_state.streak
+                } else {
+                    0
+                }
+            }
+        }
+    }
+
+    fn on_skip(&mut self, key: LoopKey) {
+        let consecutive = matches!(self.settings.anti_loop.count_mode, LoopCountMode::Consecutive);
+        match self.settings.anti_loop.counter {
+            LoopCounter::Reset => {
+                self.loop_state.counts.remove(&key);
+                if self.loop_state.last_key == Some(key) {
+                    self.loop_state.last_key = None;
+                    self.loop_state.streak = 0;
+                }
+            }
+            LoopCounter::Retire => {
+                // Cumulative: leave the count (stays >= threshold -> keeps skipping).
+                // Consecutive: a streak inherently breaks once a different branch / continue
+                // happens, so clear it like reset.
+                if consecutive && self.loop_state.last_key == Some(key) {
+                    self.loop_state.last_key = None;
+                    self.loop_state.streak = 0;
+                }
+            }
+        }
+    }
+
+    /// First neighbour of `beat` (in rotation order, excluding `skip`) whose identity key is
+    /// under the threshold. Advances `neighbour_cursor` as it scans.
+    fn first_under_limit_neighbour(&mut self, beat: usize, skip: Edge) -> Option<Edge> {
+        let len = self.graph.beats[beat].neighbours.len();
+        let threshold = self.settings.anti_loop.threshold;
+        for _ in 0..len {
+            let cur = self.neighbour_cursor[beat];
+            let edge = self.graph.beats[beat].neighbours[cur % len];
+            self.neighbour_cursor[beat] = (cur + 1) % len;
+            if edge.source == skip.source && edge.destination == skip.destination {
+                continue;
+            }
+            let key = loop_key(edge, self.settings.anti_loop.identity);
+            if self.loop_count(key) < threshold {
+                return Some(edge);
+            }
+        }
+        None
     }
 
     fn select_next_neighbor(&mut self, beat_index: usize) -> usize {
@@ -375,5 +523,97 @@ mod tests {
         d.process(9500.0); // beat 9 (last)
         let action = d.process(10500.0); // past the end
         assert_eq!(action, DriverAction::Stop);
+    }
+
+    // ---- anti-loop ----
+
+    use crate::jukebox::settings::{AntiLoopSettings, LoopCountMode};
+
+    // 10 beats; beat 5 has the given neighbour edges. last_branch_point is non-forced (99).
+    fn graph_with_neighbours(neigh: Vec<Edge>) -> SongGraph {
+        let mut beats: Vec<Beat> = (0..10)
+            .map(|i| Beat {
+                index: i,
+                start_ms: i as f64 * 1000.0,
+                duration_ms: 1000.0,
+                neighbours: vec![],
+            })
+            .collect();
+        beats[5].neighbours = neigh;
+        SongGraph { beats, last_branch_point: 99, longest_reach: 0.0 }
+    }
+
+    fn antiloop_driver(graph: SongGraph, anti_loop: AntiLoopSettings) -> Driver {
+        let settings = JukeboxSettings { anti_loop, ..JukeboxSettings::default() };
+        Driver::new(
+            graph,
+            settings,
+            Box::new(SeqRandom { vals: vec![0.0], i: 0 }),
+            Box::new(FakeClock { ms: 0 }),
+        )
+    }
+
+    fn al(enabled: bool) -> AntiLoopSettings {
+        AntiLoopSettings { enabled, threshold: 3, ..AntiLoopSettings::default() }
+    }
+
+    // Branch from beat 5 once, resetting the min-beats gate each call so should_random_branch
+    // fires every time.
+    fn branch_once(d: &mut Driver) -> usize {
+        d.beats_since_last_branch = 100;
+        d.select_random_next_beat(5)
+    }
+
+    #[test]
+    fn antiloop_disabled_always_branches() {
+        let g = graph_with_neighbours(vec![Edge { source: 5, destination: 1, distance: 1.0 }]);
+        let mut d = antiloop_driver(g, al(false));
+        for _ in 0..6 {
+            assert_eq!(branch_once(&mut d), 1);
+        }
+    }
+
+    #[test]
+    fn antiloop_skips_after_threshold_continues_linearly() {
+        let g = graph_with_neighbours(vec![Edge { source: 5, destination: 1, distance: 1.0 }]);
+        let mut d = antiloop_driver(g, al(true)); // threshold 3, different_else_continue
+        assert_eq!(branch_once(&mut d), 1); // 1
+        assert_eq!(branch_once(&mut d), 1); // 2
+        assert_eq!(branch_once(&mut d), 1); // 3
+        // limit hit, only one neighbour -> continue linearly (return next_index = 5)
+        assert_eq!(branch_once(&mut d), 5);
+        // reset counter let it branch again
+        assert_eq!(branch_once(&mut d), 1);
+    }
+
+    #[test]
+    fn antiloop_substitutes_different_branch() {
+        let g = graph_with_neighbours(vec![
+            Edge { source: 5, destination: 1, distance: 1.0 },
+            Edge { source: 5, destination: 8, distance: 1.0 },
+        ]);
+        let anti = AntiLoopSettings {
+            enabled: true,
+            threshold: 3,
+            count_mode: LoopCountMode::Cumulative,
+            ..AntiLoopSettings::default()
+        };
+        let mut d = antiloop_driver(g, anti); // skip_action = different_else_continue (default)
+        // Pre-seed edge 5->1 at the limit; 5->8 is fresh. The rotation's first candidate is
+        // 5->1 (cursor 0), which is over-limit, so it must substitute the under-limit 5->8.
+        d.loop_state.counts.insert(LoopKey::Edge(5, 1), 3);
+        assert_eq!(branch_once(&mut d), 8);
+    }
+
+    #[test]
+    fn antiloop_excludes_forced_last_branch() {
+        // beat 5 IS the forced last-branch point; default break_last_branch=false.
+        let mut g = graph_with_neighbours(vec![Edge { source: 5, destination: 1, distance: 1.0 }]);
+        g.last_branch_point = 5;
+        let mut d = antiloop_driver(g, al(true)); // always_follow_last_branch defaults true
+        // Even past the threshold, the forced last-branch is always taken.
+        for _ in 0..6 {
+            assert_eq!(branch_once(&mut d), 1);
+        }
     }
 }
