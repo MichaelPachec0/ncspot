@@ -622,10 +622,11 @@ branch_layouts = ["linear", "radial", "split"]
 # Toggle live with `g` / :jukeboxgraphics.
 graphics = true
 
-# Maximum pixel size (longest edge) of the rendered graphics image. Larger is sharper but
-# heavier to transmit each frame: raise it if the image looks soft, lower it if input feels
-# laggy while in graphics mode.
-graphics_max_px = 1280
+# Cap the rendered graphics image's longest edge (pixels). When unset, kitty renders at
+# native cell-box resolution (full fidelity, since PNG transmission is cheap) while sixel/
+# iTerm2 caps to 1280. Set it to also cap kitty (lower if input ever feels laggy), or to
+# raise the sixel/iTerm2 cap.
+# graphics_max_px = 1280
 ```
 
 Analysis comes from Spotify's internal client endpoint first; if that has no data for a track,

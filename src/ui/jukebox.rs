@@ -568,18 +568,24 @@ impl JukeboxView {
                 }
 
                 if let Some(state) = self.jukebox.state() {
-                    // Cap the longest edge to max_px while preserving aspect (independent
-                    // capping would distort the circle); the terminal scales it to the cell box.
-                    let max_px = self
+                    let px_w = (req.size.x * self.font_size.x).max(1);
+                    let px_h = (req.size.y * self.font_size.y).max(1);
+                    // kitty transmits a cheap PNG, so render at native cell-box resolution
+                    // (uncapped) for full fidelity; viuer sends raw RGBA, so keep it capped.
+                    // `graphics_max_px`, if set, caps either. Aspect is preserved (independent
+                    // capping would distort the circle).
+                    let cfg_max = self
                         .cfg
                         .values()
                         .jukebox
                         .as_ref()
-                        .and_then(|j| j.graphics_max_px)
-                        .unwrap_or(DEFAULT_MAX_PX)
-                        .max(1);
-                    let px_w = (req.size.x * self.font_size.x).max(1);
-                    let px_h = (req.size.y * self.font_size.y).max(1);
+                        .and_then(|j| j.graphics_max_px);
+                    let max_px = if kitty {
+                        cfg_max.unwrap_or(usize::MAX)
+                    } else {
+                        cfg_max.unwrap_or(DEFAULT_MAX_PX)
+                    }
+                    .max(1);
                     let scale = (max_px as f64 / px_w.max(px_h) as f64).min(1.0);
                     let size_px = (
                         ((px_w as f64 * scale) as u32).max(1),
