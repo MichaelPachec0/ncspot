@@ -3,6 +3,7 @@
 mod metadata;
 mod player;
 mod root;
+mod tracklist;
 
 use std::error::Error;
 use std::sync::Arc;
@@ -20,8 +21,10 @@ use crate::library::Library;
 use crate::queue::Queue;
 use crate::spotify::Spotify;
 
+use metadata::build_metadata;
 use player::MprisPlayer;
 use root::MprisRoot;
+use tracklist::MprisTrackList;
 
 /// D-Bus object path for a queue entry with the given stable id.
 pub(crate) fn track_path_for_id(id: u64) -> ObjectPath<'static> {
@@ -45,6 +48,14 @@ pub enum MprisCommand {
     EmitLoopStatus,
     /// Emit a Shuffle PropertiesChanged signal.
     EmitShuffleStatus,
+    /// The whole track list changed (clear, bulk add, reorder, activate playlist).
+    EmitTrackListReplaced,
+    /// A single entry with this stable id was added.
+    EmitTrackAdded(u64),
+    /// The entry with this stable id was removed.
+    EmitTrackRemoved(u64),
+    /// The metadata of the entry with this stable id changed.
+    EmitTrackMetadataChanged(u64),
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -64,6 +75,11 @@ impl MprisManager {
         let root = MprisRoot {};
         let player = MprisPlayer {
             event,
+            queue: queue.clone(),
+            library: library.clone(),
+            spotify: spotify.clone(),
+        };
+        let tracklist = MprisTrackList {
             queue,
             library,
             spotify,
@@ -72,7 +88,8 @@ impl MprisManager {
         let (tx, rx) = mpsc::unbounded_channel::<MprisCommand>();
 
         ASYNC_RUNTIME.get().unwrap().spawn(async {
-            let result = Self::serve(UnboundedReceiverStream::new(rx), root, player).await;
+            let result =
+                Self::serve(UnboundedReceiverStream::new(rx), root, player, tracklist).await;
             if let Err(e) = result {
                 log::error!("MPRIS error: {e}");
             }
@@ -85,11 +102,13 @@ impl MprisManager {
         mut rx: UnboundedReceiverStream<MprisCommand>,
         root: MprisRoot,
         player: MprisPlayer,
+        tracklist: MprisTrackList,
     ) -> Result<(), Box<dyn Error + Sync + Send>> {
         let conn = connection::Builder::session()?
             .name(instance_bus_name())?
             .serve_at("/org/mpris/MediaPlayer2", root)?
             .serve_at("/org/mpris/MediaPlayer2", player)?
+            .serve_at("/org/mpris/MediaPlayer2", tracklist)?
             .build()
             .await?;
 
@@ -98,6 +117,9 @@ impl MprisManager {
             .interface::<_, MprisPlayer>("/org/mpris/MediaPlayer2")
             .await?;
         let player_iface = player_iface_ref.get().await;
+        let tracklist_iface_ref = object_server
+            .interface::<_, MprisTrackList>("/org/mpris/MediaPlayer2")
+            .await?;
 
         loop {
             let ctx = player_iface_ref.signal_emitter();
@@ -121,6 +143,70 @@ impl MprisManager {
                 }
                 Some(MprisCommand::EmitShuffleStatus) => {
                     player_iface.shuffle_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitTrackListReplaced) => {
+                    let tl_ctx = tracklist_iface_ref.signal_emitter();
+                    let tl = tracklist_iface_ref.get().await;
+                    let tracks = tl.tracks();
+                    let current = tl
+                        .queue
+                        .get_current_index()
+                        .and_then(|i| tl.queue.id_for_index(i))
+                        .map(track_path_for_id)
+                        .unwrap_or_else(no_track_path);
+                    MprisTrackList::track_list_replaced(tl_ctx, tracks, current).await?;
+                }
+                Some(MprisCommand::EmitTrackAdded(id)) => {
+                    let tl_ctx = tracklist_iface_ref.signal_emitter();
+                    let tl = tracklist_iface_ref.get().await;
+                    if let Some(index) = tl.queue.index_for_id(id) {
+                        let playable = tl.queue.queue.read().unwrap().get(index).cloned();
+                        if let Some(p) = playable {
+                            let md = build_metadata(
+                                Some(&p),
+                                track_path_for_id(id),
+                                &tl.spotify,
+                                &tl.library,
+                            );
+                            // after = predecessor's path, or NoTrack if first
+                            let after = if index == 0 {
+                                no_track_path()
+                            } else {
+                                tl.queue
+                                    .id_for_index(index - 1)
+                                    .map(track_path_for_id)
+                                    .unwrap_or_else(no_track_path)
+                            };
+                            MprisTrackList::track_added(tl_ctx, md, after).await?;
+                        }
+                    }
+                }
+                Some(MprisCommand::EmitTrackRemoved(id)) => {
+                    let tl_ctx = tracklist_iface_ref.signal_emitter();
+                    MprisTrackList::track_removed(tl_ctx, track_path_for_id(id)).await?;
+                }
+                Some(MprisCommand::EmitTrackMetadataChanged(id)) => {
+                    let tl_ctx = tracklist_iface_ref.signal_emitter();
+                    let tl = tracklist_iface_ref.get().await;
+                    if let Some(index) = tl.queue.index_for_id(id) {
+                        // Separate the lock read from the await to avoid holding
+                        // a RwLockReadGuard across an await point.
+                        let p = tl.queue.queue.read().unwrap().get(index).cloned();
+                        if let Some(p) = p {
+                            let md = build_metadata(
+                                Some(&p),
+                                track_path_for_id(id),
+                                &tl.spotify,
+                                &tl.library,
+                            );
+                            MprisTrackList::track_metadata_changed(
+                                tl_ctx,
+                                track_path_for_id(id),
+                                md,
+                            )
+                            .await?;
+                        }
+                    }
                 }
                 None => break,
             }

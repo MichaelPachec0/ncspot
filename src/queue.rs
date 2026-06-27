@@ -161,23 +161,30 @@ impl Queue {
     /// playing item, taking into account shuffle status.
     pub fn insert_after_current(&self, track: Playable) {
         if let Some(index) = self.get_current_index() {
-            let mut random_order = self.random_order.write().unwrap();
-            if let Some(order) = random_order.as_mut() {
-                let next_i = order.iter().position(|&i| i == index).unwrap();
-                // shift everything after the insertion in order
-                for item in order.iter_mut() {
-                    if *item > index {
-                        *item += 1;
+            let id = {
+                let mut random_order = self.random_order.write().unwrap();
+                if let Some(order) = random_order.as_mut() {
+                    let next_i = order.iter().position(|&i| i == index).unwrap();
+                    // shift everything after the insertion in order
+                    for item in order.iter_mut() {
+                        if *item > index {
+                            *item += 1;
+                        }
                     }
+                    // finally, add the next track index
+                    order.insert(next_i + 1, index + 1);
                 }
-                // finally, add the next track index
-                order.insert(next_i + 1, index + 1);
-            }
-            let mut q = self.queue.write().unwrap();
-            q.insert(index + 1, track);
-            let id = self.next_id();
-            self.ids.write().unwrap().insert(index + 1, id);
+                let mut q = self.queue.write().unwrap();
+                q.insert(index + 1, track);
+                let id = self.next_id();
+                self.ids.write().unwrap().insert(index + 1, id);
+                id
+            };
+            #[cfg(feature = "mpris")]
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
         } else {
+            // No current track — append handles the emit.
             self.append(track);
         }
     }
@@ -189,55 +196,74 @@ impl Queue {
             order.push(order.len());
         }
         let id = self.next_id();
-        let mut q = self.queue.write().unwrap();
-        q.push(track);
-        self.ids.write().unwrap().push(id);
+        {
+            let mut q = self.queue.write().unwrap();
+            q.push(track);
+            self.ids.write().unwrap().push(id);
+        }
+        drop(random_order);
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
     }
 
     /// Append `tracks` after the currently playing item, taking into account
     /// shuffle status. Returns the first index(in `self.queue`) of added items.
     pub fn append_next(&self, tracks: &[Playable]) -> usize {
-        let mut q = self.queue.write().unwrap();
+        let first = {
+            let mut q = self.queue.write().unwrap();
 
-        {
-            let mut random_order = self.random_order.write().unwrap();
-            if let Some(order) = random_order.as_mut() {
-                order.extend((q.len().saturating_sub(1))..(q.len() + tracks.len()));
+            {
+                let mut random_order = self.random_order.write().unwrap();
+                if let Some(order) = random_order.as_mut() {
+                    order.extend((q.len().saturating_sub(1))..(q.len() + tracks.len()));
+                }
             }
-        }
 
-        let first = match *self.current_track.read().unwrap() {
-            Some(index) => index + 1,
-            None => q.len(),
+            let first = match *self.current_track.read().unwrap() {
+                Some(index) => index + 1,
+                None => q.len(),
+            };
+
+            for (i, track) in (first..).zip(tracks.iter()) {
+                q.insert(i, track.clone());
+            }
+
+            let new_ids: Vec<u64> = (0..tracks.len()).map(|_| self.next_id()).collect();
+            self.ids.write().unwrap().splice(first..first, new_ids);
+
+            first
         };
-
-        for (i, track) in (first..).zip(tracks.iter()) {
-            q.insert(i, track.clone());
-        }
-
-        let new_ids: Vec<u64> = (0..tracks.len()).map(|_| self.next_id()).collect();
-        self.ids.write().unwrap().splice(first..first, new_ids);
-
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
         first
     }
 
     /// Remove the item at `index`. This doesn't take into account shuffle
     /// status, and will literally remove the item at `index` in `self.queue`.
     pub fn remove(&self, index: usize) {
-        {
-            let mut q = self.queue.write().unwrap();
-            if q.is_empty() {
-                info!("queue is empty");
-                return;
-            }
-            q.remove(index);
-            self.ids.write().unwrap().remove(index);
+        let mut q = self.queue.write().unwrap();
+        if q.is_empty() {
+            info!("queue is empty");
+            return;
         }
+        // Capture the stable id of the entry we are about to remove (for MPRIS signal).
+        #[cfg(feature = "mpris")]
+        let removed_id = self.ids.read().unwrap().get(index).copied();
+        q.remove(index);
+        self.ids.write().unwrap().remove(index);
+        drop(q);
 
         // if the queue is empty stop playback
         let len = self.queue.read().unwrap().len();
         if len == 0 {
             self.stop();
+            #[cfg(feature = "mpris")]
+            if let Some(id) = removed_id {
+                self.spotify
+                    .send_mpris(crate::mpris::MprisCommand::EmitTrackRemoved(id));
+            }
             return;
         }
 
@@ -271,20 +297,31 @@ impl Queue {
         if self.get_shuffle() {
             self.generate_random_order();
         }
+
+        #[cfg(feature = "mpris")]
+        if let Some(id) = removed_id {
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitTrackRemoved(id));
+        }
     }
 
     /// Clear all the items from the queue and stop playback.
     pub fn clear(&self) {
         self.stop();
 
-        let mut q = self.queue.write().unwrap();
-        q.clear();
-        self.ids.write().unwrap().clear();
+        {
+            let mut q = self.queue.write().unwrap();
+            q.clear();
+            self.ids.write().unwrap().clear();
 
-        let mut random_order = self.random_order.write().unwrap();
-        if let Some(o) = random_order.as_mut() {
-            o.clear()
+            let mut random_order = self.random_order.write().unwrap();
+            if let Some(o) = random_order.as_mut() {
+                o.clear()
+            }
         }
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
     }
 
     /// The amount of items in `self.queue`.
@@ -294,25 +331,30 @@ impl Queue {
 
     /// Shift the item at `from` in `self.queue` to `to`.
     pub fn shift(&self, from: usize, to: usize) {
-        let mut queue = self.queue.write().unwrap();
-        let item = queue.remove(from);
-        queue.insert(to, item);
-        let mut ids = self.ids.write().unwrap();
-        let id = ids.remove(from);
-        ids.insert(to, id);
+        {
+            let mut queue = self.queue.write().unwrap();
+            let item = queue.remove(from);
+            queue.insert(to, item);
+            let mut ids = self.ids.write().unwrap();
+            let id = ids.remove(from);
+            ids.insert(to, id);
 
-        // if the currently playing track is affected by the shift, update its
-        // index
-        let mut current = self.current_track.write().unwrap();
-        if let Some(index) = *current {
-            if index == from {
-                current.replace(to);
-            } else if index == to && from > index {
-                current.replace(to + 1);
-            } else if index == to && from < index {
-                current.replace(to - 1);
+            // if the currently playing track is affected by the shift, update its
+            // index
+            let mut current = self.current_track.write().unwrap();
+            if let Some(index) = *current {
+                if index == from {
+                    current.replace(to);
+                } else if index == to && from > index {
+                    current.replace(to + 1);
+                } else if index == to && from < index {
+                    current.replace(to - 1);
+                }
             }
         }
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
     }
 
     /// Play the item at `index` in `self.queue`.
