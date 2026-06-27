@@ -96,32 +96,32 @@ impl MprisTrackList {
             if set_as_current {
                 self.queue.play(0, false, false);
             }
-        } else if let Some(id) = parse_queue_path(&after_track) {
-            if let Some(index) = self.queue.index_for_id(id) {
-                self.queue.append(playable);
-                let last = self.queue.len().saturating_sub(1);
-                let dest = index + 1;
-                self.queue.shift(last, dest);
-                if set_as_current {
-                    self.queue.play(dest, false, false);
-                }
+        } else if let Some(id) = parse_queue_path(&after_track)
+            && let Some(index) = self.queue.index_for_id(id)
+        {
+            self.queue.append(playable);
+            let last = self.queue.len().saturating_sub(1);
+            let dest = index + 1;
+            self.queue.shift(last, dest);
+            if set_as_current {
+                self.queue.play(dest, false, false);
             }
         }
     }
 
     fn remove_track(&self, track_id: ObjectPath<'_>) {
-        if let Some(id) = parse_queue_path(&track_id) {
-            if let Some(index) = self.queue.index_for_id(id) {
-                self.queue.remove(index);
-            }
+        if let Some(id) = parse_queue_path(&track_id)
+            && let Some(index) = self.queue.index_for_id(id)
+        {
+            self.queue.remove(index);
         }
     }
 
     fn go_to(&self, track_id: ObjectPath<'_>) {
-        if let Some(id) = parse_queue_path(&track_id) {
-            if let Some(index) = self.queue.index_for_id(id) {
-                self.queue.play(index, false, false);
-            }
+        if let Some(id) = parse_queue_path(&track_id)
+            && let Some(index) = self.queue.index_for_id(id)
+        {
+            self.queue.play(index, false, false);
         }
     }
 

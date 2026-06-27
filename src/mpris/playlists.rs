@@ -51,22 +51,20 @@ pub struct MprisPlaylists {
     pub active_playlist_id: Arc<Mutex<Option<String>>>,
 }
 
-impl MprisPlaylists {
-    fn all_playlist_tuples(&self) -> Vec<(OwnedObjectPath, String, String)> {
-        self.library
-            .playlists
-            .read()
-            .unwrap()
-            .iter()
-            .map(|p| {
-                (
-                    playlist_path_for_id(&p.id),
-                    p.name.clone(),
-                    String::new(), // art_url – not available
-                )
-            })
-            .collect()
-    }
+fn all_playlist_tuples(library: &Library) -> Vec<(OwnedObjectPath, String, String)> {
+    library
+        .playlists
+        .read()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                playlist_path_for_id(&p.id),
+                p.name.clone(),
+                String::new(), // art_url – not available
+            )
+        })
+        .collect()
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Playlists")]
@@ -150,7 +148,7 @@ impl MprisPlaylists {
         _order: String,
         reverse_order: bool,
     ) -> Vec<(OwnedObjectPath, String, String)> {
-        let all = self.all_playlist_tuples();
+        let all = all_playlist_tuples(&self.library);
         page_playlists(&all, index, max_count, reverse_order)
     }
 
