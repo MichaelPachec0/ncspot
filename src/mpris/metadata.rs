@@ -134,5 +134,116 @@ pub fn build_metadata(
         ),
     );
 
+    // autoRating: mirror saved-track state (0.0/1.0), same source as userRating.
+    hm.insert(
+        "xesam:autoRating".to_string(),
+        Value::F64(
+            playable
+                .and_then(|p| p.track())
+                .map(|t| match library.is_saved_track(&Playable::Track(t)) {
+                    true => 1.0,
+                    false => 0.0,
+                })
+                .unwrap_or(0.0),
+        ),
+    );
+
+    // Episode-only fields.
+    if let Some(Playable::Episode(ep)) = playable {
+        if !ep.release_date.is_empty() {
+            hm.insert(
+                "xesam:contentCreated".to_string(),
+                Value::Str(ep.release_date.clone().into()),
+            );
+        }
+        if !ep.description.is_empty() {
+            hm.insert(
+                "xesam:comment".to_string(),
+                Value::Array(vec![ep.description.clone()].into()),
+            );
+        }
+    }
+
     hm
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::events::EventManager;
+    use crate::model::episode::Episode;
+    use crate::model::track::Track;
+
+    fn ctx() -> (Spotify, std::sync::Arc<Library>) {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify.clone(), cfg);
+        (spotify, library)
+    }
+
+    fn sample_episode() -> Episode {
+        Episode {
+            id: "ep1".to_string(),
+            uri: "spotify:episode:ep1".to_string(),
+            duration: 60_000,
+            name: "Ep One".to_string(),
+            description: "A description".to_string(),
+            release_date: "2021-05-04".to_string(),
+            cover_url: Some("http://img".to_string()),
+            added_at: None,
+            list_index: 0,
+        }
+    }
+
+    #[test]
+    fn test_episode_enrichment_fields() {
+        let (spotify, library) = ctx();
+        let p = Playable::Episode(sample_episode());
+        let md = build_metadata(Some(&p), no_track_path_for_test(), &spotify, &library);
+        assert_eq!(
+            md.get("xesam:contentCreated"),
+            Some(&Value::Str("2021-05-04".into()))
+        );
+        // comment is an array of strings
+        match md.get("xesam:comment") {
+            Some(Value::Array(_)) => {}
+            other => panic!("expected comment array, got {other:?}"),
+        }
+        // autoRating present for every playable
+        assert!(md.contains_key("xesam:autoRating"));
+    }
+
+    #[test]
+    fn test_track_has_autorating_and_no_content_created() {
+        let (spotify, library) = ctx();
+        let t = Track {
+            id: Some("t1".to_string()),
+            uri: "spotify:track:t1".to_string(),
+            title: "T".to_string(),
+            track_number: 1,
+            disc_number: 1,
+            duration: 1000,
+            artists: vec![],
+            artist_ids: vec![],
+            album: None,
+            album_id: None,
+            album_artists: vec![],
+            cover_url: Some("x".to_string()),
+            url: String::new(),
+            added_at: None,
+            list_index: 0,
+            is_local: false,
+            is_playable: Some(true),
+        };
+        let p = Playable::Track(t);
+        let md = build_metadata(Some(&p), no_track_path_for_test(), &spotify, &library);
+        assert!(md.contains_key("xesam:autoRating"));
+        assert!(!md.contains_key("xesam:contentCreated"));
+    }
+
+    fn no_track_path_for_test() -> zbus::zvariant::ObjectPath<'static> {
+        zbus::zvariant::ObjectPath::from_static_str_unchecked("/org/ncspot/queue/0")
+    }
 }

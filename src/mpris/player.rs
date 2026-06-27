@@ -75,7 +75,12 @@ impl MprisPlayer {
     #[zbus(property)]
     fn metadata(&self) -> HashMap<String, Value<'static>> {
         let current = self.queue.get_current();
-        let track_path = super::no_track_path();
+        let track_path = self
+            .queue
+            .get_current_index()
+            .and_then(|i| self.queue.id_for_index(i))
+            .map(super::track_path_for_id)
+            .unwrap_or_else(super::no_track_path);
         super::metadata::build_metadata(current.as_ref(), track_path, &self.spotify, &self.library)
     }
 
@@ -111,12 +116,17 @@ impl MprisPlayer {
 
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
+        // With RepeatPlaylist a non-empty queue can always advance (wraps).
         self.queue.next_index().is_some()
+            || (self.queue.get_repeat() == crate::queue::RepeatSetting::RepeatPlaylist
+                && self.queue.len() > 0)
     }
 
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        self.queue.get_current().is_some()
+        self.queue.previous_index().is_some()
+            || (self.queue.get_repeat() == crate::queue::RepeatSetting::RepeatPlaylist
+                && self.queue.len() > 0)
     }
 
     #[zbus(property)]
@@ -136,7 +146,7 @@ impl MprisPlayer {
 
     #[zbus(property)]
     fn can_control(&self) -> bool {
-        self.queue.get_current().is_some()
+        true
     }
 
     #[zbus(signal)]
