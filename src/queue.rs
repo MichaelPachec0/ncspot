@@ -458,6 +458,9 @@ impl Queue {
     /// Set the current repeat behavior and save it to the configuration.
     pub fn set_repeat(&self, new: RepeatSetting) {
         self.cfg.with_state_mut(|s| s.repeat = new);
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitLoopStatus);
     }
 
     /// Get the current shuffle behavior.
@@ -498,6 +501,9 @@ impl Queue {
             let mut random_order = self.random_order.write().unwrap();
             *random_order = None;
         }
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitShuffleStatus);
     }
 
     /// Handle events that are specific to the queue.

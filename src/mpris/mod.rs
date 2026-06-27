@@ -37,14 +37,14 @@ pub(crate) fn no_track_path() -> ObjectPath<'static> {
 #[derive(Debug)]
 #[allow(clippy::enum_variant_names)]
 pub enum MprisCommand {
-    /// Emit playback status
     EmitPlaybackStatus,
-    /// Emit volume
     EmitVolumeStatus,
-    /// Emit metadata
     EmitMetadataStatus,
-    /// Emit seeked position
     EmitSeekedStatus(i64),
+    /// Emit a LoopStatus PropertiesChanged signal.
+    EmitLoopStatus,
+    /// Emit a Shuffle PropertiesChanged signal.
+    EmitShuffleStatus,
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -115,6 +115,12 @@ impl MprisManager {
                 Some(MprisCommand::EmitSeekedStatus(pos)) => {
                     info!("sending MPRIS seeked signal");
                     MprisPlayer::seeked(ctx, &pos).await?;
+                }
+                Some(MprisCommand::EmitLoopStatus) => {
+                    player_iface.loop_status_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitShuffleStatus) => {
+                    player_iface.shuffle_changed(ctx).await?;
                 }
                 None => break,
             }

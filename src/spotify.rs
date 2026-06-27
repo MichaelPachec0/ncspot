@@ -448,7 +448,7 @@ impl Spotify {
 
     /// Send an [MprisCommand] to the mpris thread.
     #[cfg(feature = "mpris")]
-    fn send_mpris(&self, cmd: MprisCommand) {
+    pub(crate) fn send_mpris(&self, cmd: MprisCommand) {
         debug!("Sending mpris command: {cmd:?}");
         match self.mpris.lock().unwrap().as_ref() {
             Some(mpris_manager) => {
