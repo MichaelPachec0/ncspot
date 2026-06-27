@@ -1,0 +1,140 @@
+#![allow(clippy::use_self)]
+
+mod metadata;
+mod player;
+mod root;
+
+use std::error::Error;
+use std::sync::Arc;
+
+use log::info;
+use tokio::sync::mpsc;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use zbus::connection;
+use zbus::zvariant::ObjectPath;
+
+use crate::application::ASYNC_RUNTIME;
+use crate::events::EventManager;
+use crate::library::Library;
+use crate::queue::Queue;
+use crate::spotify::Spotify;
+
+use player::MprisPlayer;
+use root::MprisRoot;
+
+/// D-Bus object path for a queue entry with the given stable id.
+pub(crate) fn track_path_for_id(id: u64) -> ObjectPath<'static> {
+    ObjectPath::from_string_unchecked(format!("/org/ncspot/queue/{id}"))
+}
+
+/// The MPRIS "no track" sentinel object path.
+pub(crate) fn no_track_path() -> ObjectPath<'static> {
+    ObjectPath::from_static_str_unchecked("/org/mpris/MediaPlayer2/TrackList/NoTrack")
+}
+
+/// Commands to control the [MprisManager] worker thread.
+#[derive(Debug)]
+#[allow(clippy::enum_variant_names)]
+pub enum MprisCommand {
+    /// Emit playback status
+    EmitPlaybackStatus,
+    /// Emit volume
+    EmitVolumeStatus,
+    /// Emit metadata
+    EmitMetadataStatus,
+    /// Emit seeked position
+    EmitSeekedStatus(i64),
+}
+
+/// An MPRIS server that internally manager a thread which can be sent commands. This is internally
+/// shared and cloning it will yield a reference to the same server.
+#[derive(Clone)]
+pub struct MprisManager {
+    tx: mpsc::UnboundedSender<MprisCommand>,
+}
+
+impl MprisManager {
+    pub fn new(
+        event: EventManager,
+        queue: Arc<Queue>,
+        library: Arc<Library>,
+        spotify: Spotify,
+    ) -> Self {
+        let root = MprisRoot {};
+        let player = MprisPlayer {
+            event,
+            queue,
+            library,
+            spotify,
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel::<MprisCommand>();
+
+        ASYNC_RUNTIME.get().unwrap().spawn(async {
+            let result = Self::serve(UnboundedReceiverStream::new(rx), root, player).await;
+            if let Err(e) = result {
+                log::error!("MPRIS error: {e}");
+            }
+        });
+
+        Self { tx }
+    }
+
+    async fn serve(
+        mut rx: UnboundedReceiverStream<MprisCommand>,
+        root: MprisRoot,
+        player: MprisPlayer,
+    ) -> Result<(), Box<dyn Error + Sync + Send>> {
+        let conn = connection::Builder::session()?
+            .name(instance_bus_name())?
+            .serve_at("/org/mpris/MediaPlayer2", root)?
+            .serve_at("/org/mpris/MediaPlayer2", player)?
+            .build()
+            .await?;
+
+        let object_server = conn.object_server();
+        let player_iface_ref = object_server
+            .interface::<_, MprisPlayer>("/org/mpris/MediaPlayer2")
+            .await?;
+        let player_iface = player_iface_ref.get().await;
+
+        loop {
+            let ctx = player_iface_ref.signal_emitter();
+            match rx.next().await {
+                Some(MprisCommand::EmitPlaybackStatus) => {
+                    player_iface.playback_status_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitVolumeStatus) => {
+                    info!("sending MPRIS volume update signal");
+                    player_iface.volume_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitMetadataStatus) => {
+                    player_iface.metadata_changed(ctx).await?;
+                }
+                Some(MprisCommand::EmitSeekedStatus(pos)) => {
+                    info!("sending MPRIS seeked signal");
+                    MprisPlayer::seeked(ctx, &pos).await?;
+                }
+                None => break,
+            }
+        }
+        Err("MPRIS server command channel closed".into())
+    }
+
+    pub fn send(&self, command: MprisCommand) {
+        if let Err(e) = self.tx.send(command) {
+            log::warn!("Could not update MPRIS state: {e}");
+        }
+    }
+}
+
+/// Get the D-Bus bus name for this instance according to the MPRIS specification.
+///
+/// <https://specifications.freedesktop.org/mpris-spec/2.2/#Bus-Name-Policy>
+pub fn instance_bus_name() -> String {
+    format!(
+        "org.mpris.MediaPlayer2.ncspot.instance{}",
+        std::process::id()
+    )
+}
