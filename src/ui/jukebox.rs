@@ -219,17 +219,31 @@ impl JukeboxView {
         track_row.saturating_sub(lift).max(1)
     }
 
-    /// A single branch bracket (╭──╮) at `apex`, in `color`.
-    fn draw_bracket(printer: &Printer, color: ColorStyle, lo: usize, hi: usize, apex: usize) {
+    /// A single branch bracket: a `╭──╮` top at `apex` with vertical sides reaching down to
+    /// the track row, so each branch visibly connects to the timeline.
+    fn draw_bracket(
+        printer: &Printer,
+        color: ColorStyle,
+        lo: usize,
+        hi: usize,
+        apex: usize,
+        track_row: usize,
+    ) {
         printer.with_color(color, |p| {
             if lo == hi {
-                p.print((lo, apex), "│");
+                for y in apex..track_row {
+                    p.print((lo, y), "│");
+                }
                 return;
             }
             p.print((lo, apex), "╭");
             p.print((hi, apex), "╮");
             for x in (lo + 1)..hi {
                 p.print((x, apex), "─");
+            }
+            for y in (apex + 1)..track_row {
+                p.print((lo, y), "│");
+                p.print((hi, y), "│");
             }
         });
     }
@@ -251,14 +265,14 @@ impl JukeboxView {
             let x2 = Self::x_of(e.destination, total, width);
             let (lo, hi) = (x1.min(x2), x1.max(x2));
             let apex = Self::apex_row(track_row, hi - lo, width);
-            Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex);
+            Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex, track_row);
         }
         if let Some(edge) = state.last_branch {
             let x1 = Self::x_of(edge.source, total, width);
             let x2 = Self::x_of(edge.destination, total, width);
             let (lo, hi) = (x1.min(x2), x1.max(x2));
             let apex = Self::apex_row(track_row, hi - lo, width);
-            Self::draw_bracket(printer, branch, lo, hi, apex);
+            Self::draw_bracket(printer, branch, lo, hi, apex, track_row);
             if track_row >= 1 {
                 printer.with_color(branch, |p| p.print((x2, track_row - 1), "▼"));
             }
@@ -448,12 +462,12 @@ impl JukeboxView {
         for (i, e) in Self::web_edges(state, show_web, max) {
             let (lo, hi) = (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
             let apex = Self::apex_row(track_row, hi - lo, left_w);
-            Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex);
+            Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex, track_row);
         }
         if let Some(edge) = state.last_branch {
             let (lo, hi) = (x_of(edge.source).min(x_of(edge.destination)), x_of(edge.source).max(x_of(edge.destination)));
             let apex = Self::apex_row(track_row, hi - lo, left_w);
-            Self::draw_bracket(printer, branch, lo, hi, apex);
+            Self::draw_bracket(printer, branch, lo, hi, apex, track_row);
         }
         let cx = x_of(state.current_beat);
         printer.with_color(cursor, |p| {
@@ -604,6 +618,13 @@ impl JukeboxView {
                     );
 
                     if kitty {
+                        // KNOWN LIMITATION: at native (uncapped) resolution this still lags on
+                        // large terminals. The transmit is now cheap (small PNG), so the cost
+                        // is CPU-bound: rasterizing the 2x-supersampled buffer + downscale +
+                        // PNG encode scales with pixel count and runs in the UI loop each beat.
+                        // Mitigations if needed: set `[jukebox] graphics_max_px`, lower the
+                        // supersample factor, or move rasterization off-thread.
+                        //
                         // PNG + a fixed image/placement id: each frame replaces the previous
                         // in place — flicker-free, no accumulation, tiny payload. On a
                         // rect change, drop the old placement first so nothing lingers.
