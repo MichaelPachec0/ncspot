@@ -102,6 +102,7 @@ pub struct ConfigValues {
     pub hide_display_names: Option<bool>,
     pub ap_port: Option<u16>,
     pub lyrics: Option<LyricsConfig>,
+    pub jukebox: Option<JukeboxConfig>,
 }
 
 /// Configuration for the lyrics feature.
@@ -130,6 +131,49 @@ impl LyricsConfig {
     }
 }
 
+/// Configuration for the Eternal Jukebox feature.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct JukeboxConfig {
+    pub enabled: Option<bool>,
+    pub branch_similarity_threshold: Option<u32>,
+    pub dynamic_threshold: Option<bool>,
+    pub min_branch_probability: Option<f64>,
+    pub max_branch_probability: Option<f64>,
+    pub branch_probability_ramp: Option<f64>,
+    pub only_backward_branches: Option<bool>,
+    pub only_long_branches: Option<bool>,
+    pub remove_sequential_branches: Option<bool>,
+    pub add_last_branch: Option<bool>,
+    pub always_follow_last_branch: Option<bool>,
+    pub max_play_time_secs: Option<u64>,
+    pub analysis_sources: Option<Vec<String>>,
+    pub eternalbox_url: Option<String>,
+    // Visualizer dials.
+    pub show_all_branches: Option<bool>,
+    pub max_branches_drawn: Option<usize>,
+    pub branch_layouts: Option<Vec<String>>,
+    pub graphics: Option<bool>,
+    pub graphics_max_px: Option<usize>,
+    // Anti-loop.
+    pub break_loops: Option<bool>,
+    pub loop_threshold: Option<usize>,
+    pub loop_identity: Option<String>,
+    pub loop_count_mode: Option<String>,
+    pub loop_skip_action: Option<String>,
+    pub break_last_branch: Option<bool>,
+    pub loop_counter: Option<String>,
+}
+
+impl JukeboxConfig {
+    /// Ordered analysis source ids, defaulting to spclient then the eternalbox fallback.
+    pub fn analysis_source_order(&self) -> Vec<String> {
+        match &self.analysis_sources {
+            Some(list) if !list.is_empty() => list.clone(),
+            _ => vec!["spclient".to_string(), "eternalbox".to_string()],
+        }
+    }
+}
+
 /// The ncspot theme.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct ConfigTheme {
@@ -154,6 +198,8 @@ pub struct ConfigTheme {
     pub search_match: Option<String>,
     pub lyrics_highlight: Option<String>,
     pub lyrics_secondary: Option<String>,
+    pub jukebox_branch: Option<String>,
+    pub jukebox_cursor: Option<String>,
 }
 
 /// The ordering that is used when representing a playlist.
@@ -182,6 +228,11 @@ pub struct UserState {
     pub playlist_orders: HashMap<String, SortingOrder>,
     pub cache_version: u16,
     pub playback_state: PlaybackState,
+    /// Jukebox tuning settings persisted from the live settings modal. When present this
+    /// overrides the `[jukebox]` config; the modal's Reset clears it. Never holds the
+    /// endless-mode / graphics on/off toggles, so the jukebox always starts disabled.
+    #[serde(default)]
+    pub jukebox: Option<crate::jukebox::settings::JukeboxSettings>,
 }
 
 impl Default for UserState {
@@ -194,6 +245,7 @@ impl Default for UserState {
             playlist_orders: HashMap::new(),
             cache_version: 0,
             playback_state: PlaybackState::Default,
+            jukebox: None,
         }
     }
 }
@@ -418,5 +470,17 @@ mod lyrics_cfg_tests {
             c2.provider_order(),
             vec![crate::lyrics::model::ProviderId::Netease, crate::lyrics::model::ProviderId::Lrclib]
         );
+    }
+
+    #[test]
+    fn jukebox_analysis_source_order_defaults_and_overrides() {
+        let c = crate::config::JukeboxConfig::default();
+        assert_eq!(c.analysis_source_order(), vec!["spclient", "eternalbox"]);
+
+        let c2 = crate::config::JukeboxConfig {
+            analysis_sources: Some(vec!["spclient".into()]),
+            ..Default::default()
+        };
+        assert_eq!(c2.analysis_source_order(), vec!["spclient"]);
     }
 }

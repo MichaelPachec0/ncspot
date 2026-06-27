@@ -89,6 +89,14 @@ pub fn load(theme_cfg: &Option<ConfigTheme>) -> Theme {
         "lyrics_secondary",
         load_color!(theme_cfg, lyrics_secondary, Dark(White)),
     );
+    palette.set_color(
+        "jukebox_branch",
+        load_color!(theme_cfg, jukebox_branch, Light(Red)),
+    );
+    palette.set_color(
+        "jukebox_cursor",
+        load_color!(theme_cfg, jukebox_cursor, Light(Green)),
+    );
 
     Theme {
         shadow: false,

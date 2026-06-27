@@ -6,6 +6,8 @@ pub mod artist;
 pub mod browse;
 pub mod contextmenu;
 pub mod help;
+pub mod jukebox;
+pub mod jukebox_settings;
 pub mod layout;
 pub mod library;
 pub mod listview;
@@ -23,6 +25,9 @@ pub mod tabbedview;
 
 #[cfg(feature = "cover")]
 pub mod cover;
+
+#[cfg(any(feature = "cover", feature = "jukebox-graphics"))]
+pub mod image_render;
 
 /// Create a CursiveRunner which implements the drawing logic and event loop.
 pub fn create_cursive() -> Result<CursiveRunner<Cursive>, Box<dyn std::error::Error>> {

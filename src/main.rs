@@ -18,6 +18,7 @@ mod commands;
 mod config;
 mod events;
 mod ext_traits;
+mod jukebox;
 mod library;
 mod lyrics;
 mod model;

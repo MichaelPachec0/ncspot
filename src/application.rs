@@ -177,12 +177,37 @@ impl Application {
             None
         };
 
+        let jukebox_analysis = Arc::new(crate::jukebox::analysis::AnalysisManager::new(
+            vec![
+                Box::new(crate::jukebox::analysis::SpclientSource {
+                    spotify: Arc::new(spotify.clone()),
+                }),
+                Box::new(crate::jukebox::analysis::EternalboxSource {
+                    base_url: configuration
+                        .values()
+                        .jukebox
+                        .clone()
+                        .unwrap_or_default()
+                        .eternalbox_url
+                        .unwrap_or_else(|| "https://eternalbox.dev".to_string()),
+                }),
+            ],
+            crate::jukebox::analysis::AnalysisCache::new(crate::config::cache_path("jukebox")),
+        ));
+        let jukebox = crate::jukebox::Jukebox::new(
+            queue.clone(),
+            jukebox_analysis,
+            event_manager.clone(),
+            configuration.clone(),
+        );
+
         let mut cmd_manager = CommandManager::new(
             spotify.clone(),
             queue.clone(),
             library.clone(),
             configuration.clone(),
             event_manager.clone(),
+            jukebox.clone(),
         );
 
         cmd_manager.register_all();
@@ -222,6 +247,9 @@ impl Application {
             lyrics_manager,
         );
 
+        let jukeboxview =
+            ui::jukebox::JukeboxView::new(jukebox.clone(), queue.clone(), configuration.clone());
+
         let status = ui::statusbar::StatusBar::new(queue.clone(), Arc::clone(&library));
 
         let mut layout =
@@ -234,6 +262,8 @@ impl Application {
         layout.add_screen("cover", coverview.with_name("cover"));
 
         layout.add_screen("lyrics", lyricsview.with_name("lyrics"));
+
+        layout.add_screen("jukebox", jukeboxview.with_name("jukebox"));
 
         // initial screen is library
         let initial_screen = configuration
@@ -272,6 +302,11 @@ impl Application {
             #[cfg(feature = "cover")]
             self.cursive
                 .call_on_name("cover", |view: &mut ui::cover::CoverView| {
+                    view.render_to_terminal();
+                });
+            #[cfg(feature = "jukebox-graphics")]
+            self.cursive
+                .call_on_name("jukebox", |view: &mut ui::jukebox::JukeboxView| {
                     view.render_to_terminal();
                 });
             #[cfg(unix)]
