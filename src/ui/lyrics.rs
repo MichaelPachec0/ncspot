@@ -123,6 +123,10 @@ impl LyricsView {
                     track_id: key.clone(),
                     tried,
                 },
+                FetchOutcome::Error { message } => LyricsState::Error {
+                    track_id: key.clone(),
+                    message,
+                },
             };
 
             let mut guard = state.write().unwrap();
@@ -310,7 +314,15 @@ impl View for LyricsView {
         match &*guard {
             LyricsState::Loaded { lyrics, .. } => self.draw_lyrics(printer, lyrics, &lyrics_cfg),
             LyricsState::Loading { .. } => self.draw_status(printer, "Loading…"),
-            LyricsState::NotFound { .. } => self.draw_status(printer, "No lyrics found"),
+            LyricsState::NotFound { tried, .. } => {
+                let msg = if tried.is_empty() {
+                    "No lyrics found".to_string()
+                } else {
+                    let names: Vec<&str> = tried.iter().map(|p| p.as_str()).collect();
+                    format!("No lyrics found (tried: {})", names.join(", "))
+                };
+                self.draw_status(printer, &msg);
+            }
             LyricsState::Error { message, .. } => {
                 self.draw_status(printer, &format!("Lyrics unavailable: {message}"));
             }
