@@ -26,6 +26,9 @@ pub struct Playlist {
     pub num_tracks: usize,
     pub tracks: Option<Vec<Playable>>,
     pub collaborative: bool,
+    /// Cover image URL (Spotify mosaic/custom), if the playlist has one.
+    #[serde(default)]
+    pub cover_url: Option<String>,
 }
 
 impl Playlist {
@@ -160,6 +163,7 @@ impl From<&SimplifiedPlaylist> for Playlist {
             num_tracks: list.items.total as usize,
             tracks: None,
             collaborative: list.collaborative,
+            cover_url: list.images.first().map(|i| i.url.clone()),
         }
     }
 }
@@ -175,6 +179,7 @@ impl From<&FullPlaylist> for Playlist {
             num_tracks: list.items.total as usize,
             tracks: None,
             collaborative: list.collaborative,
+            cover_url: list.images.first().map(|i| i.url.clone()),
         }
     }
 }
