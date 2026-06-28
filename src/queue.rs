@@ -37,6 +37,10 @@ pub enum QueueEvent {
 /// The queue determines the playback order of [Playable] items, and is also used to control
 /// playback itself.
 pub struct Queue {
+    // LOCK ORDER INVARIANT: when holding more than one of these at once, always
+    // acquire in this order: queue -> random_order -> ids -> current_track.
+    // `ids` is only ever written while `queue` is write-locked, which lets other
+    // methods resolve an id->index under `queue.write()` without racing.
     /// The internal data, which doesn't change with shuffle or repeat. This is
     /// the raw data only.
     pub queue: Arc<RwLock<Vec<Playable>>>,
@@ -160,47 +164,44 @@ impl Queue {
     /// Insert `track` as the item that should logically follow the currently
     /// playing item, taking into account shuffle status.
     pub fn insert_after_current(&self, track: Playable) {
-        if let Some(index) = self.get_current_index() {
-            {
-                let mut random_order = self.random_order.write().unwrap();
-                if let Some(order) = random_order.as_mut() {
-                    let next_i = order.iter().position(|&i| i == index).unwrap();
-                    // shift everything after the insertion in order
-                    for item in order.iter_mut() {
-                        if *item > index {
-                            *item += 1;
-                        }
-                    }
-                    // finally, add the next track index
-                    order.insert(next_i + 1, index + 1);
-                }
-                let mut q = self.queue.write().unwrap();
-                q.insert(index + 1, track);
-                let id = self.next_id();
-                self.ids.write().unwrap().insert(index + 1, id);
-                #[cfg(feature = "mpris")]
-                self.spotify
-                    .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
-            }
-        } else {
-            // No current track — append handles the emit.
+        let Some(index) = self.get_current_index() else {
+            // No current track — append handles ids/order/emit.
             self.append(track);
+            return;
+        };
+        let id = self.next_id();
+        {
+            let mut q = self.queue.write().unwrap();
+            let mut random_order = self.random_order.write().unwrap();
+            if let Some(order) = random_order.as_mut() {
+                let next_i = order.iter().position(|&i| i == index).unwrap();
+                for item in order.iter_mut() {
+                    if *item > index {
+                        *item += 1;
+                    }
+                }
+                order.insert(next_i + 1, index + 1);
+            }
+            q.insert(index + 1, track);
+            self.ids.write().unwrap().insert(index + 1, id);
         }
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
     }
 
     /// Add `track` to the end of the queue.
     pub fn append(&self, track: Playable) {
-        let mut random_order = self.random_order.write().unwrap();
-        if let Some(order) = random_order.as_mut() {
-            order.push(order.len());
-        }
         let id = self.next_id();
         {
             let mut q = self.queue.write().unwrap();
+            let mut random_order = self.random_order.write().unwrap();
+            if let Some(order) = random_order.as_mut() {
+                order.push(order.len());
+            }
             q.push(track);
             self.ids.write().unwrap().push(id);
         }
-        drop(random_order);
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
@@ -972,5 +973,24 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), before, "ids must stay unique");
+    }
+
+    #[test]
+    fn test_append_then_insert_after_current_alignment() {
+        let q = make_queue(vec![make_track(0), make_track(1)], Some(0));
+        q.set_shuffle(true);
+        q.append(make_track(2));
+        q.insert_after_current(make_track(3));
+        // ids and queue stay equal length and unique
+        assert_eq!(q.track_ids().len(), q.len());
+        let mut ids = q.track_ids();
+        let before = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), before);
+        // random_order is a valid permutation of 0..len
+        let mut order = q.get_random_order().unwrap();
+        order.sort_unstable();
+        assert_eq!(order, (0..q.len()).collect::<Vec<_>>());
     }
 }
