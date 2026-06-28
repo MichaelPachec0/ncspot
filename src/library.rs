@@ -184,7 +184,7 @@ impl Library {
             );
             #[cfg(feature = "mpris")]
             self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged);
+                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(id.to_string())));
         }
     }
 
@@ -383,7 +383,7 @@ impl Library {
         // Notify MPRIS clients that the playlist set has been refreshed.
         #[cfg(feature = "mpris")]
         self.spotify
-            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged);
+            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(None));
     }
 
     /// Fetch the artists from the web API and save them to the local library.
@@ -881,21 +881,26 @@ impl Library {
 
         playlist.load_tracks(&self.spotify);
 
-        {
+        let already_present = {
             let mut store = self.playlists.write().unwrap();
             if !store.iter().any(|p| p.id == playlist.id) {
-                store.insert(0, playlist);
+                store.insert(0, playlist.clone());
+                false
+            } else {
+                true
             }
+        };
+
+        if !already_present {
+            self.save_cache(
+                &config::cache_path(CACHE_PLAYLISTS),
+                &self.playlists.read().unwrap(),
+            );
+
+            #[cfg(feature = "mpris")]
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(playlist.id.clone())));
         }
-
-        self.save_cache(
-            &config::cache_path(CACHE_PLAYLISTS),
-            &self.playlists.read().unwrap(),
-        );
-
-        #[cfg(feature = "mpris")]
-        self.spotify
-            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged);
     }
 
     /// Check whether `show` is already in the user's library.

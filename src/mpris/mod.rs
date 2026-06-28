@@ -63,8 +63,8 @@ pub enum MprisCommand {
     EmitTrackRemoved(u64),
     /// The metadata of the entry with this stable id changed.
     EmitTrackMetadataChanged(u64),
-    /// The library's playlist set changed; notify MPRIS clients.
-    EmitPlaylistChanged,
+    /// A playlist changed. Some(id) = that specific playlist; None = bulk refresh.
+    EmitPlaylistChanged(Option<String>),
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -234,24 +234,31 @@ impl MprisManager {
                         }
                     }
                 }
-                Some(MprisCommand::EmitPlaylistChanged) => {
+                Some(MprisCommand::EmitPlaylistChanged(id)) => {
                     let pl_ctx = playlists_iface_ref.signal_emitter();
                     let pl = playlists_iface_ref.get().await;
-                    // Emit PlaylistChanged for the first playlist to notify clients that
-                    // the library has refreshed.  Avoid holding the RwLockReadGuard
-                    // across the await point.
-                    let first = {
-                        let guard = pl.library.playlists.read().unwrap();
-                        guard.first().map(|p| {
-                            (
-                                playlists::playlist_path_for_id(&p.id),
-                                p.name.clone(),
-                                String::new(),
-                            )
-                        })
-                    };
-                    if let Some(tuple) = first {
-                        MprisPlaylists::playlist_changed(pl_ctx, tuple).await?;
+                    match id {
+                        Some(id) => {
+                            let tuple = {
+                                let guard = pl.library.playlists.read().unwrap();
+                                guard.iter().find(|p| p.id == id).map(|p| {
+                                    (
+                                        playlists::playlist_path_for_id(&p.id),
+                                        p.name.clone(),
+                                        String::new(),
+                                    )
+                                })
+                            };
+                            if let Some(tuple) = tuple {
+                                MprisPlaylists::playlist_changed(pl_ctx, tuple).await?;
+                            } else {
+                                // Playlist gone (deleted): tell clients the set changed.
+                                pl.playlist_count_changed(pl_ctx).await?;
+                            }
+                        }
+                        None => {
+                            pl.playlist_count_changed(pl_ctx).await?;
+                        }
                     }
                 }
                 None => break,
