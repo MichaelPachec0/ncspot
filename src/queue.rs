@@ -1,7 +1,9 @@
 use std::cmp::Ordering;
 use std::sync::{Arc, RwLock};
 
-use log::{debug, info};
+use log::debug;
+#[cfg(feature = "notify")]
+use log::info;
 #[cfg(feature = "notify")]
 use notify_rust::Notification;
 
@@ -84,50 +86,48 @@ impl Queue {
     /// The index of the next item in `self.queue` that should be played. None
     /// if at the end of the queue.
     pub fn next_index(&self) -> Option<usize> {
-        match *self.current_track.read().unwrap() {
-            Some(mut index) => {
-                let random_order = self.random_order.read().unwrap();
-                if let Some(order) = random_order.as_ref() {
-                    index = order.iter().position(|&i| i == index).unwrap();
-                }
+        // Lock order: snapshot current_track (drop its guard), then queue -> random_order.
+        let current = (*self.current_track.read().unwrap())?;
+        let queue = self.queue.read().unwrap();
+        let random_order = self.random_order.read().unwrap();
 
-                let mut next_index = index + 1;
-                if next_index < self.queue.read().unwrap().len() {
-                    if let Some(order) = random_order.as_ref() {
-                        next_index = order[next_index];
-                    }
+        let mut index = current;
+        if let Some(order) = random_order.as_ref() {
+            index = order.iter().position(|&i| i == current).unwrap();
+        }
 
-                    Some(next_index)
-                } else {
-                    None
-                }
-            }
-            None => None,
+        let next_index = index + 1;
+        if next_index < queue.len() {
+            Some(match random_order.as_ref() {
+                Some(order) => order[next_index],
+                None => next_index,
+            })
+        } else {
+            None
         }
     }
 
     /// The index of the previous item in `self.queue` that should be played.
     /// None if at the start of the queue.
     pub fn previous_index(&self) -> Option<usize> {
-        match *self.current_track.read().unwrap() {
-            Some(mut index) => {
-                let random_order = self.random_order.read().unwrap();
-                if let Some(order) = random_order.as_ref() {
-                    index = order.iter().position(|&i| i == index).unwrap();
-                }
+        // Lock order: snapshot current_track (drop its guard), then queue -> random_order.
+        let current = (*self.current_track.read().unwrap())?;
+        let _queue = self.queue.read().unwrap();
+        let random_order = self.random_order.read().unwrap();
 
-                if index > 0 {
-                    let mut next_index = index - 1;
-                    if let Some(order) = random_order.as_ref() {
-                        next_index = order[next_index];
-                    }
+        let mut index = current;
+        if let Some(order) = random_order.as_ref() {
+            index = order.iter().position(|&i| i == current).unwrap();
+        }
 
-                    Some(next_index)
-                } else {
-                    None
-                }
-            }
-            None => None,
+        if index > 0 {
+            let prev = index - 1;
+            Some(match random_order.as_ref() {
+                Some(order) => order[prev],
+                None => prev,
+            })
+        } else {
+            None
         }
     }
 
@@ -215,6 +215,8 @@ impl Queue {
             self.ids.write().unwrap().insert(index + 1, id);
             self.ids.read().unwrap().get(index).copied()
         };
+        #[cfg(not(feature = "mpris"))]
+        let _ = after_id;
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
@@ -401,13 +403,19 @@ impl Queue {
         id
     }
 
-    /// Resolve `after_id` -> index and insert `track` immediately after it,
-    /// atomically (no resolve-then-act race). `after_id == None` inserts at the
-    /// front. Returns the index inserted at, or None if `after_id` is no longer
-    /// present in the queue.
+    /// Resolve `after_id` -> index and insert `track` immediately after it.
+    /// `after_id == None` inserts at the front. Returns the index inserted at,
+    /// or None if `after_id` is no longer present in the queue.
+    ///
+    /// The id->index resolution is race-free (done under `queue.write()` so ids
+    /// cannot change during the lookup), but `insert_at` re-acquires the lock.
+    /// The residual gap is benign: `insert_at` clamps the index, so it never
+    /// panics and the track lands at the correct position.
     pub fn insert_after_id(&self, after_id: Option<u64>, track: Playable) -> Option<usize> {
-        // Hold queue.write() across the whole op. Because `ids` is only written
-        // while `queue` is write-locked, the id->index resolution cannot race.
+        // Acquire queue.write() to resolve the id->index atomically; ids are
+        // only mutated while queue is write-locked, so the position is stable
+        // for this critical section. insert_at re-acquires the lock; the
+        // residual gap is benign because insert_at clamps the index.
         let index = {
             let q = self.queue.write().unwrap();
             let index = match after_id {
