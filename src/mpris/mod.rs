@@ -56,8 +56,9 @@ pub enum MprisCommand {
     EmitShuffleStatus,
     /// The whole track list changed (clear, bulk add, reorder, activate playlist).
     EmitTrackListReplaced,
-    /// A single entry with this stable id was added.
-    EmitTrackAdded(u64),
+    /// A single entry was added; `after_id` is the predecessor entry's id
+    /// (None if inserted at the front), captured at insert time.
+    EmitTrackAdded { id: u64, after_id: Option<u64> },
     /// The entry with this stable id was removed.
     EmitTrackRemoved(u64),
     /// The metadata of the entry with this stable id changed.
@@ -181,29 +182,22 @@ impl MprisManager {
                         .unwrap_or_else(no_track_path);
                     MprisTrackList::track_list_replaced(tl_ctx, tracks, current).await?;
                 }
-                Some(MprisCommand::EmitTrackAdded(id)) => {
+                Some(MprisCommand::EmitTrackAdded { id, after_id }) => {
                     let tl_ctx = tracklist_iface_ref.signal_emitter();
                     let tl = tracklist_iface_ref.get().await;
-                    if let Some(index) = tl.queue.index_for_id(id) {
-                        let playable = tl.queue.queue.read().unwrap().get(index).cloned();
-                        if let Some(p) = playable {
-                            let md = build_metadata(
-                                Some(&p),
-                                track_path_for_id(id),
-                                &tl.spotify,
-                                &tl.library,
-                            );
-                            // after = predecessor's path, or NoTrack if first
-                            let after = if index == 0 {
-                                no_track_path()
-                            } else {
-                                tl.queue
-                                    .id_for_index(index - 1)
-                                    .map(track_path_for_id)
-                                    .unwrap_or_else(no_track_path)
-                            };
-                            MprisTrackList::track_added(tl_ctx, md, after).await?;
-                        }
+                    let playable = tl
+                        .queue
+                        .index_for_id(id)
+                        .and_then(|index| tl.queue.queue.read().unwrap().get(index).cloned());
+                    if let Some(p) = playable {
+                        let md = build_metadata(
+                            Some(&p),
+                            track_path_for_id(id),
+                            &tl.spotify,
+                            &tl.library,
+                        );
+                        let after = after_id.map(track_path_for_id).unwrap_or_else(no_track_path);
+                        MprisTrackList::track_added(tl_ctx, md, after).await?;
                     }
                 }
                 Some(MprisCommand::EmitTrackRemoved(id)) => {

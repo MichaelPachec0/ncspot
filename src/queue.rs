@@ -170,7 +170,7 @@ impl Queue {
             return;
         };
         let id = self.next_id();
-        {
+        let after_id = {
             let mut q = self.queue.write().unwrap();
             let mut random_order = self.random_order.write().unwrap();
             if let Some(order) = random_order.as_mut() {
@@ -184,10 +184,11 @@ impl Queue {
             }
             q.insert(index + 1, track);
             self.ids.write().unwrap().insert(index + 1, id);
-        }
+            self.ids.read().unwrap().get(index).copied()
+        };
         #[cfg(feature = "mpris")]
         self.spotify
-            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
     }
 
     /// Add `track` to the end of the queue.
@@ -203,8 +204,14 @@ impl Queue {
             self.ids.write().unwrap().push(id);
         }
         #[cfg(feature = "mpris")]
-        self.spotify
-            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded(id));
+        {
+            let after_id = {
+                let ids = self.ids.read().unwrap();
+                (ids.len() >= 2).then(|| ids[ids.len() - 2])
+            };
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
+        }
     }
 
     /// Append `tracks` after the currently playing item, taking into account
@@ -240,22 +247,44 @@ impl Queue {
         first
     }
 
-    /// Remove the item at `index`. This doesn't take into account shuffle
-    /// status, and will literally remove the item at `index` in `self.queue`.
+    /// Remove the item at `index` in `self.queue`. No-op if out of bounds.
     pub fn remove(&self, index: usize) {
-        let mut q = self.queue.write().unwrap();
-        if q.is_empty() {
-            info!("queue is empty");
-            return;
-        }
-        // Capture the stable id of the entry we are about to remove (for MPRIS signal).
-        #[cfg(feature = "mpris")]
-        let removed_id = self.ids.read().unwrap().get(index).copied();
-        q.remove(index);
-        self.ids.write().unwrap().remove(index);
-        drop(q);
+        let removed_id = {
+            let mut q = self.queue.write().unwrap();
+            if index >= q.len() {
+                return;
+            }
+            #[cfg(feature = "mpris")]
+            let rid = self.ids.read().unwrap().get(index).copied();
+            #[cfg(not(feature = "mpris"))]
+            let rid: Option<u64> = None;
+            q.remove(index);
+            self.ids.write().unwrap().remove(index);
+            rid
+        };
+        self.after_remove(index, removed_id);
+    }
 
-        // if the queue is empty stop playback
+    /// Remove the queue entry with stable id `id`, resolving the index atomically.
+    /// No-op if the id is no longer present.
+    pub fn remove_by_id(&self, id: u64) {
+        let (index, removed_id) = {
+            let mut q = self.queue.write().unwrap();
+            let index = match self.ids.read().unwrap().iter().position(|&i| i == id) {
+                Some(i) => i,
+                None => return,
+            };
+            q.remove(index);
+            self.ids.write().unwrap().remove(index);
+            (index, Some(id))
+        };
+        self.after_remove(index, removed_id);
+    }
+
+    /// Shared post-removal bookkeeping: stop/advance playback as needed, fix the
+    /// current index, regenerate shuffle order, and emit TrackRemoved.
+    fn after_remove(&self, index: usize, removed_id: Option<u64>) {
+        let _ = removed_id;
         let len = self.queue.read().unwrap().len();
         if len == 0 {
             self.stop();
@@ -267,15 +296,10 @@ impl Queue {
             return;
         }
 
-        // if we are deleting the currently playing track, play the track with
-        // the same index again, because the next track is now at the position
-        // of the one we deleted
         let current = *self.current_track.read().unwrap();
         if let Some(current_track) = current {
             match current_track.cmp(&index) {
                 Ordering::Equal => {
-                    // if we have deleted the last item and it was playing
-                    // stop playback, unless repeat playlist is on, play next
                     if current_track == len {
                         if self.get_repeat() == RepeatSetting::RepeatPlaylist {
                             self.next(false);
@@ -302,6 +326,79 @@ impl Queue {
         if let Some(id) = removed_id {
             self.spotify
                 .send_mpris(crate::mpris::MprisCommand::EmitTrackRemoved(id));
+        }
+    }
+
+    /// Insert `track` at `index` (clamped to the queue length), maintaining
+    /// ids, random_order and current_track, and emit a single TrackAdded
+    /// carrying the predecessor's id. Returns the new entry's id.
+    pub fn insert_at(&self, index: usize, track: Playable) -> u64 {
+        let id = self.next_id();
+        let after_id = {
+            let mut q = self.queue.write().unwrap();
+            let index = index.min(q.len());
+
+            let mut random_order = self.random_order.write().unwrap();
+            if let Some(order) = random_order.as_mut() {
+                for item in order.iter_mut() {
+                    if *item >= index {
+                        *item += 1;
+                    }
+                }
+                order.push(index);
+            }
+            drop(random_order);
+
+            q.insert(index, track);
+
+            let mut ids = self.ids.write().unwrap();
+            let after_id = (index > 0).then(|| ids[index - 1]);
+            ids.insert(index, id);
+            drop(ids);
+
+            let mut current = self.current_track.write().unwrap();
+            if let Some(ci) = *current
+                && ci >= index
+            {
+                current.replace(ci + 1);
+            }
+            after_id
+        };
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
+        #[cfg(not(feature = "mpris"))]
+        let _ = after_id;
+        id
+    }
+
+    /// Resolve `after_id` -> index and insert `track` immediately after it,
+    /// atomically (no resolve-then-act race). `after_id == None` inserts at the
+    /// front. Returns the index inserted at, or None if `after_id` is no longer
+    /// present in the queue.
+    pub fn insert_after_id(&self, after_id: Option<u64>, track: Playable) -> Option<usize> {
+        // Hold queue.write() across the whole op. Because `ids` is only written
+        // while `queue` is write-locked, the id->index resolution cannot race.
+        let index = {
+            let q = self.queue.write().unwrap();
+            let index = match after_id {
+                None => 0,
+                Some(aid) => match self.ids.read().unwrap().iter().position(|&i| i == aid) {
+                    Some(pos) => pos + 1,
+                    None => return None,
+                },
+            };
+            drop(q);
+            index
+        };
+        self.insert_at(index, track);
+        Some(index)
+    }
+
+    /// Play the entry with stable id `id`. No-op if the id is no longer present.
+    pub fn play_by_id(&self, id: u64) {
+        if let Some(index) = self.index_for_id(id) {
+            self.play(index, false, false);
         }
     }
 
@@ -952,6 +1049,62 @@ mod tests {
             [0, 1, 2],
             "random_order must contain every queue index once"
         );
+    }
+
+    // --- insert_at / insert_after_id / remove_by_id ---
+
+    #[test]
+    fn test_insert_at_middle_maintains_alignment_and_order() {
+        let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(1));
+        q.set_shuffle(true);
+        let id = q.insert_at(1, make_track(9));
+        assert_eq!(q.index_for_id(id), Some(1));
+        assert_eq!(q.track_ids().len(), q.len());
+        // current_track (was index 1) shifted to 2 because we inserted at 1
+        assert_eq!(q.get_current_index(), Some(2));
+        let mut order = q.get_random_order().unwrap();
+        order.sort_unstable();
+        assert_eq!(order, (0..q.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_insert_after_id_resolves_and_returns_index() {
+        let q = make_queue(vec![make_track(0), make_track(1)], Some(0));
+        let id0 = q.id_for_index(0).unwrap();
+        let idx = q.insert_after_id(Some(id0), make_track(9));
+        assert_eq!(idx, Some(1));
+        assert_eq!(track_id(&q.queue.read().unwrap()[1]), "id_9");
+    }
+
+    #[test]
+    fn test_insert_after_id_unknown_returns_none() {
+        let q = make_queue(vec![make_track(0)], Some(0));
+        assert_eq!(q.insert_after_id(Some(123_456), make_track(9)), None);
+        assert_eq!(q.len(), 1); // nothing inserted
+    }
+
+    #[test]
+    fn test_remove_by_id_removes_correct_entry() {
+        let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(0));
+        let id1 = q.id_for_index(1).unwrap();
+        q.remove_by_id(id1);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.index_for_id(id1), None);
+        assert_eq!(track_id(&q.queue.read().unwrap()[1]), "id_2");
+    }
+
+    #[test]
+    fn test_remove_by_id_unknown_is_noop() {
+        let q = make_queue(vec![make_track(0)], Some(0));
+        q.remove_by_id(999); // must not panic
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn test_remove_out_of_bounds_index_is_noop() {
+        let q = make_queue(vec![make_track(0)], Some(0));
+        q.remove(5); // previously panicked; must be a no-op now
+        assert_eq!(q.len(), 1);
     }
 
     // --- clear ---
