@@ -109,34 +109,33 @@ impl MprisPlaylists {
     /// Load the playlist identified by `playlist_id` into the queue and start playback.
     ///
     /// This loads a *copy* of the playlist's tracks — it never mutates the saved playlist.
-    fn activate_playlist(&self, playlist_id: ObjectPath<'_>) {
+    async fn activate_playlist(&self, playlist_id: ObjectPath<'_>) {
         let Some(id) = parse_playlist_path(&playlist_id) else {
             return;
         };
-
-        // Clone the playlist entry so we can call load_tracks without holding the read lock.
         let playlist_copy = {
             let playlists = self.library.playlists.read().unwrap();
             playlists.iter().find(|p| p.id == id).cloned()
         };
-
         let Some(mut playlist) = playlist_copy else {
             return;
         };
-
-        // load_tracks is a no-op if tracks are already populated.
-        playlist.load_tracks(&self.spotify);
-
-        let Some(tracks) = &playlist.tracks else {
+        let spotify = self.spotify.clone();
+        let tracks = tokio::task::spawn_blocking(move || {
+            playlist.load_tracks(&spotify);
+            playlist.tracks.clone()
+        })
+        .await
+        .ok()
+        .flatten();
+        let Some(tracks) = tracks else {
             return;
         };
-
         let should_shuffle = self.queue.get_shuffle();
         self.queue.clear();
-        let index = self.queue.append_next(tracks);
+        let index = self.queue.append_next(&tracks);
         self.queue.play(index, should_shuffle, should_shuffle);
-
-        // Record which playlist is now active.
+        // Task 8 replaces this with self.queue.set_active_playlist(Some(id)).
         *self.active_playlist_id.lock().unwrap() = Some(id);
     }
 

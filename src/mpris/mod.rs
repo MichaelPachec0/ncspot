@@ -190,12 +190,13 @@ impl MprisManager {
                         .index_for_id(id)
                         .and_then(|index| tl.queue.queue.read().unwrap().get(index).cloned());
                     if let Some(p) = playable {
-                        let md = build_metadata(
-                            Some(&p),
-                            track_path_for_id(id),
-                            &tl.spotify,
-                            &tl.library,
-                        );
+                        let spotify = tl.spotify.clone();
+                        let library = tl.library.clone();
+                        let md = tokio::task::spawn_blocking(move || {
+                            build_metadata(Some(&p), track_path_for_id(id), &spotify, &library)
+                        })
+                        .await
+                        .unwrap_or_default();
                         let after = after_id.map(track_path_for_id).unwrap_or_else(no_track_path);
                         MprisTrackList::track_added(tl_ctx, md, after).await?;
                     }
@@ -212,12 +213,18 @@ impl MprisManager {
                         // a RwLockReadGuard across an await point.
                         let p = tl.queue.queue.read().unwrap().get(index).cloned();
                         if let Some(p) = p {
-                            let md = build_metadata(
-                                Some(&p),
-                                track_path_for_id(id),
-                                &tl.spotify,
-                                &tl.library,
-                            );
+                            let spotify = tl.spotify.clone();
+                            let library = tl.library.clone();
+                            let md = tokio::task::spawn_blocking(move || {
+                                build_metadata(
+                                    Some(&p),
+                                    track_path_for_id(id),
+                                    &spotify,
+                                    &library,
+                                )
+                            })
+                            .await
+                            .unwrap_or_default();
                             MprisTrackList::track_metadata_changed(
                                 tl_ctx,
                                 track_path_for_id(id),
