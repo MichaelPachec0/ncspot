@@ -339,6 +339,21 @@ impl Queue {
             let id = ids.remove(from);
             ids.insert(to, id);
 
+            // Keep the shuffle order pointing at the same logical tracks after the move.
+            let mut random_order = self.random_order.write().unwrap();
+            if let Some(order) = random_order.as_mut() {
+                for v in order.iter_mut() {
+                    if *v == from {
+                        *v = to;
+                    } else if from < to && *v > from && *v <= to {
+                        *v -= 1;
+                    } else if from > to && *v >= to && *v < from {
+                        *v += 1;
+                    }
+                }
+            }
+            drop(random_order);
+
             // if the currently playing track is affected by the shift, update its
             // index
             let mut current = self.current_track.write().unwrap();
@@ -860,6 +875,37 @@ mod tests {
         let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(2));
         q.shift(2, 0);
         assert_eq!(q.get_current_index(), Some(0));
+    }
+
+    #[test]
+    fn test_shift_remaps_random_order() {
+        // queue [0,1,2,3], explicit shuffle order [2,0,3,1]
+        let q = make_queue(
+            vec![make_track(0), make_track(1), make_track(2), make_track(3)],
+            Some(0),
+        );
+        *q.random_order.write().unwrap() = Some(vec![2, 0, 3, 1]);
+        // capture the playable each order-slot points at, by track id
+        let before: Vec<String> = q
+            .get_random_order()
+            .unwrap()
+            .iter()
+            .map(|&i| track_id(&q.queue.read().unwrap()[i]).to_string())
+            .collect();
+        // move queue[0] to position 2
+        q.shift(0, 2);
+        let after: Vec<String> = q
+            .get_random_order()
+            .unwrap()
+            .iter()
+            .map(|&i| track_id(&q.queue.read().unwrap()[i]).to_string())
+            .collect();
+        // the shuffle SEQUENCE (which tracks play in which order) must be unchanged
+        assert_eq!(before, after);
+        // and random_order is still a permutation of 0..len
+        let mut order = q.get_random_order().unwrap();
+        order.sort_unstable();
+        assert_eq!(order, (0..q.len()).collect::<Vec<_>>());
     }
 
     // --- shuffle ---
