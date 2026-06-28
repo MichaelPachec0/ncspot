@@ -63,65 +63,60 @@ impl MprisTrackList {
         true
     }
 
-    fn get_tracks_metadata(
+    async fn get_tracks_metadata(
         &self,
         track_ids: Vec<ObjectPath<'_>>,
     ) -> Vec<HashMap<String, Value<'static>>> {
-        track_ids
-            .iter()
-            .filter_map(|path| {
-                let id = parse_queue_path(path)?;
-                let index = self.queue.index_for_id(id)?;
-                let playable = self.queue.queue.read().unwrap().get(index).cloned()?;
-                Some(build_metadata(
-                    Some(&playable),
-                    track_path_for_id(id),
-                    &self.spotify,
-                    &self.library,
-                ))
-            })
-            .collect()
+        let pairs = self.queue.playables_for_paths(&track_ids);
+        let spotify = self.spotify.clone();
+        let library = self.library.clone();
+        tokio::task::spawn_blocking(move || {
+            pairs
+                .into_iter()
+                .map(|(id, playable)| {
+                    build_metadata(Some(&playable), track_path_for_id(id), &spotify, &library)
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    fn add_track(&self, uri: &str, after_track: ObjectPath<'_>, set_as_current: bool) {
-        let Some(playable) = resolve_single_playable(&self.spotify, uri) else {
-            return;
-        };
-        // Insert after the entry named by `after_track`, or at the front for NoTrack.
-        if after_track.as_str() == no_track_path().as_str() {
-            // Insert at front: append then shift to 0.
-            self.queue.append(playable);
-            let last = self.queue.len().saturating_sub(1);
-            self.queue.shift(last, 0);
-            if set_as_current {
-                self.queue.play(0, false, false);
-            }
-        } else if let Some(id) = parse_queue_path(&after_track)
-            && let Some(index) = self.queue.index_for_id(id)
+    async fn add_track(&self, uri: &str, after_track: ObjectPath<'_>, set_as_current: bool) {
+        let spotify = self.spotify.clone();
+        let uri_owned = uri.to_string();
+        let playable = match tokio::task::spawn_blocking(move || {
+            resolve_single_playable(&spotify, &uri_owned)
+        })
+        .await
         {
-            self.queue.append(playable);
-            let last = self.queue.len().saturating_sub(1);
-            let dest = index + 1;
-            self.queue.shift(last, dest);
-            if set_as_current {
-                self.queue.play(dest, false, false);
+            Ok(Some(p)) => p,
+            _ => return,
+        };
+        let after_id = if after_track.as_str() == no_track_path().as_str() {
+            None
+        } else {
+            match parse_queue_path(&after_track) {
+                Some(id) => Some(id),
+                None => return,
             }
+        };
+        if let Some(index) = self.queue.insert_after_id(after_id, playable)
+            && set_as_current
+        {
+            self.queue.play(index, false, false);
         }
     }
 
     fn remove_track(&self, track_id: ObjectPath<'_>) {
-        if let Some(id) = parse_queue_path(&track_id)
-            && let Some(index) = self.queue.index_for_id(id)
-        {
-            self.queue.remove(index);
+        if let Some(id) = parse_queue_path(&track_id) {
+            self.queue.remove_by_id(id);
         }
     }
 
     fn go_to(&self, track_id: ObjectPath<'_>) {
-        if let Some(id) = parse_queue_path(&track_id)
-            && let Some(index) = self.queue.index_for_id(id)
-        {
-            self.queue.play(index, false, false);
+        if let Some(id) = parse_queue_path(&track_id) {
+            self.queue.play_by_id(id);
         }
     }
 

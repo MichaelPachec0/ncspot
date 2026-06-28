@@ -197,11 +197,19 @@ impl MprisPlayer {
         }
     }
 
-    fn set_position(&self, _track: ObjectPath, position: i64) {
+    fn set_position(&self, track: ObjectPath<'_>, position: i64) {
+        // Per MPRIS spec: no-op when the TrackId does not match the current track.
+        let current_path = self
+            .queue
+            .get_current_index()
+            .and_then(|i| self.queue.id_for_index(i))
+            .map(super::track_path_for_id);
+        if current_path.as_ref().map(|p| p.as_str()) != Some(track.as_str()) {
+            return;
+        }
         if let Some(current_track) = self.queue.get_current() {
             let position = (position / 1000) as u32;
             let duration = current_track.duration();
-
             if position < duration {
                 self.spotify.seek(position);
             }

@@ -7,7 +7,7 @@ mod root;
 mod tracklist;
 
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use log::info;
 use tokio::sync::mpsc;
@@ -56,14 +56,17 @@ pub enum MprisCommand {
     EmitShuffleStatus,
     /// The whole track list changed (clear, bulk add, reorder, activate playlist).
     EmitTrackListReplaced,
-    /// A single entry with this stable id was added.
-    EmitTrackAdded(u64),
+    /// A single entry was added; `after_id` is the predecessor entry's id
+    /// (None if inserted at the front), captured at insert time.
+    EmitTrackAdded { id: u64, after_id: Option<u64> },
     /// The entry with this stable id was removed.
     EmitTrackRemoved(u64),
     /// The metadata of the entry with this stable id changed.
     EmitTrackMetadataChanged(u64),
-    /// The library's playlist set changed; notify MPRIS clients.
-    EmitPlaylistChanged,
+    /// A playlist changed. Some(id) = that specific playlist; None = bulk refresh.
+    EmitPlaylistChanged(Option<String>),
+    /// The active playlist changed; emit ActivePlaylist PropertiesChanged.
+    EmitActivePlaylistChanged,
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -96,7 +99,6 @@ impl MprisManager {
             queue,
             library,
             spotify,
-            active_playlist_id: Arc::new(Mutex::new(None)),
         };
 
         let (tx, rx) = mpsc::unbounded_channel::<MprisCommand>();
@@ -181,29 +183,25 @@ impl MprisManager {
                         .unwrap_or_else(no_track_path);
                     MprisTrackList::track_list_replaced(tl_ctx, tracks, current).await?;
                 }
-                Some(MprisCommand::EmitTrackAdded(id)) => {
+                Some(MprisCommand::EmitTrackAdded { id, after_id }) => {
                     let tl_ctx = tracklist_iface_ref.signal_emitter();
                     let tl = tracklist_iface_ref.get().await;
-                    if let Some(index) = tl.queue.index_for_id(id) {
-                        let playable = tl.queue.queue.read().unwrap().get(index).cloned();
-                        if let Some(p) = playable {
-                            let md = build_metadata(
-                                Some(&p),
-                                track_path_for_id(id),
-                                &tl.spotify,
-                                &tl.library,
-                            );
-                            // after = predecessor's path, or NoTrack if first
-                            let after = if index == 0 {
-                                no_track_path()
-                            } else {
-                                tl.queue
-                                    .id_for_index(index - 1)
-                                    .map(track_path_for_id)
-                                    .unwrap_or_else(no_track_path)
-                            };
-                            MprisTrackList::track_added(tl_ctx, md, after).await?;
-                        }
+                    let playable = tl
+                        .queue
+                        .index_for_id(id)
+                        .and_then(|index| tl.queue.queue.read().unwrap().get(index).cloned());
+                    if let Some(p) = playable {
+                        let spotify = tl.spotify.clone();
+                        let library = tl.library.clone();
+                        let md = tokio::task::spawn_blocking(move || {
+                            build_metadata(Some(&p), track_path_for_id(id), &spotify, &library)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        let after = after_id
+                            .map(track_path_for_id)
+                            .unwrap_or_else(no_track_path);
+                        MprisTrackList::track_added(tl_ctx, md, after).await?;
                     }
                 }
                 Some(MprisCommand::EmitTrackRemoved(id)) => {
@@ -218,12 +216,13 @@ impl MprisManager {
                         // a RwLockReadGuard across an await point.
                         let p = tl.queue.queue.read().unwrap().get(index).cloned();
                         if let Some(p) = p {
-                            let md = build_metadata(
-                                Some(&p),
-                                track_path_for_id(id),
-                                &tl.spotify,
-                                &tl.library,
-                            );
+                            let spotify = tl.spotify.clone();
+                            let library = tl.library.clone();
+                            let md = tokio::task::spawn_blocking(move || {
+                                build_metadata(Some(&p), track_path_for_id(id), &spotify, &library)
+                            })
+                            .await
+                            .unwrap_or_default();
                             MprisTrackList::track_metadata_changed(
                                 tl_ctx,
                                 track_path_for_id(id),
@@ -233,25 +232,37 @@ impl MprisManager {
                         }
                     }
                 }
-                Some(MprisCommand::EmitPlaylistChanged) => {
+                Some(MprisCommand::EmitPlaylistChanged(id)) => {
                     let pl_ctx = playlists_iface_ref.signal_emitter();
                     let pl = playlists_iface_ref.get().await;
-                    // Emit PlaylistChanged for the first playlist to notify clients that
-                    // the library has refreshed.  Avoid holding the RwLockReadGuard
-                    // across the await point.
-                    let first = {
-                        let guard = pl.library.playlists.read().unwrap();
-                        guard.first().map(|p| {
-                            (
-                                playlists::playlist_path_for_id(&p.id),
-                                p.name.clone(),
-                                String::new(),
-                            )
-                        })
-                    };
-                    if let Some(tuple) = first {
-                        MprisPlaylists::playlist_changed(pl_ctx, tuple).await?;
+                    match id {
+                        Some(id) => {
+                            let tuple = {
+                                let guard = pl.library.playlists.read().unwrap();
+                                guard.iter().find(|p| p.id == id).map(|p| {
+                                    (
+                                        playlists::playlist_path_for_id(&p.id),
+                                        p.name.clone(),
+                                        String::new(),
+                                    )
+                                })
+                            };
+                            if let Some(tuple) = tuple {
+                                MprisPlaylists::playlist_changed(pl_ctx, tuple).await?;
+                            } else {
+                                // Playlist gone (deleted): tell clients the set changed.
+                                pl.playlist_count_changed(pl_ctx).await?;
+                            }
+                        }
+                        None => {
+                            pl.playlist_count_changed(pl_ctx).await?;
+                        }
                     }
+                }
+                Some(MprisCommand::EmitActivePlaylistChanged) => {
+                    let pl_ctx = playlists_iface_ref.signal_emitter();
+                    let pl = playlists_iface_ref.get().await;
+                    pl.active_playlist_changed(pl_ctx).await?;
                 }
                 None => break,
             }
