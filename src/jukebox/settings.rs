@@ -133,7 +133,11 @@ impl AntiLoopSettings {
         Self {
             enabled: c.break_loops.unwrap_or(d.enabled),
             threshold: c.loop_threshold.unwrap_or(d.threshold).max(1),
-            identity: c.loop_identity.as_deref().map(LoopIdentity::parse).unwrap_or(d.identity),
+            identity: c
+                .loop_identity
+                .as_deref()
+                .map(LoopIdentity::parse)
+                .unwrap_or(d.identity),
             count_mode: c
                 .loop_count_mode
                 .as_deref()
@@ -145,7 +149,11 @@ impl AntiLoopSettings {
                 .map(LoopSkipAction::parse)
                 .unwrap_or(d.skip_action),
             break_last_branch: c.break_last_branch.unwrap_or(d.break_last_branch),
-            counter: c.loop_counter.as_deref().map(LoopCounter::parse).unwrap_or(d.counter),
+            counter: c
+                .loop_counter
+                .as_deref()
+                .map(LoopCounter::parse)
+                .unwrap_or(d.counter),
         }
     }
 }
@@ -174,11 +182,15 @@ impl JukeboxSettings {
     pub fn from_config(c: &JukeboxConfig) -> Self {
         let d = Self::default();
         Self {
-            max_branch_distance: c.branch_similarity_threshold.unwrap_or(d.max_branch_distance),
+            max_branch_distance: c
+                .branch_similarity_threshold
+                .unwrap_or(d.max_branch_distance),
             dynamic_threshold: c.dynamic_threshold.unwrap_or(d.dynamic_threshold),
             min_branch_probability: c.min_branch_probability.unwrap_or(d.min_branch_probability),
             max_branch_probability: c.max_branch_probability.unwrap_or(d.max_branch_probability),
-            branch_probability_ramp: c.branch_probability_ramp.unwrap_or(d.branch_probability_ramp),
+            branch_probability_ramp: c
+                .branch_probability_ramp
+                .unwrap_or(d.branch_probability_ramp),
             only_backward_branches: c.only_backward_branches.unwrap_or(d.only_backward_branches),
             only_long_branches: c.only_long_branches.unwrap_or(d.only_long_branches),
             remove_sequential_branches: c
@@ -228,7 +240,10 @@ mod tests {
 
     #[test]
     fn config_overrides_apply() {
-        let c = JukeboxConfig { branch_similarity_threshold: Some(50), ..Default::default() };
+        let c = JukeboxConfig {
+            branch_similarity_threshold: Some(50),
+            ..Default::default()
+        };
         let s = JukeboxSettings::from_config(&c);
         assert_eq!(s.max_branch_distance, 50);
         assert_eq!(s.min_branch_probability, 0.18); // untouched
@@ -241,7 +256,10 @@ mod tests {
         assert_eq!(s.anti_loop.threshold, 4);
         assert_eq!(s.anti_loop.identity, LoopIdentity::Edge);
         assert_eq!(s.anti_loop.count_mode, LoopCountMode::Consecutive);
-        assert_eq!(s.anti_loop.skip_action, LoopSkipAction::DifferentElseContinue);
+        assert_eq!(
+            s.anti_loop.skip_action,
+            LoopSkipAction::DifferentElseContinue
+        );
         assert!(!s.anti_loop.break_last_branch);
         assert_eq!(s.anti_loop.counter, LoopCounter::Reset);
     }

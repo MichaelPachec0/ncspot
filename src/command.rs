@@ -821,9 +821,9 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "reconnect" => Command::Reconnect,
                 "lyricsscrollup" => Command::LyricsScrollUp,
                 "lyricsscrolldown" => Command::LyricsScrollDown,
-                "lyricsoffset" => Command::LyricsOffset(
-                    args.first().and_then(|a| a.parse().ok()).unwrap_or(100),
-                ),
+                "lyricsoffset" => {
+                    Command::LyricsOffset(args.first().and_then(|a| a.parse().ok()).unwrap_or(100))
+                }
                 "lyricsprovider" => Command::LyricsProviderCycle,
                 "lyricsrefetch" => Command::LyricsRefetch,
                 "lyricscopyline" => Command::LyricsCopyLine,

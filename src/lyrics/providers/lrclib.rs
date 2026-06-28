@@ -6,7 +6,9 @@ use crate::lyrics::model::{LyricLine, Lyrics, ProviderId, TrackMeta};
 use crate::lyrics::provider::LyricsProvider;
 
 const USER_AGENT: &str = concat!(
-    "ncspot/", env!("CARGO_PKG_VERSION"), " (https://github.com/hrkfdn/ncspot)"
+    "ncspot/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/hrkfdn/ncspot)"
 );
 
 #[derive(Deserialize)]
@@ -34,9 +36,20 @@ pub fn parse_get_response(json: &str) -> Option<Lyrics> {
     let plain = r.plain_lyrics.filter(|s| !s.trim().is_empty())?;
     let lines = plain
         .lines()
-        .map(|t| LyricLine { start_ms: None, text: t.to_string(), translation: None, romanization: None })
+        .map(|t| LyricLine {
+            start_ms: None,
+            text: t.to_string(),
+            translation: None,
+            romanization: None,
+        })
         .collect();
-    Some(Lyrics { provider: ProviderId::Lrclib, synced: false, rtl: false, language: None, lines })
+    Some(Lyrics {
+        provider: ProviderId::Lrclib,
+        synced: false,
+        rtl: false,
+        language: None,
+        lines,
+    })
 }
 
 pub struct Lrclib;
@@ -48,8 +61,7 @@ impl LyricsProvider for Lrclib {
 
     fn enabled(&self, cfg: &Config) -> bool {
         let lyrics = cfg.values().lyrics.clone().unwrap_or_default();
-        lyrics.enabled.unwrap_or(true)
-            && lyrics.provider_order().contains(&ProviderId::Lrclib)
+        lyrics.enabled.unwrap_or(true) && lyrics.provider_order().contains(&ProviderId::Lrclib)
     }
 
     fn fetch(&self, track: &TrackMeta) -> anyhow::Result<Option<Lyrics>> {
@@ -57,13 +69,11 @@ impl LyricsProvider for Lrclib {
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
-        let mut req = client
-            .get("https://lrclib.net/api/get")
-            .query(&[
-                ("track_name", track.title.as_str()),
-                ("artist_name", track.artist.as_str()),
-                ("duration", &(track.duration_ms / 1000).to_string()),
-            ]);
+        let mut req = client.get("https://lrclib.net/api/get").query(&[
+            ("track_name", track.title.as_str()),
+            ("artist_name", track.artist.as_str()),
+            ("duration", &(track.duration_ms / 1000).to_string()),
+        ]);
         if let Some(album) = &track.album {
             req = req.query(&[("album_name", album.as_str())]);
         }

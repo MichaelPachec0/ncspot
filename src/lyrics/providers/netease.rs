@@ -54,7 +54,11 @@ fn lrc_text(b: &Option<LyricBody>) -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
-pub fn parse_lyric_response(json: &str, want_romaji: bool, client_romanize: bool) -> Option<Lyrics> {
+pub fn parse_lyric_response(
+    json: &str,
+    want_romaji: bool,
+    client_romanize: bool,
+) -> Option<Lyrics> {
     let r: LyricResp = serde_json::from_str(json).ok()?;
     let base = lrc_text(&r.lrc)?;
     let mut lines = parse_lrc(&base);
@@ -87,7 +91,13 @@ pub fn parse_lyric_response(json: &str, want_romaji: bool, client_romanize: bool
             }
         }
     }
-    Some(Lyrics { provider: ProviderId::Netease, synced: true, rtl: false, language: None, lines })
+    Some(Lyrics {
+        provider: ProviderId::Netease,
+        synced: true,
+        rtl: false,
+        language: None,
+        lines,
+    })
 }
 
 pub struct Netease;

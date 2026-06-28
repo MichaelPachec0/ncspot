@@ -259,14 +259,10 @@ impl LyricsView {
                     RowStyle::Normal
                 },
             ));
-            if show_translation
-                && let Some(translation) = &line.translation
-            {
+            if show_translation && let Some(translation) = &line.translation {
                 rows.push((translation.as_str(), RowStyle::Secondary));
             }
-            if show_romaji
-                && let Some(romanization) = &line.romanization
-            {
+            if show_romaji && let Some(romanization) = &line.romanization {
                 rows.push((romanization.as_str(), RowStyle::Secondary));
             }
         }

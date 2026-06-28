@@ -2,9 +2,9 @@ pub mod analysis;
 pub mod driver;
 pub mod graph;
 pub mod model;
+pub mod remixer;
 #[cfg(feature = "jukebox-graphics")]
 pub mod render;
-pub mod remixer;
 pub mod settings;
 
 use std::sync::atomic::{AtomicBool, Ordering};

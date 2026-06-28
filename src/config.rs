@@ -125,8 +125,16 @@ impl LyricsConfig {
     pub fn provider_order(&self) -> Vec<crate::lyrics::model::ProviderId> {
         use crate::lyrics::model::ProviderId;
         match &self.providers {
-            Some(list) => list.iter().filter_map(|s| ProviderId::from_str(s)).collect(),
-            None => vec![ProviderId::Lrclib, ProviderId::Spotify, ProviderId::Netease, ProviderId::Musixmatch],
+            Some(list) => list
+                .iter()
+                .filter_map(|s| ProviderId::from_str(s))
+                .collect(),
+            None => vec![
+                ProviderId::Lrclib,
+                ProviderId::Spotify,
+                ProviderId::Netease,
+                ProviderId::Musixmatch,
+            ],
         }
     }
 }
@@ -468,7 +476,10 @@ mod lyrics_cfg_tests {
         };
         assert_eq!(
             c2.provider_order(),
-            vec![crate::lyrics::model::ProviderId::Netease, crate::lyrics::model::ProviderId::Lrclib]
+            vec![
+                crate::lyrics::model::ProviderId::Netease,
+                crate::lyrics::model::ProviderId::Lrclib
+            ]
         );
     }
 

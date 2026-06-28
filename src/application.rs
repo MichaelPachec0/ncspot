@@ -234,8 +234,13 @@ impl Application {
                 }),
                 Box::new(crate::lyrics::providers::netease::Netease),
                 Box::new(crate::lyrics::providers::musixmatch::Musixmatch {
-                    token: configuration.values().lyrics.clone().unwrap_or_default()
-                        .musixmatch_token.unwrap_or_default(),
+                    token: configuration
+                        .values()
+                        .lyrics
+                        .clone()
+                        .unwrap_or_default()
+                        .musixmatch_token
+                        .unwrap_or_default(),
                 }),
             ],
             crate::lyrics::cache::LyricsCache::new(crate::config::cache_path("lyrics")),

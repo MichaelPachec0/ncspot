@@ -12,10 +12,14 @@ use crate::lyrics::provider::LyricsProvider;
 
 pub enum FetchOutcome {
     Found(Lyrics),
-    NotFound { tried: Vec<ProviderId> },
+    NotFound {
+        tried: Vec<ProviderId>,
+    },
     /// At least one provider errored and no lyrics were found, so we can't say
     /// for sure whether lyrics exist.
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 pub struct LyricsManager {
@@ -150,7 +154,10 @@ mod tests {
         );
         let mgr = LyricsManager::new(
             vec![
-                Box::new(Mock { id: ProviderId::Lrclib, result: None }),
+                Box::new(Mock {
+                    id: ProviderId::Lrclib,
+                    result: None,
+                }),
                 Box::new(Mock {
                     id: ProviderId::Netease,
                     result: Some(ly(ProviderId::Netease)),
@@ -172,7 +179,10 @@ mod tests {
             std::env::temp_dir().join(format!("lyr-mgr-{}-2", std::process::id())),
         );
         let mgr = LyricsManager::new(
-            vec![Box::new(Mock { id: ProviderId::Lrclib, result: None })],
+            vec![Box::new(Mock {
+                id: ProviderId::Lrclib,
+                result: None,
+            })],
             cache,
         );
         match mgr.fetch(cfg.as_ref(), &[ProviderId::Lrclib], &track()) {
@@ -187,7 +197,12 @@ mod tests {
         let cache = LyricsCache::new(
             std::env::temp_dir().join(format!("lyr-mgr-{}-3", std::process::id())),
         );
-        let mgr = LyricsManager::new(vec![Box::new(ErrMock { id: ProviderId::Lrclib })], cache);
+        let mgr = LyricsManager::new(
+            vec![Box::new(ErrMock {
+                id: ProviderId::Lrclib,
+            })],
+            cache,
+        );
         match mgr.fetch(cfg.as_ref(), &[ProviderId::Lrclib], &track()) {
             FetchOutcome::Error { message } => assert!(message.contains("lrclib")),
             _ => panic!("expected Error"),

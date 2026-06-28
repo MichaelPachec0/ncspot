@@ -75,7 +75,13 @@ pub fn clear_terminal_area(offset: Vec2, size: Vec2) {
         let _ = stdout.write_all(b"\x1b_Ga=d,d=A\x1b\\");
     }
     for y in offset.y..offset.y + size.y {
-        let _ = write!(stdout, "\x1b[{};{}H{}", y + 1, offset.x + 1, " ".repeat(size.x));
+        let _ = write!(
+            stdout,
+            "\x1b[{};{}H{}",
+            y + 1,
+            offset.x + 1,
+            " ".repeat(size.x)
+        );
     }
     let _ = stdout.flush();
 }
@@ -86,7 +92,13 @@ pub fn clear_terminal_area(offset: Vec2, size: Vec2) {
 /// PNG keeps the payload tiny (the graph is mostly solid background), so this stays cheap
 /// even at high resolution. `q=2` suppresses kitty's responses so they don't reach stdin.
 #[cfg(feature = "jukebox-graphics")]
-pub fn blit_kitty_png(png: &[u8], offset: Vec2, cols: usize, rows: usize, id: u32) -> std::io::Result<()> {
+pub fn blit_kitty_png(
+    png: &[u8],
+    offset: Vec2,
+    cols: usize,
+    rows: usize,
+    id: u32,
+) -> std::io::Result<()> {
     use base64::Engine;
 
     let data = base64::engine::general_purpose::STANDARD.encode(png);
@@ -104,7 +116,10 @@ pub fn blit_kitty_png(png: &[u8], offset: Vec2, cols: usize, rows: usize, id: u3
         let last = end == bytes.len();
         let m = u8::from(!last);
         if first {
-            write!(out, "\x1b_Ga=T,f=100,q=2,i={id},p={id},c={cols},r={rows},m={m};")?;
+            write!(
+                out,
+                "\x1b_Ga=T,f=100,q=2,i={id},p={id},c={cols},r={rows},m={m};"
+            )?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={m};")?;

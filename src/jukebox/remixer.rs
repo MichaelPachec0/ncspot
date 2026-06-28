@@ -80,7 +80,11 @@ mod tests {
     use crate::jukebox::model::Segment;
 
     fn ti(start: f64, duration: f64) -> TimeInterval {
-        TimeInterval { start, duration, confidence: 1.0 }
+        TimeInterval {
+            start,
+            duration,
+            confidence: 1.0,
+        }
     }
     fn seg(start: f64, duration: f64) -> Segment {
         Segment {

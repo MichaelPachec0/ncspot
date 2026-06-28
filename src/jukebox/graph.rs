@@ -131,16 +131,25 @@ impl GraphGenerator<'_> {
                 }
                 sum += distance;
             }
-            let parent_distance =
-                if current.index_in_parent == other.index_in_parent { 0.0 } else { 100.0 };
+            let parent_distance = if current.index_in_parent == other.index_in_parent {
+                0.0
+            } else {
+                100.0
+            };
             let total = sum / current.overlapping_segments.len() as f64 + parent_distance;
             if total < JukeboxSettings::RANGE_MAX_BRANCH_DISTANCE {
-                edges.push(Edge { source: beat_index, destination: other_index, distance: total });
+                edges.push(Edge {
+                    source: beat_index,
+                    destination: other_index,
+                    distance: total,
+                });
             }
         }
 
         edges.sort_by(|a, b| {
-            a.distance.partial_cmp(&b.distance).unwrap_or(std::cmp::Ordering::Equal)
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         for e in edges.into_iter().take(JukeboxSettings::MAX_BRANCHES) {
             self.all_neighbours[beat_index].push(e);
@@ -194,7 +203,11 @@ impl GraphGenerator<'_> {
         if self.settings.add_last_branch {
             let lbb = self.longest_backward_branch(graph);
             let max_distance = if lbb < 50.0 { 65.0 } else { 55.0 };
-            self.insert_best_backward_branch(graph, self.computed_max_branch_distance, max_distance);
+            self.insert_best_backward_branch(
+                graph,
+                self.computed_max_branch_distance,
+                max_distance,
+            );
         }
         graph.last_branch_point = self.find_best_last_beat(graph);
         self.filter_out_bad_branches(graph);
@@ -288,8 +301,8 @@ impl GraphGenerator<'_> {
         let mut longest_reach = 0.0f64;
         for idx in (0..n).rev() {
             let distance_to_end = (n - idx) as i64;
-            let reach =
-                ((reaches[idx] - distance_to_end) as f64 * 100.0) / self.analysis.beats.len() as f64;
+            let reach = ((reaches[idx] - distance_to_end) as f64 * 100.0)
+                / self.analysis.beats.len() as f64;
             if reach > longest_reach && !graph.beats[idx].neighbours.is_empty() {
                 longest_reach = reach;
                 longest = idx;
@@ -305,7 +318,9 @@ impl GraphGenerator<'_> {
     fn filter_out_bad_branches(&self, graph: &mut SongGraph) {
         let last_index = graph.last_branch_point;
         for i in 0..last_index {
-            graph.beats[i].neighbours.retain(|n| n.destination < last_index);
+            graph.beats[i]
+                .neighbours
+                .retain(|n| n.destination < last_index);
         }
     }
 
@@ -388,13 +403,23 @@ mod tests {
         let mut segments = Vec::new();
         for i in 0..6 {
             let start = i as f64;
-            beats.push(TimeInterval { start, duration: 1.0, confidence: 1.0 });
+            beats.push(TimeInterval {
+                start,
+                duration: 1.0,
+                confidence: 1.0,
+            });
             let timbre_val = (i % 3) as f64;
             let mut s = seg_feat(vec![timbre_val], 0.5);
             s.start = start;
             segments.push(s);
         }
-        AudioAnalysis { bars: vec![], beats, tatums: vec![], sections: vec![], segments }
+        AudioAnalysis {
+            bars: vec![],
+            beats,
+            tatums: vec![],
+            sections: vec![],
+            segments,
+        }
     }
 
     #[test]

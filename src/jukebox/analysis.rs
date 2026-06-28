@@ -20,7 +20,10 @@ pub struct AnalysisCache {
 impl AnalysisCache {
     pub fn new(dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
-        Self { dir, mem: RwLock::new(HashMap::new()) }
+        Self {
+            dir,
+            mem: RwLock::new(HashMap::new()),
+        }
     }
 
     fn path(&self, key: &str) -> PathBuf {
@@ -38,7 +41,10 @@ impl AnalysisCache {
     }
 
     pub fn put(&self, key: &str, analysis: &AudioAnalysis) {
-        self.mem.write().unwrap().insert(key.to_string(), analysis.clone());
+        self.mem
+            .write()
+            .unwrap()
+            .insert(key.to_string(), analysis.clone());
         if let Ok(json) = serde_json::to_vec(analysis) {
             let _ = std::fs::write(self.path(key), json);
         }
@@ -80,7 +86,9 @@ impl AnalysisSource for SpclientSource {
             .block_on(async {
                 tokio::time::timeout(
                     Duration::from_secs(10),
-                    session.spclient().request_as_json(&Method::GET, &endpoint, None, None),
+                    session
+                        .spclient()
+                        .request_as_json(&Method::GET, &endpoint, None, None),
                 )
                 .await
             })
@@ -185,7 +193,11 @@ mod tests {
     fn sample() -> AudioAnalysis {
         AudioAnalysis {
             bars: vec![],
-            beats: vec![TimeInterval { start: 0.0, duration: 1.0, confidence: 1.0 }],
+            beats: vec![TimeInterval {
+                start: 0.0,
+                duration: 1.0,
+                confidence: 1.0,
+            }],
             tatums: vec![],
             sections: vec![],
             segments: vec![],
@@ -246,8 +258,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let mgr = AnalysisManager::new(
             vec![
-                Box::new(Mock { id: "spclient", result: None }),
-                Box::new(Mock { id: "eternalbox", result: Some(sample()) }),
+                Box::new(Mock {
+                    id: "spclient",
+                    result: None,
+                }),
+                Box::new(Mock {
+                    id: "eternalbox",
+                    result: Some(sample()),
+                }),
             ],
             AnalysisCache::new(dir.clone()),
         );
