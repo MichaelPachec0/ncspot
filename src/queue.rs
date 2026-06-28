@@ -161,6 +161,27 @@ impl Queue {
         self.ids.read().unwrap().clone()
     }
 
+    /// Resolve a batch of `/org/ncspot/queue/<id>` paths to (id, Playable) pairs
+    /// in a single pass under one read lock. Unknown/foreign paths are skipped.
+    #[cfg(feature = "mpris")]
+    pub fn playables_for_paths(
+        &self,
+        paths: &[zbus::zvariant::ObjectPath<'_>],
+    ) -> Vec<(u64, crate::model::playable::Playable)> {
+        use std::collections::HashMap;
+        let q = self.queue.read().unwrap();
+        let ids = self.ids.read().unwrap();
+        let pos: HashMap<u64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+        paths
+            .iter()
+            .filter_map(|p| {
+                let id: u64 = p.as_str().strip_prefix("/org/ncspot/queue/")?.parse().ok()?;
+                let &index = pos.get(&id)?;
+                q.get(index).cloned().map(|pl| (id, pl))
+            })
+            .collect()
+    }
+
     /// Insert `track` as the item that should logically follow the currently
     /// playing item, taking into account shuffle status.
     pub fn insert_after_current(&self, track: Playable) {
@@ -1172,6 +1193,26 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), before, "ids must stay unique");
+    }
+
+    #[cfg(feature = "mpris")]
+    #[test]
+    fn test_playables_for_paths_o1_resolution() {
+        use zbus::zvariant::ObjectPath;
+        let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(0));
+        let id2 = q.id_for_index(2).unwrap();
+        let id0 = q.id_for_index(0).unwrap();
+        let paths = vec![
+            ObjectPath::from_string_unchecked(format!("/org/ncspot/queue/{id2}")),
+            ObjectPath::from_static_str_unchecked("/org/ncspot/queue/999999"), // unknown -> skipped
+            ObjectPath::from_string_unchecked(format!("/org/ncspot/queue/{id0}")),
+        ];
+        let got = q.playables_for_paths(&paths);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, id2);
+        assert_eq!(track_id(&got[0].1), "id_2");
+        assert_eq!(got[1].0, id0);
+        assert_eq!(track_id(&got[1].1), "id_0");
     }
 
     #[test]

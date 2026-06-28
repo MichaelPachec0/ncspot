@@ -67,17 +67,7 @@ impl MprisTrackList {
         &self,
         track_ids: Vec<ObjectPath<'_>>,
     ) -> Vec<HashMap<String, Value<'static>>> {
-        // Resolve (id, playable) pairs first (cheap); Task 6 replaces this inline
-        // resolution with the O(1) self.queue.playables_for_paths(&track_ids).
-        let pairs: Vec<(u64, crate::model::playable::Playable)> = track_ids
-            .iter()
-            .filter_map(|path| {
-                let id = parse_queue_path(path)?;
-                let index = self.queue.index_for_id(id)?;
-                let p = self.queue.queue.read().unwrap().get(index).cloned()?;
-                Some((id, p))
-            })
-            .collect();
+        let pairs = self.queue.playables_for_paths(&track_ids);
         let spotify = self.spotify.clone();
         let library = self.library.clone();
         tokio::task::spawn_blocking(move || {
