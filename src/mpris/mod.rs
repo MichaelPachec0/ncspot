@@ -7,7 +7,7 @@ mod root;
 mod tracklist;
 
 use std::error::Error;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use log::info;
 use tokio::sync::mpsc;
@@ -65,6 +65,8 @@ pub enum MprisCommand {
     EmitTrackMetadataChanged(u64),
     /// A playlist changed. Some(id) = that specific playlist; None = bulk refresh.
     EmitPlaylistChanged(Option<String>),
+    /// The active playlist changed; emit ActivePlaylist PropertiesChanged.
+    EmitActivePlaylistChanged,
 }
 
 /// An MPRIS server that internally manager a thread which can be sent commands. This is internally
@@ -97,7 +99,6 @@ impl MprisManager {
             queue,
             library,
             spotify,
-            active_playlist_id: Arc::new(Mutex::new(None)),
         };
 
         let (tx, rx) = mpsc::unbounded_channel::<MprisCommand>();
@@ -260,6 +261,11 @@ impl MprisManager {
                             pl.playlist_count_changed(pl_ctx).await?;
                         }
                     }
+                }
+                Some(MprisCommand::EmitActivePlaylistChanged) => {
+                    let pl_ctx = playlists_iface_ref.signal_emitter();
+                    let pl = playlists_iface_ref.get().await;
+                    pl.active_playlist_changed(pl_ctx).await?;
                 }
                 None => break,
             }

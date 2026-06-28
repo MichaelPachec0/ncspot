@@ -1,6 +1,6 @@
 #![allow(clippy::use_self)]
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use zbus::interface;
 use zbus::object_server::SignalEmitter;
@@ -47,8 +47,6 @@ pub struct MprisPlaylists {
     pub queue: Arc<Queue>,
     pub library: Arc<Library>,
     pub spotify: Spotify,
-    /// ID of the playlist most recently activated via ActivatePlaylist.
-    pub active_playlist_id: Arc<Mutex<Option<String>>>,
 }
 
 fn all_playlist_tuples(library: &Library) -> Vec<(OwnedObjectPath, String, String)> {
@@ -85,25 +83,13 @@ impl MprisPlaylists {
     /// Returns `(true, playlist_tuple)` when active, `(false, sentinel)` otherwise.
     #[zbus(property)]
     fn active_playlist(&self) -> (bool, (OwnedObjectPath, String, String)) {
-        let guard = self.active_playlist_id.lock().unwrap();
-        if let Some(ref id) = *guard {
+        if let Some(id) = self.queue.active_playlist() {
             let playlists = self.library.playlists.read().unwrap();
-            if let Some(p) = playlists.iter().find(|p| &p.id == id) {
-                return (
-                    true,
-                    (playlist_path_for_id(id), p.name.clone(), String::new()),
-                );
+            if let Some(p) = playlists.iter().find(|p| p.id == id) {
+                return (true, (playlist_path_for_id(&id), p.name.clone(), String::new()));
             }
         }
-        // No active playlist – the MPRIS spec allows "/" as the sentinel path.
-        (
-            false,
-            (
-                OwnedObjectPath::try_from("/").unwrap(),
-                String::new(),
-                String::new(),
-            ),
-        )
+        (false, (OwnedObjectPath::try_from("/").unwrap(), String::new(), String::new()))
     }
 
     /// Load the playlist identified by `playlist_id` into the queue and start playback.
@@ -135,8 +121,7 @@ impl MprisPlaylists {
         self.queue.clear();
         let index = self.queue.append_next(&tracks);
         self.queue.play(index, should_shuffle, should_shuffle);
-        // Task 8 replaces this with self.queue.set_active_playlist(Some(id)).
-        *self.active_playlist_id.lock().unwrap() = Some(id);
+        self.queue.set_active_playlist(Some(id));
     }
 
     /// Return a page of playlists starting at `index`, up to `max_count`, in the given order.

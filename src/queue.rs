@@ -52,6 +52,9 @@ pub struct Queue {
     ids: RwLock<Vec<u64>>,
     /// Monotonic source of new entry ids.
     id_counter: std::sync::atomic::AtomicU64,
+    /// The Spotify playlist id most recently loaded via ActivatePlaylist, if any.
+    /// Reset to None by clear() so it is never stale after a non-activate queue replacement.
+    active_playlist: RwLock<Option<String>>,
     spotify: Spotify,
     cfg: Arc<Config>,
     library: Arc<Library>,
@@ -72,6 +75,7 @@ impl Queue {
             random_order: RwLock::new(queue_state.random_order),
             ids: RwLock::new(ids),
             id_counter,
+            active_playlist: RwLock::new(None),
             cfg,
             library,
         }
@@ -437,6 +441,8 @@ impl Queue {
                 o.clear()
             }
         }
+        // Any non-ActivatePlaylist queue replacement clears the active playlist.
+        self.set_active_playlist(None);
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
@@ -694,6 +700,27 @@ impl Queue {
         }
     }
 
+    /// The playlist id the queue was last loaded from via ActivatePlaylist, if any.
+    #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
+    pub fn active_playlist(&self) -> Option<String> {
+        self.active_playlist.read().unwrap().clone()
+    }
+
+    /// Record (or clear) the active source playlist and notify MPRIS.
+    #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
+    pub fn set_active_playlist(&self, id: Option<String>) {
+        {
+            let mut g = self.active_playlist.write().unwrap();
+            if *g == id {
+                return;
+            }
+            *g = id;
+        }
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitActivePlaylistChanged);
+    }
+
     /// Get the spotify session.
     pub fn get_spotify(&self) -> Spotify {
         self.spotify.clone()
@@ -797,6 +824,7 @@ mod tests {
             current_track: RwLock::new(current),
             ids: RwLock::new(ids),
             id_counter,
+            active_playlist: RwLock::new(None),
             spotify,
             cfg,
             library,
@@ -1144,6 +1172,15 @@ mod tests {
         q.clear();
         // clear() clears the order contents but leaves it as Some([]).
         assert_eq!(q.get_random_order(), Some(vec![]));
+    }
+
+    #[test]
+    fn test_active_playlist_set_and_cleared_by_clear() {
+        let q = make_queue(vec![make_track(0)], Some(0));
+        q.set_active_playlist(Some("pl_abc".to_string()));
+        assert_eq!(q.active_playlist(), Some("pl_abc".to_string()));
+        q.clear();
+        assert_eq!(q.active_playlist(), None);
     }
 
     #[test]
