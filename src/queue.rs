@@ -179,7 +179,11 @@ impl Queue {
         paths
             .iter()
             .filter_map(|p| {
-                let id: u64 = p.as_str().strip_prefix("/org/ncspot/queue/")?.parse().ok()?;
+                let id: u64 = p
+                    .as_str()
+                    .strip_prefix("/org/ncspot/queue/")?
+                    .parse()
+                    .ok()?;
                 let &index = pos.get(&id)?;
                 q.get(index).cloned().map(|pl| (id, pl))
             })

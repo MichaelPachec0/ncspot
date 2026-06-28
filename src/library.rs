@@ -184,7 +184,9 @@ impl Library {
             );
             #[cfg(feature = "mpris")]
             self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(id.to_string())));
+                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(
+                    id.to_string(),
+                )));
         }
     }
 
@@ -899,7 +901,9 @@ impl Library {
 
             #[cfg(feature = "mpris")]
             self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(playlist.id.clone())));
+                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(
+                    playlist.id.clone(),
+                )));
         }
     }
 

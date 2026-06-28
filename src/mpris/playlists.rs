@@ -86,10 +86,20 @@ impl MprisPlaylists {
         if let Some(id) = self.queue.active_playlist() {
             let playlists = self.library.playlists.read().unwrap();
             if let Some(p) = playlists.iter().find(|p| p.id == id) {
-                return (true, (playlist_path_for_id(&id), p.name.clone(), String::new()));
+                return (
+                    true,
+                    (playlist_path_for_id(&id), p.name.clone(), String::new()),
+                );
             }
         }
-        (false, (OwnedObjectPath::try_from("/").unwrap(), String::new(), String::new()))
+        (
+            false,
+            (
+                OwnedObjectPath::try_from("/").unwrap(),
+                String::new(),
+                String::new(),
+            ),
+        )
     }
 
     /// Load the playlist identified by `playlist_id` into the queue and start playback.

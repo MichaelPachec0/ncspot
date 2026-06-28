@@ -85,13 +85,14 @@ impl MprisTrackList {
     async fn add_track(&self, uri: &str, after_track: ObjectPath<'_>, set_as_current: bool) {
         let spotify = self.spotify.clone();
         let uri_owned = uri.to_string();
-        let playable =
-            match tokio::task::spawn_blocking(move || resolve_single_playable(&spotify, &uri_owned))
-                .await
-            {
-                Ok(Some(p)) => p,
-                _ => return,
-            };
+        let playable = match tokio::task::spawn_blocking(move || {
+            resolve_single_playable(&spotify, &uri_owned)
+        })
+        .await
+        {
+            Ok(Some(p)) => p,
+            _ => return,
+        };
         let after_id = if after_track.as_str() == no_track_path().as_str() {
             None
         } else {
