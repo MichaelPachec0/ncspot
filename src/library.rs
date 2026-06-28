@@ -353,6 +353,18 @@ impl Library {
                     self.append_or_update(playlist);
                     // trigger redraw
                     self.trigger_redraw();
+                } else {
+                    // Snapshot unchanged, so the cached tracks are current and we
+                    // skip the costly reload. But a cache written before the
+                    // cover_url field existed stores it as None; backfill it from
+                    // the freshly-fetched list metadata so playlist art appears
+                    // without forcing a full re-download.
+                    let mut store = self.playlists.write().unwrap();
+                    if let Some(local) = store.iter_mut().find(|p| p.id == remote.id)
+                        && local.cover_url != remote.cover_url
+                    {
+                        local.cover_url = remote.cover_url.clone();
+                    }
                 }
             }
             lists_batch = lists_page.next();
