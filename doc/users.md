@@ -187,9 +187,10 @@ beats. Toggle it from anywhere with `:jukeboxtoggle`, and open the visualizer wi
 | <kbd>b</kbd>                 | Toggle "bounce" (repeat the current section).                 |
 | <kbd>i</kbd>                 | Toggle endless mode.                                           |
 | <kbd>g</kbd>                 | Toggle the graphics backend (image vs ASCII), if compiled in. |
+| <kbd>s</kbd>                 | Open the per-song jukebox settings menu.                      |
 
 The underlying commands (`jukeboxtoggle`, `jukeboxview`, `jukeboxbounce`, `jukeboxseek`,
-`jukeboxsettings`, `jukeboxgraphics`) can be bound to any key via `[keybindings]`. Analysis is
+`jukeboxsettings`, `jukeboxgraphics`, `jukeboxsongsettings`) can be bound to any key via `[keybindings]`. Analysis is
 fetched from Spotify's internal client endpoint, with a configurable eternalbox.dev fallback;
 tracks without analysis (local files, podcasts) cannot be jukeboxed. See
 [Jukebox settings](#jukebox-settings).
@@ -202,6 +203,11 @@ graphics` (default `true` when the feature is compiled). On kitty the image is t
 PNG and replaced in place with a transparent background, so it blends with the terminal and
 stays cheap even at high `graphics_max_px`; on sixel/iTerm2 it uses your theme's background
 colour (falling back to black for the default `TerminalDefault`).
+
+Press <kbd>s</kbd> or run `:jukeboxsongsettings` to open the per-song settings menu, which
+lets you save dial overrides for the current track (as a full snapshot or a diff from the
+global settings). In the Split view the dial read-out marks per-song overrides with `▸` and
+global-but-changed dials with `·`.
 
 ### Vim-Like Commands
 You can open a Vim-style command prompt using <kbd>:</kbd>, and close it at any
@@ -649,6 +655,10 @@ graphics = true
 # iTerm2 caps to 1280. Set it to also cap kitty (lower if input ever feels laggy), or to
 # raise the sixel/iTerm2 cap.
 # graphics_max_px = 1280
+
+# When saving per-song settings, store the full dial snapshot (true) or only dials that
+# differ from global settings (false). Toggled in the per-song settings menu.
+# override_per_song = false
 ```
 
 With `break_loops` on, the jukebox tracks how often each branch is taken and, once a branch
