@@ -170,6 +170,7 @@ pub enum Command {
     JukeboxSeekToBeat,
     JukeboxSettings,
     JukeboxGraphics,
+    JukeboxSongSettings,
 }
 
 impl fmt::Display for Command {
@@ -247,7 +248,8 @@ impl fmt::Display for Command {
             | Self::JukeboxBounce
             | Self::JukeboxSeekToBeat
             | Self::JukeboxSettings
-            | Self::JukeboxGraphics => vec![],
+            | Self::JukeboxGraphics
+            | Self::JukeboxSongSettings => vec![],
         };
         repr_tokens.append(&mut extras_args);
         write!(f, "{}", repr_tokens.join(" "))
@@ -314,6 +316,7 @@ impl Command {
             Self::JukeboxSeekToBeat => "jukeboxseek",
             Self::JukeboxSettings => "jukeboxsettings",
             Self::JukeboxGraphics => "jukeboxgraphics",
+            Self::JukeboxSongSettings => "jukeboxsongsettings",
         }
     }
 }
@@ -834,6 +837,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "jukeboxseek" => Command::JukeboxSeekToBeat,
                 "jukeboxsettings" => Command::JukeboxSettings,
                 "jukeboxgraphics" => Command::JukeboxGraphics,
+                "jukeboxsongsettings" => Command::JukeboxSongSettings,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),
@@ -844,4 +848,17 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
         };
     }
     Ok(commands)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_jukebox_song_settings() {
+        assert!(matches!(
+            parse("jukeboxsongsettings").as_deref(),
+            Ok([Command::JukeboxSongSettings])
+        ));
+    }
 }
