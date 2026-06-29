@@ -7,6 +7,7 @@ pub mod remixer;
 pub mod render;
 pub mod settings;
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use crate::jukebox::analysis::AnalysisManager;
 use crate::jukebox::driver::{Driver, DriverAction, SystemClock, XorShiftRandom};
 use crate::jukebox::graph::{Edge, SongGraph};
 use crate::jukebox::remixer::remix;
-use crate::jukebox::settings::JukeboxSettings;
+use crate::jukebox::settings::{JukeboxSettings, PartialJukeboxSettings, SettingsSource};
 use crate::model::playable::Playable;
 use crate::queue::Queue;
 use crate::traits::ListItem;
@@ -53,6 +54,13 @@ pub struct SongState {
     pub last_branch: Option<Edge>,
     pub bouncing: bool,
     pub no_analysis: bool,
+    // Read by the Split-panel read-out (wired in Task 4).
+    #[allow(dead_code)]
+    pub effective: JukeboxSettings,
+    #[allow(dead_code)]
+    pub source: SettingsSource,
+    #[allow(dead_code)]
+    pub per_song: Option<PartialJukeboxSettings>,
 }
 
 struct JukeboxInner {
@@ -156,6 +164,10 @@ impl Jukebox {
     }
     pub fn apply_settings(&self, settings: JukeboxSettings) {
         *self.inner.settings.write().unwrap() = settings;
+        self.request_rebuild();
+    }
+    /// Force the driver to rebuild the current track on its next tick.
+    pub fn request_rebuild(&self) {
         self.inner.rebuild.store(true, Ordering::Relaxed);
     }
 
@@ -164,6 +176,27 @@ impl Jukebox {
         Self {
             inner: Arc::new(JukeboxInner::new(JukeboxSettings::default(), false, false)),
         }
+    }
+}
+
+/// Resolve the effective settings for `track_id`: the global `base` wins when the override
+/// toggle is on or no per-song entry exists; otherwise the per-song override is overlaid.
+pub fn resolve_effective(
+    base: &JukeboxSettings,
+    override_per_song: bool,
+    overrides: &HashMap<String, PartialJukeboxSettings>,
+    track_id: &str,
+) -> (
+    JukeboxSettings,
+    SettingsSource,
+    Option<PartialJukeboxSettings>,
+) {
+    if override_per_song {
+        return (base.clone(), SettingsSource::Global, None);
+    }
+    match overrides.get(track_id) {
+        Some(p) => (p.resolve(base), SettingsSource::PerSong, Some(p.clone())),
+        None => (base.clone(), SettingsSource::Global, None),
     }
 }
 
@@ -180,6 +213,9 @@ fn publish_no_analysis(inner: &JukeboxInner, events: &EventManager, playable: &P
         last_branch: None,
         bouncing: false,
         no_analysis: true,
+        effective: JukeboxSettings::default(),
+        source: SettingsSource::Global,
+        per_song: None,
     });
     events.trigger();
 }
@@ -187,9 +223,9 @@ fn publish_no_analysis(inner: &JukeboxInner, events: &EventManager, playable: &P
 /// Build a driver for `track_id` from cached/fetched analysis. Returns the driver and the
 /// shared graph, or None if no analysis is available.
 fn build_driver(
-    inner: &JukeboxInner,
     analysis: &AnalysisManager,
     cfg: &Config,
+    settings: &JukeboxSettings,
     track_id: &str,
     seed: u64,
 ) -> Option<(Driver, Arc<SongGraph>)> {
@@ -204,12 +240,11 @@ fn build_driver(
     if remixed.beats.is_empty() {
         return None;
     }
-    let settings = inner.settings.read().unwrap().clone();
-    let g = graph::generate(&settings, &remixed);
+    let g = graph::generate(settings, &remixed);
     let shared = Arc::new(g.clone());
     let driver = Driver::new(
         g,
-        settings,
+        settings.clone(),
         Box::new(XorShiftRandom::new(seed | 1)),
         Box::new(SystemClock),
     );
@@ -227,6 +262,9 @@ fn run_driver_loop(
     let mut current_track_id: Option<String> = None;
     let mut current_graph: Arc<SongGraph> = Arc::new(SongGraph::default());
     let mut current_title = String::new();
+    let mut current_effective = JukeboxSettings::default();
+    let mut current_source = SettingsSource::Global;
+    let mut current_partial: Option<PartialJukeboxSettings> = None;
     let mut started = Instant::now();
     let mut seek_cooldown: u32 = 0;
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
@@ -261,11 +299,24 @@ fn run_driver_loop(
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
-            match build_driver(&inner, &analysis, &cfg, &id, seed) {
+            let (eff, src, partial) = {
+                let base = inner.settings.read().unwrap().clone();
+                let st = cfg.state();
+                resolve_effective(
+                    &base,
+                    st.jukebox_override_per_song,
+                    &st.jukebox_overrides,
+                    &id,
+                )
+            };
+            match build_driver(&analysis, &cfg, &eff, &id, seed) {
                 Some((d, g)) => {
                     driver = Some(d);
                     current_graph = g;
                     current_title = playable.track().map(|t| t.title).unwrap_or_default();
+                    current_effective = eff;
+                    current_source = src;
+                    current_partial = partial;
                     started = Instant::now();
                 }
                 None => {
@@ -277,11 +328,25 @@ fn run_driver_loop(
 
         if inner.rebuild.swap(false, Ordering::Relaxed)
             && let Some(id) = current_track_id.clone()
-            && let Some((d, g)) = build_driver(&inner, &analysis, &cfg, &id, seed | 2)
         {
-            driver = Some(d);
-            current_graph = g;
-            started = Instant::now();
+            let (eff, src, partial) = {
+                let base = inner.settings.read().unwrap().clone();
+                let st = cfg.state();
+                resolve_effective(
+                    &base,
+                    st.jukebox_override_per_song,
+                    &st.jukebox_overrides,
+                    &id,
+                )
+            };
+            if let Some((d, g)) = build_driver(&analysis, &cfg, &eff, &id, seed | 2) {
+                driver = Some(d);
+                current_graph = g;
+                current_effective = eff;
+                current_source = src;
+                current_partial = partial;
+                started = Instant::now();
+            }
         }
 
         let Some(d) = driver.as_mut() else {
@@ -317,6 +382,9 @@ fn run_driver_loop(
             last_branch: d.last_branch(),
             bouncing: inner.bouncing.load(Ordering::Relaxed),
             no_analysis: false,
+            effective: current_effective.clone(),
+            source: current_source,
+            per_song: current_partial.clone(),
         });
         events.trigger();
     }
@@ -325,6 +393,39 @@ fn run_driver_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_effective_precedence() {
+        use crate::jukebox::settings::{PartialJukeboxSettings, SettingsSource};
+        use std::collections::HashMap;
+
+        let base = JukeboxSettings::default();
+        let mut overrides = HashMap::new();
+        overrides.insert(
+            "trk".to_string(),
+            PartialJukeboxSettings {
+                max_branch_distance: Some(70),
+                ..PartialJukeboxSettings::default()
+            },
+        );
+
+        // Per-song present, toggle off -> per-song wins.
+        let (eff, src, partial) = resolve_effective(&base, false, &overrides, "trk");
+        assert_eq!(eff.max_branch_distance, 70);
+        assert_eq!(src, SettingsSource::PerSong);
+        assert!(partial.is_some());
+
+        // Toggle on -> global wins, per-song ignored.
+        let (eff, src, partial) = resolve_effective(&base, true, &overrides, "trk");
+        assert_eq!(eff.max_branch_distance, base.max_branch_distance);
+        assert_eq!(src, SettingsSource::Global);
+        assert!(partial.is_none());
+
+        // No entry for this track -> global.
+        let (_, src, partial) = resolve_effective(&base, false, &overrides, "other");
+        assert_eq!(src, SettingsSource::Global);
+        assert!(partial.is_none());
+    }
 
     #[test]
     fn toggle_flips_enabled() {

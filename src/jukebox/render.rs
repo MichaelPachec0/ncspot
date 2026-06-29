@@ -395,6 +395,9 @@ mod render_tests {
             }),
             bouncing: false,
             no_analysis: false,
+            effective: crate::jukebox::settings::JukeboxSettings::default(),
+            source: crate::jukebox::settings::SettingsSource::Global,
+            per_song: None,
         }
     }
 
