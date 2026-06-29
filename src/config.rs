@@ -170,6 +170,8 @@ pub struct JukeboxConfig {
     pub loop_skip_action: Option<String>,
     pub break_last_branch: Option<bool>,
     pub loop_counter: Option<String>,
+    /// Default for the global "override per-song settings" toggle on first run.
+    pub override_per_song: Option<bool>,
 }
 
 impl JukeboxConfig {
@@ -241,6 +243,12 @@ pub struct UserState {
     /// endless-mode / graphics on/off toggles, so the jukebox always starts disabled.
     #[serde(default)]
     pub jukebox: Option<crate::jukebox::settings::JukeboxSettings>,
+    /// Per-track jukebox dial overrides, keyed by Spotify track id.
+    #[serde(default)]
+    pub jukebox_overrides: HashMap<String, crate::jukebox::settings::PartialJukeboxSettings>,
+    /// When true, per-song overrides are ignored and the global settings drive every track.
+    #[serde(default)]
+    pub jukebox_override_per_song: bool,
 }
 
 impl Default for UserState {
@@ -254,6 +262,8 @@ impl Default for UserState {
             cache_version: 0,
             playback_state: PlaybackState::Default,
             jukebox: None,
+            jukebox_overrides: HashMap::new(),
+            jukebox_override_per_song: false,
         }
     }
 }
@@ -493,5 +503,17 @@ mod lyrics_cfg_tests {
             ..Default::default()
         };
         assert_eq!(c2.analysis_source_order(), vec!["spclient"]);
+    }
+
+    #[test]
+    fn userstate_back_compat_defaults_for_new_jukebox_fields() {
+        // A state serialized before these fields existed must load with defaults.
+        let mut v = serde_json::to_value(super::UserState::default()).unwrap();
+        let obj = v.as_object_mut().unwrap();
+        obj.remove("jukebox_overrides");
+        obj.remove("jukebox_override_per_song");
+        let restored: super::UserState = serde_json::from_value(v).unwrap();
+        assert!(restored.jukebox_overrides.is_empty());
+        assert!(!restored.jukebox_override_per_song);
     }
 }
