@@ -327,6 +327,10 @@ impl Config {
             userstate.playback_state = playback_state;
         }
 
+        if let Some(over) = values.jukebox.as_ref().and_then(|j| j.override_per_song) {
+            userstate.jukebox_override_per_song = over;
+        }
+
         Self {
             filename,
             values: RwLock::new(values),
