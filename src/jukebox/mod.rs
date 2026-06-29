@@ -54,12 +54,11 @@ pub struct SongState {
     pub last_branch: Option<Edge>,
     pub bouncing: bool,
     pub no_analysis: bool,
-    // Read by the Split-panel read-out (wired in Task 4).
-    #[allow(dead_code)]
+    /// Effective settings for this song (read by the Split-panel dial read-out).
     pub effective: JukeboxSettings,
-    #[allow(dead_code)]
+    /// Which precedence tier produced `effective`.
     pub source: SettingsSource,
-    #[allow(dead_code)]
+    /// Per-song override in effect, if any.
     pub per_song: Option<PartialJukeboxSettings>,
 }
 

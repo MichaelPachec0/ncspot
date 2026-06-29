@@ -29,6 +29,9 @@ const MIN_BLIT_INTERVAL_MS: u128 = 200;
 #[cfg(feature = "jukebox-graphics")]
 const JUKEBOX_KITTY_ID: u32 = 0x6E63_7370; // "ncsp"
 
+/// Width (columns) of the Split-view side panel that holds the dial read-out.
+const SPLIT_PANEL_W: usize = 32;
+
 #[cfg(feature = "jukebox-graphics")]
 #[derive(Clone, PartialEq)]
 struct ImageRequest {
@@ -456,7 +459,7 @@ impl JukeboxView {
             Self::draw_status(printer, "No analysis available for this track.");
             return;
         }
-        let panel_w = 22usize;
+        let panel_w = SPLIT_PANEL_W;
         let left_w = w.saturating_sub(panel_w + 1);
 
         let branch = ColorStyle::new(
@@ -511,28 +514,16 @@ impl JukeboxView {
         self.draw_split_panel(printer, state, left_w, total);
     }
 
-    fn draw_split_panel(&self, printer: &Printer, state: &SongState, left_w: usize, total: usize) {
+    fn draw_split_panel(&self, printer: &Printer, state: &SongState, left_w: usize, _total: usize) {
         let px = left_w + 2;
-        let panel_w = 22usize;
-        let title: String = state.track_title.chars().take(panel_w - 2).collect();
-        printer.print((px, 1), "Now Playing");
-        printer.print((px, 2), &title);
-        printer.print(
-            (px, 4),
-            &format!("Beat   {}/{}", state.current_beat + 1, total),
-        );
-        printer.print(
-            (px, 5),
-            &format!("Branch {:.0}%", state.branch_chance * 100.0),
-        );
-        printer.print((px, 6), &format!("Jumps  {}", state.jumps));
-        let mins = state.listen_time_ms / 60000;
-        let secs = (state.listen_time_ms / 1000) % 60;
-        printer.print((px, 7), &format!("Listen {mins}:{secs:02}"));
-        if state.bouncing {
-            printer.print((px, 8), "[bounce]");
+        for (row, (marker, text)) in dial_lines(state).into_iter().enumerate() {
+            let line = if marker == ' ' {
+                text
+            } else {
+                format!("{marker}{text}")
+            };
+            printer.print((px, row), &line);
         }
-        printer.print((px, 9), &format!("Played {}", state.beats_played));
     }
 
     #[cfg(feature = "jukebox-graphics")]
@@ -554,7 +545,7 @@ impl JukeboxView {
 
         let (region, layout_name) = match mode {
             ViewMode::Split => {
-                let left_w = w.saturating_sub(22 + 1);
+                let left_w = w.saturating_sub(SPLIT_PANEL_W + 1);
                 for y in 0..h {
                     printer.print((left_w, y), "│");
                 }
@@ -723,6 +714,107 @@ impl JukeboxView {
     }
 }
 
+/// One read-out row per dial plus the live values, each with a marker:
+/// `▸` = supplied by the per-song override, `·` = changed from default but inherited,
+/// space = default + inherited.
+pub fn dial_lines(state: &SongState) -> Vec<(char, String)> {
+    use crate::jukebox::settings::{Dial, JukeboxSettings, SettingsSource};
+
+    let d = JukeboxSettings::default();
+    let e = &state.effective;
+    let ps = state.per_song.as_ref();
+    // Marker for a dial: per-song override > changed-from-default > none.
+    let mark = |dial: Dial, changed: bool| -> char {
+        if ps.map(|p| p.is_overridden(dial)).unwrap_or(false) {
+            '▸'
+        } else if changed {
+            '·'
+        } else {
+            ' '
+        }
+    };
+    let onoff = |b: bool| if b { "on" } else { "off" };
+
+    let source = match state.source {
+        SettingsSource::Global => "global",
+        SettingsSource::PerSong => "per-song",
+    };
+
+    let mut out: Vec<(char, String)> = Vec::new();
+    out.push((' ', format!("Now Playing · {source}")));
+    let title: String = state.track_title.chars().take(SPLIT_PANEL_W - 2).collect();
+    out.push((' ', title));
+    out.push((' ', "── dials (▸=changed) ──".into()));
+    out.push((
+        mark(
+            Dial::MaxBranchDistance,
+            e.max_branch_distance != d.max_branch_distance,
+        ),
+        format!("similarity     {}", e.max_branch_distance),
+    ));
+    out.push((
+        mark(
+            Dial::MinBranchProbability,
+            e.min_branch_probability != d.min_branch_probability
+                || e.max_branch_probability != d.max_branch_probability,
+        ),
+        format!(
+            "min/max  {:.2}/{:.2}",
+            e.min_branch_probability, e.max_branch_probability
+        ),
+    ));
+    out.push((
+        mark(
+            Dial::BranchProbabilityRamp,
+            e.branch_probability_ramp != d.branch_probability_ramp,
+        ),
+        format!("ramp         {:.3}", e.branch_probability_ramp),
+    ));
+    out.push((
+        mark(
+            Dial::DynamicThreshold,
+            e.dynamic_threshold != d.dynamic_threshold,
+        ),
+        format!("dynamic      {}", onoff(e.dynamic_threshold)),
+    ));
+    out.push((
+        mark(
+            Dial::OnlyBackwardBranches,
+            e.only_backward_branches != d.only_backward_branches
+                || e.only_long_branches != d.only_long_branches,
+        ),
+        format!(
+            "back/long  {}/{}",
+            onoff(e.only_backward_branches),
+            onoff(e.only_long_branches)
+        ),
+    ));
+    out.push((
+        mark(Dial::AntiLoop, e.anti_loop != d.anti_loop),
+        format!(
+            "anti-loop  {} ({})",
+            onoff(e.anti_loop.enabled),
+            e.anti_loop.threshold
+        ),
+    ));
+    out.push((' ', "── live ──".into()));
+    out.push((
+        ' ',
+        format!(
+            "branch {:.0}%  jumps {}",
+            state.branch_chance * 100.0,
+            state.jumps
+        ),
+    ));
+    let mins = state.listen_time_ms / 60000;
+    let secs = (state.listen_time_ms / 1000) % 60;
+    out.push((
+        ' ',
+        format!("played {}  listen {}:{:02}", state.beats_played, mins, secs),
+    ));
+    out
+}
+
 impl View for JukeboxView {
     fn draw(&self, printer: &Printer<'_, '_>) {
         let Some(state) = self.jukebox.state() else {
@@ -871,4 +963,61 @@ fn blit_image(img: &image::RgbaImage, offset: Vec2, size: Vec2) -> Result<(), vi
     };
     let dynimg = image::DynamicImage::ImageRgba8(img.clone());
     viuer::print(&dynimg, &config).map(|_| ())
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::*;
+    use crate::jukebox::graph::SongGraph;
+    use crate::jukebox::settings::{JukeboxSettings, PartialJukeboxSettings, SettingsSource};
+    use std::sync::Arc;
+
+    fn base_state() -> SongState {
+        SongState {
+            track_title: "t".into(),
+            graph: Arc::new(SongGraph::default()),
+            current_beat: 0,
+            beats_played: 0,
+            jumps: 0,
+            branch_chance: 0.2,
+            listen_time_ms: 0,
+            last_branch: None,
+            bouncing: false,
+            no_analysis: false,
+            effective: JukeboxSettings::default(),
+            source: SettingsSource::Global,
+            per_song: None,
+        }
+    }
+
+    #[test]
+    fn dial_lines_marks_per_song_overrides() {
+        let mut st = base_state();
+        st.source = SettingsSource::PerSong;
+        st.effective.max_branch_distance = 70;
+        st.per_song = Some(PartialJukeboxSettings {
+            max_branch_distance: Some(70),
+            ..PartialJukeboxSettings::default()
+        });
+        let lines = dial_lines(&st);
+        let joined: String = lines.iter().map(|(m, t)| format!("{m}{t}\n")).collect();
+        // Source tag present.
+        assert!(joined.contains("per-song"));
+        // The overridden dial is flagged with the per-song marker.
+        let sim = lines
+            .iter()
+            .find(|(_, t)| t.contains("similarity"))
+            .unwrap();
+        assert_eq!(sim.0, '▸');
+    }
+
+    #[test]
+    fn dial_lines_plain_when_global_defaults() {
+        let lines = dial_lines(&base_state());
+        let sim = lines
+            .iter()
+            .find(|(_, t)| t.contains("similarity"))
+            .unwrap();
+        assert_eq!(sim.0, ' '); // default value, inherited -> no marker
+    }
 }
