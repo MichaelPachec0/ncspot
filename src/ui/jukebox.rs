@@ -743,7 +743,7 @@ pub fn dial_lines(state: &SongState) -> Vec<(char, String)> {
     out.push((' ', format!("Now Playing · {source}")));
     let title: String = state.track_title.chars().take(SPLIT_PANEL_W - 2).collect();
     out.push((' ', title));
-    out.push((' ', "── dials (▸=changed) ──".into()));
+    out.push((' ', "── dials (▸song ·chg) ──".into()));
     out.push((
         mark(
             Dial::MaxBranchDistance,
@@ -800,9 +800,10 @@ pub fn dial_lines(state: &SongState) -> Vec<(char, String)> {
     out.push((
         ' ',
         format!(
-            "branch {:.0}%  jumps {}",
+            "branch {:.0}%  jumps {}{}",
             state.branch_chance * 100.0,
-            state.jumps
+            state.jumps,
+            if state.bouncing { "  [bounce]" } else { "" }
         ),
     ));
     let mins = state.listen_time_ms / 60000;
@@ -1052,5 +1053,28 @@ mod panel_tests {
             .find(|(_, t)| t.contains("similarity"))
             .unwrap();
         assert_eq!(sim.0, ' '); // default value, inherited -> no marker
+    }
+
+    #[test]
+    fn dial_lines_bounce_shown_in_live_section() {
+        let mut st = base_state();
+        st.bouncing = true;
+        let lines = dial_lines(&st);
+        let branch_line = lines
+            .iter()
+            .find(|(_, t)| t.contains("branch") && t.contains("jumps"))
+            .unwrap();
+        assert!(
+            branch_line.1.contains("[bounce]"),
+            "expected [bounce] in live branch line when bouncing"
+        );
+
+        // Non-bouncing state must not show it.
+        let lines2 = dial_lines(&base_state());
+        let branch_line2 = lines2
+            .iter()
+            .find(|(_, t)| t.contains("branch") && t.contains("jumps"))
+            .unwrap();
+        assert!(!branch_line2.1.contains("[bounce]"));
     }
 }
