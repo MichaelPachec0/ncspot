@@ -225,6 +225,152 @@ impl Default for JukeboxSettings {
     }
 }
 
+/// Which precedence tier produced the effective settings for the current track.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsSource {
+    Global,
+    PerSong,
+}
+
+/// Identifies a single tunable dial, for marking which are per-song-overridden.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dial {
+    MaxBranchDistance,
+    DynamicThreshold,
+    MinBranchProbability,
+    MaxBranchProbability,
+    BranchProbabilityRamp,
+    OnlyBackwardBranches,
+    OnlyLongBranches,
+    RemoveSequentialBranches,
+    AddLastBranch,
+    AlwaysFollowLastBranch,
+    MaxPlayTimeSecs,
+    AntiLoop,
+}
+
+/// A per-track override: each dial is `Some` when supplied per-song, `None` when inherited
+/// from the global baseline. A full snapshot sets every field; a diff sets only the dials
+/// that differ from the baseline. `anti_loop` is overridden as a single unit.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PartialJukeboxSettings {
+    pub max_branch_distance: Option<u32>,
+    pub dynamic_threshold: Option<bool>,
+    pub min_branch_probability: Option<f64>,
+    pub max_branch_probability: Option<f64>,
+    pub branch_probability_ramp: Option<f64>,
+    pub only_backward_branches: Option<bool>,
+    pub only_long_branches: Option<bool>,
+    pub remove_sequential_branches: Option<bool>,
+    pub add_last_branch: Option<bool>,
+    pub always_follow_last_branch: Option<bool>,
+    pub max_play_time_secs: Option<u64>,
+    pub anti_loop: Option<AntiLoopSettings>,
+}
+
+#[allow(dead_code)]
+impl PartialJukeboxSettings {
+    /// Capture every dial from `cur`.
+    pub fn snapshot(cur: &JukeboxSettings) -> Self {
+        Self {
+            max_branch_distance: Some(cur.max_branch_distance),
+            dynamic_threshold: Some(cur.dynamic_threshold),
+            min_branch_probability: Some(cur.min_branch_probability),
+            max_branch_probability: Some(cur.max_branch_probability),
+            branch_probability_ramp: Some(cur.branch_probability_ramp),
+            only_backward_branches: Some(cur.only_backward_branches),
+            only_long_branches: Some(cur.only_long_branches),
+            remove_sequential_branches: Some(cur.remove_sequential_branches),
+            add_last_branch: Some(cur.add_last_branch),
+            always_follow_last_branch: Some(cur.always_follow_last_branch),
+            max_play_time_secs: Some(cur.max_play_time_secs),
+            anti_loop: Some(cur.anti_loop),
+        }
+    }
+
+    /// Set only the dials in `cur` that differ from `base`.
+    pub fn diff(cur: &JukeboxSettings, base: &JukeboxSettings) -> Self {
+        macro_rules! d {
+            ($f:ident) => {
+                if cur.$f != base.$f {
+                    Some(cur.$f)
+                } else {
+                    None
+                }
+            };
+        }
+        Self {
+            max_branch_distance: d!(max_branch_distance),
+            dynamic_threshold: d!(dynamic_threshold),
+            min_branch_probability: d!(min_branch_probability),
+            max_branch_probability: d!(max_branch_probability),
+            branch_probability_ramp: d!(branch_probability_ramp),
+            only_backward_branches: d!(only_backward_branches),
+            only_long_branches: d!(only_long_branches),
+            remove_sequential_branches: d!(remove_sequential_branches),
+            add_last_branch: d!(add_last_branch),
+            always_follow_last_branch: d!(always_follow_last_branch),
+            max_play_time_secs: d!(max_play_time_secs),
+            anti_loop: if cur.anti_loop != base.anti_loop {
+                Some(cur.anti_loop)
+            } else {
+                None
+            },
+        }
+    }
+
+    /// Overlay the `Some` dials onto `base`.
+    pub fn resolve(&self, base: &JukeboxSettings) -> JukeboxSettings {
+        JukeboxSettings {
+            max_branch_distance: self.max_branch_distance.unwrap_or(base.max_branch_distance),
+            dynamic_threshold: self.dynamic_threshold.unwrap_or(base.dynamic_threshold),
+            min_branch_probability: self
+                .min_branch_probability
+                .unwrap_or(base.min_branch_probability),
+            max_branch_probability: self
+                .max_branch_probability
+                .unwrap_or(base.max_branch_probability),
+            branch_probability_ramp: self
+                .branch_probability_ramp
+                .unwrap_or(base.branch_probability_ramp),
+            only_backward_branches: self
+                .only_backward_branches
+                .unwrap_or(base.only_backward_branches),
+            only_long_branches: self.only_long_branches.unwrap_or(base.only_long_branches),
+            remove_sequential_branches: self
+                .remove_sequential_branches
+                .unwrap_or(base.remove_sequential_branches),
+            add_last_branch: self.add_last_branch.unwrap_or(base.add_last_branch),
+            always_follow_last_branch: self
+                .always_follow_last_branch
+                .unwrap_or(base.always_follow_last_branch),
+            max_play_time_secs: self.max_play_time_secs.unwrap_or(base.max_play_time_secs),
+            anti_loop: self.anti_loop.unwrap_or(base.anti_loop),
+        }
+    }
+
+    /// Whether `field` is supplied by this per-song override (vs inherited).
+    pub fn is_overridden(&self, field: Dial) -> bool {
+        match field {
+            Dial::MaxBranchDistance => self.max_branch_distance.is_some(),
+            Dial::DynamicThreshold => self.dynamic_threshold.is_some(),
+            Dial::MinBranchProbability => self.min_branch_probability.is_some(),
+            Dial::MaxBranchProbability => self.max_branch_probability.is_some(),
+            Dial::BranchProbabilityRamp => self.branch_probability_ramp.is_some(),
+            Dial::OnlyBackwardBranches => self.only_backward_branches.is_some(),
+            Dial::OnlyLongBranches => self.only_long_branches.is_some(),
+            Dial::RemoveSequentialBranches => self.remove_sequential_branches.is_some(),
+            Dial::AddLastBranch => self.add_last_branch.is_some(),
+            Dial::AlwaysFollowLastBranch => self.always_follow_last_branch.is_some(),
+            Dial::MaxPlayTimeSecs => self.max_play_time_secs.is_some(),
+            Dial::AntiLoop => self.anti_loop.is_some(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +442,56 @@ mod tests {
         let s = JukeboxSettings::from_config(&c);
         assert_eq!(s.anti_loop.identity, LoopIdentity::Edge);
         assert_eq!(s.anti_loop.threshold, 1); // clamped to >= 1
+    }
+
+    #[test]
+    fn snapshot_sets_all_fields_and_resolves_to_source() {
+        let cur = JukeboxSettings {
+            max_branch_distance: 55,
+            ..JukeboxSettings::default()
+        };
+        let p = PartialJukeboxSettings::snapshot(&cur);
+        assert!(p.max_branch_distance.is_some());
+        assert!(p.anti_loop.is_some());
+        // Resolving a full snapshot over any base reproduces the snapshot.
+        assert_eq!(p.resolve(&JukeboxSettings::default()), cur);
+    }
+
+    #[test]
+    fn diff_only_sets_changed_fields() {
+        let base = JukeboxSettings::default();
+        let mut cur = base.clone();
+        cur.max_branch_distance = 55;
+        let p = PartialJukeboxSettings::diff(&cur, &base);
+        assert_eq!(p.max_branch_distance, Some(55));
+        assert!(p.min_branch_probability.is_none());
+        assert!(p.anti_loop.is_none());
+        assert!(p.is_overridden(Dial::MaxBranchDistance));
+        assert!(!p.is_overridden(Dial::MinBranchProbability));
+    }
+
+    #[test]
+    fn resolve_overlays_only_some_fields() {
+        let base = JukeboxSettings {
+            min_branch_probability: 0.30,
+            ..JukeboxSettings::default()
+        };
+        let p = PartialJukeboxSettings {
+            max_branch_distance: Some(70),
+            ..PartialJukeboxSettings::default()
+        };
+        let eff = p.resolve(&base);
+        assert_eq!(eff.max_branch_distance, 70); // from partial
+        assert_eq!(eff.min_branch_probability, 0.30); // inherited from base
+    }
+
+    #[test]
+    fn diff_detects_anti_loop_change_as_unit() {
+        let base = JukeboxSettings::default();
+        let mut cur = base.clone();
+        cur.anti_loop.enabled = !base.anti_loop.enabled;
+        let p = PartialJukeboxSettings::diff(&cur, &base);
+        assert!(p.anti_loop.is_some());
+        assert!(p.is_overridden(Dial::AntiLoop));
     }
 }
