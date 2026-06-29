@@ -12,16 +12,16 @@ fn has_han(s: &str) -> bool {
 /// Romanization (no special inter-syllable assimilation rules).
 fn romanize_hangul(s: &str) -> String {
     const LEAD: [&str; 19] = [
-        "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch",
-        "k", "t", "p", "h",
+        "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "", "j", "jj", "ch", "k", "t",
+        "p", "h",
     ];
     const VOWEL: [&str; 21] = [
-        "a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u",
-        "wo", "we", "wi", "yu", "eu", "ui", "i",
+        "a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae", "oe", "yo", "u", "wo",
+        "we", "wi", "yu", "eu", "ui", "i",
     ];
     const TAIL: [&str; 28] = [
-        "", "k", "k", "k", "n", "n", "n", "t", "l", "l", "l", "l", "l", "l", "l", "l", "m",
-        "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t",
+        "", "k", "k", "k", "n", "n", "n", "t", "l", "l", "l", "l", "l", "l", "l", "l", "m", "p",
+        "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t",
     ];
     let mut out = String::new();
     for c in s.chars() {

@@ -119,7 +119,11 @@ impl JukeboxView {
         let jb = self.cfg.values().jukebox.clone().unwrap_or_default();
         let show_all = jb.show_all_branches.unwrap_or(true);
         let layouts = jb.branch_layouts.unwrap_or_else(|| {
-            vec!["linear".to_string(), "radial".to_string(), "split".to_string()]
+            vec![
+                "linear".to_string(),
+                "radial".to_string(),
+                "split".to_string(),
+            ]
         });
         let show_web = show_all && layouts.iter().any(|l| l == layout);
         (show_web, jb.max_branches_drawn.unwrap_or(0))
@@ -153,7 +157,9 @@ impl JukeboxView {
     }
 
     fn move_selection(&self, delta: i64) {
-        let Some(state) = self.jukebox.state() else { return };
+        let Some(state) = self.jukebox.state() else {
+            return;
+        };
         let total = state.graph.beats.len();
         if total == 0 {
             return;
@@ -197,14 +203,19 @@ impl JukeboxView {
     fn edge_colors() -> Vec<ColorStyle> {
         use cursive::theme::Color;
         [
-            Color::Rgb(0, 80, 80),    // dim cyan
-            Color::Rgb(0, 80, 0),     // dim green
-            Color::Rgb(90, 70, 0),    // dim amber
-            Color::Rgb(80, 0, 80),    // dim magenta
-            Color::Rgb(40, 40, 100),  // dim blue
+            Color::Rgb(0, 80, 80),   // dim cyan
+            Color::Rgb(0, 80, 0),    // dim green
+            Color::Rgb(90, 70, 0),   // dim amber
+            Color::Rgb(80, 0, 80),   // dim magenta
+            Color::Rgb(40, 40, 100), // dim blue
         ]
         .into_iter()
-        .map(|c| ColorStyle::new(ColorType::Color(c), ColorType::Palette(PaletteColor::Background)))
+        .map(|c| {
+            ColorStyle::new(
+                ColorType::Color(c),
+                ColorType::Palette(PaletteColor::Background),
+            )
+        })
         .collect()
     }
 
@@ -326,8 +337,15 @@ impl JukeboxView {
         );
         let normal = ColorStyle::primary();
 
-        let status = if self.jukebox.is_enabled() { "▶" } else { "⏸" };
-        printer.print((0, 0), &format!("Eternal Jukebox {status}  {}", state.track_title));
+        let status = if self.jukebox.is_enabled() {
+            "▶"
+        } else {
+            "⏸"
+        };
+        printer.print(
+            (0, 0),
+            &format!("Eternal Jukebox {status}  {}", state.track_title),
+        );
 
         let track_row = h / 2;
 
@@ -395,14 +413,23 @@ impl JukeboxView {
         printer.print((0, 0), &format!("Eternal Jukebox  {}", state.track_title));
         for i in 0..total {
             let (x, y) = pos(i);
-            let ch = if state.graph.beats[i].neighbours.is_empty() { "·" } else { "◦" };
+            let ch = if state.graph.beats[i].neighbours.is_empty() {
+                "·"
+            } else {
+                "◦"
+            };
             printer.with_color(normal, |p| p.print((x, y), ch));
         }
         // All branches as colour-cycled chords; active branch overlaid in red.
         let (show_web, max) = self.branch_render("radial");
         let palette = Self::edge_colors();
         for (i, e) in Self::web_edges(state, show_web, max) {
-            Self::draw_line(printer, palette[i % palette.len()], pos(e.source), pos(e.destination));
+            Self::draw_line(
+                printer,
+                palette[i % palette.len()],
+                pos(e.source),
+                pos(e.destination),
+            );
         }
         if let Some(edge) = state.last_branch {
             Self::draw_line(printer, branch, pos(edge.source), pos(edge.destination));
@@ -460,12 +487,18 @@ impl JukeboxView {
         let (show_web, max) = self.branch_render("split");
         let palette = Self::edge_colors();
         for (i, e) in Self::web_edges(state, show_web, max) {
-            let (lo, hi) = (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
+            let (lo, hi) = (
+                x_of(e.source).min(x_of(e.destination)),
+                x_of(e.source).max(x_of(e.destination)),
+            );
             let apex = Self::apex_row(track_row, hi - lo, left_w);
             Self::draw_bracket(printer, palette[i % palette.len()], lo, hi, apex, track_row);
         }
         if let Some(edge) = state.last_branch {
-            let (lo, hi) = (x_of(edge.source).min(x_of(edge.destination)), x_of(edge.source).max(x_of(edge.destination)));
+            let (lo, hi) = (
+                x_of(edge.source).min(x_of(edge.destination)),
+                x_of(edge.source).max(x_of(edge.destination)),
+            );
             let apex = Self::apex_row(track_row, hi - lo, left_w);
             Self::draw_bracket(printer, branch, lo, hi, apex, track_row);
         }
@@ -484,8 +517,14 @@ impl JukeboxView {
         let title: String = state.track_title.chars().take(panel_w - 2).collect();
         printer.print((px, 1), "Now Playing");
         printer.print((px, 2), &title);
-        printer.print((px, 4), &format!("Beat   {}/{}", state.current_beat + 1, total));
-        printer.print((px, 5), &format!("Branch {:.0}%", state.branch_chance * 100.0));
+        printer.print(
+            (px, 4),
+            &format!("Beat   {}/{}", state.current_beat + 1, total),
+        );
+        printer.print(
+            (px, 5),
+            &format!("Branch {:.0}%", state.branch_chance * 100.0),
+        );
         printer.print((px, 6), &format!("Jumps  {}", state.jumps));
         let mins = state.listen_time_ms / 60000;
         let secs = (state.listen_time_ms / 1000) % 60;
@@ -547,8 +586,12 @@ impl JukeboxView {
             max,
         );
         let bg = theme_bg_rgba(printer.theme.palette[PaletteColor::Background]);
-        *self.desired.write().unwrap() =
-            Some(ImageRequest { offset: printer.offset, size: region, key, bg });
+        *self.desired.write().unwrap() = Some(ImageRequest {
+            offset: printer.offset,
+            size: region,
+            key,
+            bg,
+        });
     }
 
     #[cfg(feature = "jukebox-graphics")]

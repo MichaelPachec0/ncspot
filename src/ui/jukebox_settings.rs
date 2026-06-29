@@ -18,7 +18,10 @@ fn num_field(value: impl std::fmt::Display) -> impl cursive::View {
 /// A dropdown of `options`, with `current` pre-selected. The selected value is the option
 /// string, read back in `collect_settings` and parsed into the enum.
 fn enum_select(options: &[&'static str], current: &str) -> SelectView<&'static str> {
-    let sel = options.iter().position(|o| o.eq_ignore_ascii_case(current)).unwrap_or(0);
+    let sel = options
+        .iter()
+        .position(|o| o.eq_ignore_ascii_case(current))
+        .unwrap_or(0);
     let mut sv = SelectView::<&'static str>::new().popup();
     for opt in options {
         sv.add_item(*opt, *opt);
@@ -56,33 +59,47 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
     );
     list.add_child(
         "Dynamic threshold",
-        Checkbox::new().with_checked(cur.dynamic_threshold).with_name("jb_dyn"),
+        Checkbox::new()
+            .with_checked(cur.dynamic_threshold)
+            .with_name("jb_dyn"),
     );
     list.add_child(
         "Only backward branches",
-        Checkbox::new().with_checked(cur.only_backward_branches).with_name("jb_back"),
+        Checkbox::new()
+            .with_checked(cur.only_backward_branches)
+            .with_name("jb_back"),
     );
     list.add_child(
         "Only long branches",
-        Checkbox::new().with_checked(cur.only_long_branches).with_name("jb_long"),
+        Checkbox::new()
+            .with_checked(cur.only_long_branches)
+            .with_name("jb_long"),
     );
     list.add_child(
         "Remove sequential branches",
-        Checkbox::new().with_checked(cur.remove_sequential_branches).with_name("jb_seq"),
+        Checkbox::new()
+            .with_checked(cur.remove_sequential_branches)
+            .with_name("jb_seq"),
     );
     list.add_child(
         "Add best last branch",
-        Checkbox::new().with_checked(cur.add_last_branch).with_name("jb_last"),
+        Checkbox::new()
+            .with_checked(cur.add_last_branch)
+            .with_name("jb_last"),
     );
     list.add_child(
         "Always follow last branch",
-        Checkbox::new().with_checked(cur.always_follow_last_branch).with_name("jb_follow"),
+        Checkbox::new()
+            .with_checked(cur.always_follow_last_branch)
+            .with_name("jb_follow"),
     );
 
     list.add_child("─ Anti-loop ─", cursive::views::DummyView);
     list.add_child(
         "Break loops",
-        Checkbox::new().with_checked(cur.anti_loop.enabled).with_name("jb_break_loops"),
+        Checkbox::new()
+            .with_checked(cur.anti_loop.enabled)
+            .with_name("jb_break_loops"),
     );
     list.add_child(
         "Loop threshold",
@@ -90,13 +107,19 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
     );
     list.add_child(
         "Identity",
-        enum_select(&["edge", "destination", "distance"], cur.anti_loop.identity.as_str())
-            .with_name("jb_loop_identity"),
+        enum_select(
+            &["edge", "destination", "distance"],
+            cur.anti_loop.identity.as_str(),
+        )
+        .with_name("jb_loop_identity"),
     );
     list.add_child(
         "Count mode",
-        enum_select(&["consecutive", "cumulative"], cur.anti_loop.count_mode.as_str())
-            .with_name("jb_loop_count"),
+        enum_select(
+            &["consecutive", "cumulative"],
+            cur.anti_loop.count_mode.as_str(),
+        )
+        .with_name("jb_loop_count"),
     );
     list.add_child(
         "Skip action",
@@ -108,7 +131,9 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
     );
     list.add_child(
         "Break last branch",
-        Checkbox::new().with_checked(cur.anti_loop.break_last_branch).with_name("jb_break_last"),
+        Checkbox::new()
+            .with_checked(cur.anti_loop.break_last_branch)
+            .with_name("jb_break_last"),
     );
     list.add_child(
         "Counter",
@@ -155,7 +180,8 @@ fn read_num<T: std::str::FromStr>(s: &mut Cursive, name: &str, fallback: T) -> T
 }
 
 fn read_bool(s: &mut Cursive, name: &str, fallback: bool) -> bool {
-    s.call_on_name(name, |v: &mut Checkbox| v.is_checked()).unwrap_or(fallback)
+    s.call_on_name(name, |v: &mut Checkbox| v.is_checked())
+        .unwrap_or(fallback)
 }
 
 fn read_enum<T>(s: &mut Cursive, name: &str, parse: fn(&str) -> T, fallback: T) -> T {
@@ -181,8 +207,18 @@ fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
         anti_loop: AntiLoopSettings {
             enabled: read_bool(s, "jb_break_loops", cur.anti_loop.enabled),
             threshold: read_num::<usize>(s, "jb_loop_threshold", cur.anti_loop.threshold).max(1),
-            identity: read_enum(s, "jb_loop_identity", LoopIdentity::parse, cur.anti_loop.identity),
-            count_mode: read_enum(s, "jb_loop_count", LoopCountMode::parse, cur.anti_loop.count_mode),
+            identity: read_enum(
+                s,
+                "jb_loop_identity",
+                LoopIdentity::parse,
+                cur.anti_loop.identity,
+            ),
+            count_mode: read_enum(
+                s,
+                "jb_loop_count",
+                LoopCountMode::parse,
+                cur.anti_loop.count_mode,
+            ),
             skip_action: read_enum(
                 s,
                 "jb_loop_skip",
@@ -190,7 +226,12 @@ fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
                 cur.anti_loop.skip_action,
             ),
             break_last_branch: read_bool(s, "jb_break_last", cur.anti_loop.break_last_branch),
-            counter: read_enum(s, "jb_loop_counter", LoopCounter::parse, cur.anti_loop.counter),
+            counter: read_enum(
+                s,
+                "jb_loop_counter",
+                LoopCounter::parse,
+                cur.anti_loop.counter,
+            ),
         },
     }
 }

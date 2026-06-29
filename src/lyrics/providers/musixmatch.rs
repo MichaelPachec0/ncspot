@@ -70,10 +70,18 @@ impl LyricsProvider for Musixmatch {
             let spotify_id = format!("spotify:track:{id}");
             req = req.query(&[("track_spotify_id", spotify_id.as_str())]);
         }
-        let resp = req.send().map_err(|e| anyhow::anyhow!(
-            "musixmatch request failed ({})",
-            if e.is_timeout() { "timeout" } else if e.is_connect() { "connect" } else { "transport" }
-        ))?;
+        let resp = req.send().map_err(|e| {
+            anyhow::anyhow!(
+                "musixmatch request failed ({})",
+                if e.is_timeout() {
+                    "timeout"
+                } else if e.is_connect() {
+                    "connect"
+                } else {
+                    "transport"
+                }
+            )
+        })?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(None);
@@ -81,7 +89,9 @@ impl LyricsProvider for Musixmatch {
         if !status.is_success() {
             return Ok(None);
         }
-        let text = resp.text().map_err(|_| anyhow::anyhow!("musixmatch response read failed"))?;
+        let text = resp
+            .text()
+            .map_err(|_| anyhow::anyhow!("musixmatch response read failed"))?;
         // Detect captcha / throttle responses (Musixmatch returns 200 with a
         // captcha page or a JSON error when the token is rate-limited).
         if text.contains("\"captcha\"") || text.contains("\"status_code\":401") {

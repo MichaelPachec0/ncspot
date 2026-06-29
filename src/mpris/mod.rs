@@ -243,7 +243,7 @@ impl MprisManager {
                                     (
                                         playlists::playlist_path_for_id(&p.id),
                                         p.name.clone(),
-                                        String::new(),
+                                        p.cover_url.clone().unwrap_or_default(),
                                     )
                                 })
                             };

@@ -12,7 +12,10 @@ pub struct LyricsCache {
 impl LyricsCache {
     pub fn new(dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&dir);
-        Self { dir, mem: RwLock::new(HashMap::new()) }
+        Self {
+            dir,
+            mem: RwLock::new(HashMap::new()),
+        }
     }
 
     fn path(&self, key: &str) -> PathBuf {
@@ -25,12 +28,18 @@ impl LyricsCache {
         }
         let bytes = std::fs::read(self.path(key)).ok()?;
         let lyrics: Lyrics = serde_json::from_slice(&bytes).ok()?;
-        self.mem.write().unwrap().insert(key.to_string(), lyrics.clone());
+        self.mem
+            .write()
+            .unwrap()
+            .insert(key.to_string(), lyrics.clone());
         Some(lyrics)
     }
 
     pub fn put(&self, key: &str, lyrics: &Lyrics) {
-        self.mem.write().unwrap().insert(key.to_string(), lyrics.clone());
+        self.mem
+            .write()
+            .unwrap()
+            .insert(key.to_string(), lyrics.clone());
         if let Ok(json) = serde_json::to_vec(lyrics) {
             let _ = std::fs::write(self.path(key), json);
         }
@@ -45,7 +54,7 @@ impl LyricsCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lyrics::model::{Lyrics, LyricLine, ProviderId};
+    use crate::lyrics::model::{LyricLine, Lyrics, ProviderId};
 
     fn sample() -> Lyrics {
         Lyrics {
@@ -53,7 +62,12 @@ mod tests {
             synced: true,
             rtl: false,
             language: Some("en".into()),
-            lines: vec![LyricLine { start_ms: Some(0), text: "hi".into(), translation: None, romanization: None }],
+            lines: vec![LyricLine {
+                start_ms: Some(0),
+                text: "hi".into(),
+                translation: None,
+                romanization: None,
+            }],
         }
     }
 
@@ -75,10 +89,8 @@ mod tests {
 
     #[test]
     fn remove_clears_memory_and_disk() {
-        let dir = std::env::temp_dir().join(format!(
-            "ncspot-lyrics-test-remove-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("ncspot-lyrics-test-remove-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         // Write entry to disk.
         {

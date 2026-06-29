@@ -16,7 +16,11 @@ pub fn from_librespot(l: &LibrespotLyrics) -> Lyrics {
         .lines
         .iter()
         .map(|line| LyricLine {
-            start_ms: if synced { line.start_time_ms.parse::<u32>().ok() } else { None },
+            start_ms: if synced {
+                line.start_time_ms.parse::<u32>().ok()
+            } else {
+                None
+            },
             text: line.words.clone(),
             translation: None,
             romanization: None,
@@ -45,16 +49,23 @@ impl LyricsProvider for SpotifyProvider {
     }
 
     fn fetch(&self, track: &TrackMeta) -> anyhow::Result<Option<Lyrics>> {
-        let Some(id_str) = &track.spotify_id else { return Ok(None) };
-        let Some(session) = self.spotify.session() else { return Ok(None) };
+        let Some(id_str) = &track.spotify_id else {
+            return Ok(None);
+        };
+        let Some(session) = self.spotify.session() else {
+            return Ok(None);
+        };
         let track_id = SpotifyId::from_base62(id_str)?;
-        let fetched = crate::application::ASYNC_RUNTIME.get().unwrap().block_on(async {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                LibrespotLyrics::get(&session, &track_id),
-            )
-            .await
-        });
+        let fetched = crate::application::ASYNC_RUNTIME
+            .get()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    LibrespotLyrics::get(&session, &track_id),
+                )
+                .await
+            });
         match fetched {
             Ok(Ok(lib)) => Ok(Some(from_librespot(&lib))),
             Ok(Err(e)) => {

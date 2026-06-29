@@ -156,11 +156,11 @@ const SS: u32 = 2; // supersample factor
 
 // Full-intensity branch colours (not dimmed in graphics mode).
 const PALETTE: [[u8; 4]; 5] = [
-    [0, 200, 200, 255],  // cyan
-    [0, 200, 0, 255],    // green
-    [225, 175, 0, 255],  // amber
-    [200, 0, 200, 255],  // magenta
-    [90, 90, 235, 255],  // blue
+    [0, 200, 200, 255], // cyan
+    [0, 200, 0, 255],   // green
+    [225, 175, 0, 255], // amber
+    [200, 0, 200, 255], // magenta
+    [90, 90, 235, 255], // blue
 ];
 const ACTIVE: [u8; 4] = [235, 45, 45, 255]; // red (matches jukebox_branch intent)
 const CURSOR: [u8; 4] = [60, 225, 95, 255]; // green (matches jukebox_cursor intent)
@@ -238,7 +238,9 @@ pub fn render(
     if !state.graph.beats.is_empty() {
         match mode {
             ViewMode::Radial => draw_radial(&mut img, state, bw, bh, show_web, max),
-            ViewMode::Linear | ViewMode::Split => draw_linear(&mut img, state, bw, bh, show_web, max),
+            ViewMode::Linear | ViewMode::Split => {
+                draw_linear(&mut img, state, bw, bh, show_web, max)
+            }
         }
     }
 
@@ -254,7 +256,10 @@ fn draw_radial(img: &mut RgbaImage, state: &SongState, w: u32, h: u32, show_web:
     let radius = (cx.min(cy) - (6 * SS) as f64).max(2.0);
     let pos = |i: usize| -> (i64, i64) {
         let ang = std::f64::consts::TAU * i as f64 / total as f64 - std::f64::consts::FRAC_PI_2;
-        ((cx + radius * ang.cos()).round() as i64, (cy + radius * ang.sin()).round() as i64)
+        (
+            (cx + radius * ang.cos()).round() as i64,
+            (cy + radius * ang.sin()).round() as i64,
+        )
     };
 
     for i in 0..total {
@@ -267,10 +272,21 @@ fn draw_radial(img: &mut RgbaImage, state: &SongState, w: u32, h: u32, show_web:
         raster::filled_circle(img, x, y, r, color);
     }
     for (i, e) in non_active_edges(state, show_web, max) {
-        raster::line(img, pos(e.source), pos(e.destination), Rgba(PALETTE[i % PALETTE.len()]));
+        raster::line(
+            img,
+            pos(e.source),
+            pos(e.destination),
+            Rgba(PALETTE[i % PALETTE.len()]),
+        );
     }
     if let Some(e) = state.last_branch {
-        raster::thick_line(img, pos(e.source), pos(e.destination), Rgba(ACTIVE), (2 * SS) as i64);
+        raster::thick_line(
+            img,
+            pos(e.source),
+            pos(e.destination),
+            Rgba(ACTIVE),
+            (2 * SS) as i64,
+        );
     }
     let (ccx, ccy) = pos(state.current_beat);
     raster::filled_circle(img, ccx, ccy, (3 * SS) as i64, Rgba(CURSOR));
@@ -291,23 +307,50 @@ fn draw_linear(img: &mut RgbaImage, state: &SongState, w: u32, h: u32, show_web:
         ((span * track_y) / (w as i64).max(1)).clamp(SS as i64, (track_y - 2).max(SS as i64))
     };
 
-    raster::line(img, (margin, track_y), (w as i64 - margin, track_y), Rgba(BEAT));
+    raster::line(
+        img,
+        (margin, track_y),
+        (w as i64 - margin, track_y),
+        Rgba(BEAT),
+    );
     for i in 0..total {
         raster::filled_circle(img, x_of(i), track_y, SS as i64, Rgba(BEAT));
     }
     for (i, e) in non_active_edges(state, show_web, max) {
-        let (lo, hi) =
-            (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
-        raster::arc_polyline(img, (lo, track_y), (hi, track_y), arc_h(hi - lo), Rgba(PALETTE[i % PALETTE.len()]));
+        let (lo, hi) = (
+            x_of(e.source).min(x_of(e.destination)),
+            x_of(e.source).max(x_of(e.destination)),
+        );
+        raster::arc_polyline(
+            img,
+            (lo, track_y),
+            (hi, track_y),
+            arc_h(hi - lo),
+            Rgba(PALETTE[i % PALETTE.len()]),
+        );
     }
     if let Some(e) = state.last_branch {
-        let (lo, hi) =
-            (x_of(e.source).min(x_of(e.destination)), x_of(e.source).max(x_of(e.destination)));
+        let (lo, hi) = (
+            x_of(e.source).min(x_of(e.destination)),
+            x_of(e.source).max(x_of(e.destination)),
+        );
         let height = arc_h(hi - lo);
         raster::arc_polyline(img, (lo, track_y), (hi, track_y), height, Rgba(ACTIVE));
-        raster::arc_polyline(img, (lo, track_y - 1), (hi, track_y - 1), height, Rgba(ACTIVE));
+        raster::arc_polyline(
+            img,
+            (lo, track_y - 1),
+            (hi, track_y - 1),
+            height,
+            Rgba(ACTIVE),
+        );
     }
-    raster::filled_circle(img, x_of(state.current_beat), track_y, (2 * SS) as i64, Rgba(CURSOR));
+    raster::filled_circle(
+        img,
+        x_of(state.current_beat),
+        track_y,
+        (2 * SS) as i64,
+        Rgba(CURSOR),
+    );
 }
 
 #[cfg(test)]
@@ -323,7 +366,11 @@ mod render_tests {
                 start_ms: i as f64 * 1000.0,
                 duration_ms: 1000.0,
                 neighbours: if i == 4 {
-                    vec![Edge { source: 4, destination: 1, distance: 5.0 }]
+                    vec![Edge {
+                        source: 4,
+                        destination: 1,
+                        distance: 5.0,
+                    }]
                 } else {
                     vec![]
                 },
@@ -331,13 +378,21 @@ mod render_tests {
             .collect();
         SongState {
             track_title: "t".into(),
-            graph: Arc::new(SongGraph { beats, last_branch_point: 4, longest_reach: 0.0 }),
+            graph: Arc::new(SongGraph {
+                beats,
+                last_branch_point: 4,
+                longest_reach: 0.0,
+            }),
             current_beat: 4,
             beats_played: 10,
             jumps: 1,
             branch_chance: 0.2,
             listen_time_ms: 1000,
-            last_branch: Some(Edge { source: 4, destination: 1, distance: 5.0 }),
+            last_branch: Some(Edge {
+                source: 4,
+                destination: 1,
+                distance: 5.0,
+            }),
             bouncing: false,
             no_analysis: false,
         }
@@ -345,13 +400,27 @@ mod render_tests {
 
     #[test]
     fn render_produces_requested_dimensions() {
-        let img = render(&state_with_active_branch(), ViewMode::Radial, (120, 60), true, 0, [0, 0, 0, 255]);
+        let img = render(
+            &state_with_active_branch(),
+            ViewMode::Radial,
+            (120, 60),
+            true,
+            0,
+            [0, 0, 0, 255],
+        );
         assert_eq!(img.dimensions(), (120, 60));
     }
 
     #[test]
     fn render_is_non_empty() {
-        let img = render(&state_with_active_branch(), ViewMode::Radial, (120, 60), true, 0, [0, 0, 0, 255]);
+        let img = render(
+            &state_with_active_branch(),
+            ViewMode::Radial,
+            (120, 60),
+            true,
+            0,
+            [0, 0, 0, 255],
+        );
         assert!(img.pixels().any(|p| p.0[3] > 0));
     }
 
@@ -372,4 +441,3 @@ mod render_tests {
         assert_ne!(k1, k2);
     }
 }
-

@@ -261,8 +261,8 @@ impl Driver {
         }
 
         // Loop limit reached for this branch.
-        let forced = next_index == self.graph.last_branch_point
-            && self.settings.always_follow_last_branch;
+        let forced =
+            next_index == self.graph.last_branch_point && self.settings.always_follow_last_branch;
         if forced && !self.settings.anti_loop.break_last_branch {
             return self.take_branch(edge); // never break the eternal mechanism
         }
@@ -335,7 +335,10 @@ impl Driver {
     }
 
     fn on_skip(&mut self, key: LoopKey) {
-        let consecutive = matches!(self.settings.anti_loop.count_mode, LoopCountMode::Consecutive);
+        let consecutive = matches!(
+            self.settings.anti_loop.count_mode,
+            LoopCountMode::Consecutive
+        );
         match self.settings.anti_loop.counter {
             LoopCounter::Reset => {
                 self.loop_state.counts.remove(&key);
@@ -452,8 +455,16 @@ mod tests {
                 neighbours: vec![],
             })
             .collect();
-        beats[5].neighbours = vec![Edge { source: 5, destination: 1, distance: 10.0 }];
-        SongGraph { beats, last_branch_point, longest_reach: 0.0 }
+        beats[5].neighbours = vec![Edge {
+            source: 5,
+            destination: 1,
+            distance: 10.0,
+        }];
+        SongGraph {
+            beats,
+            last_branch_point,
+            longest_reach: 0.0,
+        }
     }
 
     fn driver(rng: Vec<f64>, last_branch_point: usize) -> Driver {
@@ -540,21 +551,35 @@ mod tests {
             })
             .collect();
         beats[5].neighbours = neigh;
-        SongGraph { beats, last_branch_point: 99, longest_reach: 0.0 }
+        SongGraph {
+            beats,
+            last_branch_point: 99,
+            longest_reach: 0.0,
+        }
     }
 
     fn antiloop_driver(graph: SongGraph, anti_loop: AntiLoopSettings) -> Driver {
-        let settings = JukeboxSettings { anti_loop, ..JukeboxSettings::default() };
+        let settings = JukeboxSettings {
+            anti_loop,
+            ..JukeboxSettings::default()
+        };
         Driver::new(
             graph,
             settings,
-            Box::new(SeqRandom { vals: vec![0.0], i: 0 }),
+            Box::new(SeqRandom {
+                vals: vec![0.0],
+                i: 0,
+            }),
             Box::new(FakeClock { ms: 0 }),
         )
     }
 
     fn al(enabled: bool) -> AntiLoopSettings {
-        AntiLoopSettings { enabled, threshold: 3, ..AntiLoopSettings::default() }
+        AntiLoopSettings {
+            enabled,
+            threshold: 3,
+            ..AntiLoopSettings::default()
+        }
     }
 
     // Branch from beat 5 once, resetting the min-beats gate each call so should_random_branch
@@ -566,7 +591,11 @@ mod tests {
 
     #[test]
     fn antiloop_disabled_always_branches() {
-        let g = graph_with_neighbours(vec![Edge { source: 5, destination: 1, distance: 1.0 }]);
+        let g = graph_with_neighbours(vec![Edge {
+            source: 5,
+            destination: 1,
+            distance: 1.0,
+        }]);
         let mut d = antiloop_driver(g, al(false));
         for _ in 0..6 {
             assert_eq!(branch_once(&mut d), 1);
@@ -575,7 +604,11 @@ mod tests {
 
     #[test]
     fn antiloop_skips_after_threshold_continues_linearly() {
-        let g = graph_with_neighbours(vec![Edge { source: 5, destination: 1, distance: 1.0 }]);
+        let g = graph_with_neighbours(vec![Edge {
+            source: 5,
+            destination: 1,
+            distance: 1.0,
+        }]);
         let mut d = antiloop_driver(g, al(true)); // threshold 3, different_else_continue
         assert_eq!(branch_once(&mut d), 1); // 1
         assert_eq!(branch_once(&mut d), 1); // 2
@@ -589,8 +622,16 @@ mod tests {
     #[test]
     fn antiloop_substitutes_different_branch() {
         let g = graph_with_neighbours(vec![
-            Edge { source: 5, destination: 1, distance: 1.0 },
-            Edge { source: 5, destination: 8, distance: 1.0 },
+            Edge {
+                source: 5,
+                destination: 1,
+                distance: 1.0,
+            },
+            Edge {
+                source: 5,
+                destination: 8,
+                distance: 1.0,
+            },
         ]);
         let anti = AntiLoopSettings {
             enabled: true,
@@ -608,7 +649,11 @@ mod tests {
     #[test]
     fn antiloop_excludes_forced_last_branch() {
         // beat 5 IS the forced last-branch point; default break_last_branch=false.
-        let mut g = graph_with_neighbours(vec![Edge { source: 5, destination: 1, distance: 1.0 }]);
+        let mut g = graph_with_neighbours(vec![Edge {
+            source: 5,
+            destination: 1,
+            distance: 1.0,
+        }]);
         g.last_branch_point = 5;
         let mut d = antiloop_driver(g, al(true)); // always_follow_last_branch defaults true
         // Even past the threshold, the forced last-branch is always taken.

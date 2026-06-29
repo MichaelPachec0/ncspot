@@ -83,10 +83,21 @@ impl Lyrics {
 #[derive(Clone, Debug)]
 pub enum LyricsState {
     Idle,
-    Loading { track_id: String },
-    Loaded { track_id: String, lyrics: Lyrics },
-    NotFound { track_id: String, tried: Vec<ProviderId> },
-    Error { track_id: String, message: String },
+    Loading {
+        track_id: String,
+    },
+    Loaded {
+        track_id: String,
+        lyrics: Lyrics,
+    },
+    NotFound {
+        track_id: String,
+        tried: Vec<ProviderId>,
+    },
+    Error {
+        track_id: String,
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -94,11 +105,22 @@ mod tests {
     use super::*;
 
     fn line(ms: u32, t: &str) -> LyricLine {
-        LyricLine { start_ms: Some(ms), text: t.into(), translation: None, romanization: None }
+        LyricLine {
+            start_ms: Some(ms),
+            text: t.into(),
+            translation: None,
+            romanization: None,
+        }
     }
 
     fn synced(lines: Vec<LyricLine>) -> Lyrics {
-        Lyrics { provider: ProviderId::Lrclib, synced: true, rtl: false, language: None, lines }
+        Lyrics {
+            provider: ProviderId::Lrclib,
+            synced: true,
+            rtl: false,
+            language: None,
+            lines,
+        }
     }
 
     #[test]
@@ -126,7 +148,12 @@ mod tests {
 
     #[test]
     fn provider_id_roundtrips() {
-        for p in [ProviderId::Lrclib, ProviderId::Spotify, ProviderId::Netease, ProviderId::Musixmatch] {
+        for p in [
+            ProviderId::Lrclib,
+            ProviderId::Spotify,
+            ProviderId::Netease,
+            ProviderId::Musixmatch,
+        ] {
             assert_eq!(ProviderId::from_str(p.as_str()), Some(p));
         }
         assert_eq!(ProviderId::from_str("nope"), None);

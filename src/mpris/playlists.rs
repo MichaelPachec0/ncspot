@@ -59,7 +59,7 @@ fn all_playlist_tuples(library: &Library) -> Vec<(OwnedObjectPath, String, Strin
             (
                 playlist_path_for_id(&p.id),
                 p.name.clone(),
-                String::new(), // art_url – not available
+                p.cover_url.clone().unwrap_or_default(),
             )
         })
         .collect()
@@ -88,7 +88,11 @@ impl MprisPlaylists {
             if let Some(p) = playlists.iter().find(|p| p.id == id) {
                 return (
                     true,
-                    (playlist_path_for_id(&id), p.name.clone(), String::new()),
+                    (
+                        playlist_path_for_id(&id),
+                        p.name.clone(),
+                        p.cover_url.clone().unwrap_or_default(),
+                    ),
                 );
             }
         }
