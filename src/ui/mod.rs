@@ -8,6 +8,7 @@ pub mod contextmenu;
 pub mod help;
 pub mod jukebox;
 pub mod jukebox_settings;
+pub mod jukebox_song_settings;
 pub mod layout;
 pub mod library;
 pub mod listview;

@@ -226,7 +226,6 @@ impl Default for JukeboxSettings {
 }
 
 /// Which precedence tier produced the effective settings for the current track.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSource {
     Global,
@@ -234,7 +233,6 @@ pub enum SettingsSource {
 }
 
 /// Identifies a single tunable dial, for marking which are per-song-overridden.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dial {
     MaxBranchDistance,
@@ -254,7 +252,6 @@ pub enum Dial {
 /// A per-track override: each dial is `Some` when supplied per-song, `None` when inherited
 /// from the global baseline. A full snapshot sets every field; a diff sets only the dials
 /// that differ from the baseline. `anti_loop` is overridden as a single unit.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct PartialJukeboxSettings {
     pub max_branch_distance: Option<u32>,
@@ -271,7 +268,6 @@ pub struct PartialJukeboxSettings {
     pub anti_loop: Option<AntiLoopSettings>,
 }
 
-#[allow(dead_code)]
 impl PartialJukeboxSettings {
     /// Capture every dial from `cur`.
     pub fn snapshot(cur: &JukeboxSettings) -> Self {

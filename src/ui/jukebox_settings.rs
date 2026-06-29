@@ -11,13 +11,13 @@ use crate::jukebox::settings::{
 };
 use crate::ui::modal::Modal;
 
-fn num_field(value: impl std::fmt::Display) -> impl cursive::View {
+pub(crate) fn num_field(value: impl std::fmt::Display) -> impl cursive::View {
     EditView::new().content(value.to_string()).fixed_width(10)
 }
 
 /// A dropdown of `options`, with `current` pre-selected. The selected value is the option
 /// string, read back in `collect_settings` and parsed into the enum.
-fn enum_select(options: &[&'static str], current: &str) -> SelectView<&'static str> {
+pub(crate) fn enum_select(options: &[&'static str], current: &str) -> SelectView<&'static str> {
     let sel = options
         .iter()
         .position(|o| o.eq_ignore_ascii_case(current))
@@ -30,12 +30,9 @@ fn enum_select(options: &[&'static str], current: &str) -> SelectView<&'static s
     sv
 }
 
-/// Build and show the jukebox settings modal, pre-filled from the live settings. Apply
-/// updates the live settings and persists them; Reset clears the persisted override and
-/// restores the `config.toml` baseline.
-pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Config>) {
-    let cur = jukebox.settings();
-
+/// Build the dial widgets (named `jb_*`) shared by the global and per-song modals,
+/// pre-filled from `cur`. Caller adds its own buttons/extra widgets.
+pub(crate) fn build_dial_list(cur: &JukeboxSettings) -> ListView {
     let mut list = ListView::new();
     list.add_child(
         "Similarity threshold",
@@ -140,6 +137,16 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
         enum_select(&["reset", "retire"], cur.anti_loop.counter.as_str())
             .with_name("jb_loop_counter"),
     );
+    list
+}
+
+/// Build and show the jukebox settings modal, pre-filled from the live settings. Apply
+/// updates the live settings and persists them; Reset clears the persisted override and
+/// restores the `config.toml` baseline.
+pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Config>) {
+    let cur = jukebox.settings();
+
+    let mut list = build_dial_list(&cur);
 
     list.add_child("─ Per-song ─", cursive::views::DummyView);
     list.add_child(
@@ -193,25 +200,25 @@ fn persist(cfg: &Config, settings: JukeboxSettings) {
     cfg.save_state();
 }
 
-fn read_num<T: std::str::FromStr>(s: &mut Cursive, name: &str, fallback: T) -> T {
+pub(crate) fn read_num<T: std::str::FromStr>(s: &mut Cursive, name: &str, fallback: T) -> T {
     s.call_on_name(name, |v: &mut EditView| v.get_content().parse::<T>().ok())
         .flatten()
         .unwrap_or(fallback)
 }
 
-fn read_bool(s: &mut Cursive, name: &str, fallback: bool) -> bool {
+pub(crate) fn read_bool(s: &mut Cursive, name: &str, fallback: bool) -> bool {
     s.call_on_name(name, |v: &mut Checkbox| v.is_checked())
         .unwrap_or(fallback)
 }
 
-fn read_enum<T>(s: &mut Cursive, name: &str, parse: fn(&str) -> T, fallback: T) -> T {
+pub(crate) fn read_enum<T>(s: &mut Cursive, name: &str, parse: fn(&str) -> T, fallback: T) -> T {
     s.call_on_name(name, |v: &mut SelectView<&'static str>| v.selection())
         .flatten()
         .map(|val| parse(*val))
         .unwrap_or(fallback)
 }
 
-fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
+pub(crate) fn collect_settings(s: &mut Cursive, cur: &JukeboxSettings) -> JukeboxSettings {
     JukeboxSettings {
         max_branch_distance: read_num(s, "jb_threshold", cur.max_branch_distance),
         dynamic_threshold: read_bool(s, "jb_dyn", cur.dynamic_threshold),

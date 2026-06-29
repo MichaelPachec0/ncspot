@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::jukebox::graph::Edge;
 use crate::jukebox::{Jukebox, SongState, ViewMode};
 use crate::queue::Queue;
-use crate::traits::ViewExt;
+use crate::traits::{ListItem, ViewExt};
 
 /// Default cap on the blitted image's longest edge, in pixels. Larger = sharper but heavier
 /// to transmit each frame. Overridable via `[jukebox] graphics_max_px`.
@@ -80,7 +80,6 @@ fn theme_bg_rgba(color: cursive::theme::Color) -> [u8; 4] {
 
 pub struct JukeboxView {
     jukebox: Arc<Jukebox>,
-    #[allow(dead_code)]
     queue: Arc<Queue>,
     cfg: Arc<Config>,
     selected_beat: RwLock<Option<usize>>,
@@ -887,6 +886,21 @@ impl View for JukeboxView {
                 self.jukebox.toggle();
                 EventResult::Consumed(None)
             }
+            Event::Char('s') => {
+                let jukebox = self.jukebox.clone();
+                let cfg = self.cfg.clone();
+                let queue = self.queue.clone();
+                EventResult::with_cb(move |s| {
+                    let (id, title) = current_track(&queue);
+                    crate::ui::jukebox_song_settings::open(
+                        s,
+                        jukebox.clone(),
+                        cfg.clone(),
+                        id,
+                        title,
+                    );
+                })
+            }
             _ => EventResult::Ignored,
         }
     }
@@ -941,8 +955,27 @@ impl ViewExt for JukeboxView {
                 self.jukebox.toggle_graphics();
                 Ok(CommandResult::Consumed(None))
             }
+            Command::JukeboxSongSettings => {
+                let (id, title) = current_track(&self.queue);
+                crate::ui::jukebox_song_settings::open(
+                    s,
+                    self.jukebox.clone(),
+                    self.cfg.clone(),
+                    id,
+                    title,
+                );
+                Ok(CommandResult::Consumed(None))
+            }
             _ => Ok(CommandResult::Ignored),
         }
+    }
+}
+
+/// The current track's Spotify id (if any) and title, for opening the per-song menu.
+fn current_track(queue: &Queue) -> (Option<String>, String) {
+    match queue.get_current() {
+        Some(p) => (p.id(), p.track().map(|t| t.title).unwrap_or_default()),
+        None => (None, String::new()),
     }
 }
 
