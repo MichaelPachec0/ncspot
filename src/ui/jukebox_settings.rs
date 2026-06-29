@@ -141,6 +141,14 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
             .with_name("jb_loop_counter"),
     );
 
+    list.add_child("─ Per-song ─", cursive::views::DummyView);
+    list.add_child(
+        "Override per-song settings",
+        Checkbox::new()
+            .with_checked(cfg.state().jukebox_override_per_song)
+            .with_name("jb_override_per_song"),
+    );
+
     let apply_jukebox = jukebox.clone();
     let apply_cfg = cfg.clone();
     let reset_jukebox = jukebox.clone();
@@ -151,6 +159,9 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
             let new = collect_settings(s, &apply_jukebox.settings());
             apply_jukebox.apply_settings(new.clone());
             persist(&apply_cfg, new);
+            let over = read_bool(s, "jb_override_per_song", false);
+            apply_cfg.with_state_mut(move |st| st.jukebox_override_per_song = over);
+            apply_cfg.save_state();
             s.pop_layer();
         })
         .button("Reset", move |s| {
@@ -158,7 +169,16 @@ pub fn open_settings_modal(s: &mut Cursive, jukebox: Arc<Jukebox>, cfg: Arc<Conf
             let base = JukeboxSettings::from_config(
                 &reset_cfg.values().jukebox.clone().unwrap_or_default(),
             );
-            reset_cfg.with_state_mut(|st| st.jukebox = None);
+            let default_over = reset_cfg
+                .values()
+                .jukebox
+                .as_ref()
+                .and_then(|j| j.override_per_song)
+                .unwrap_or(false);
+            reset_cfg.with_state_mut(move |st| {
+                st.jukebox = None;
+                st.jukebox_override_per_song = default_over;
+            });
             reset_cfg.save_state();
             reset_jukebox.apply_settings(base);
             s.pop_layer();
