@@ -1,8 +1,8 @@
 use std::sync::{Arc, RwLock};
 
 use cursive::Cursive;
-use cursive::event::{Event, EventResult, Key};
-use cursive::theme::{ColorStyle, ColorType, PaletteColor};
+use cursive::event::{Event, EventResult, Key, MouseButton, MouseEvent};
+use cursive::theme::{ColorStyle, ColorType, Effect, PaletteColor};
 use cursive::{Printer, Vec2, View};
 use unicode_width::UnicodeWidthStr;
 
@@ -22,6 +22,46 @@ enum RowStyle {
     Secondary,
 }
 
+/// Cached row→line layout from the last draw, used to hit-test clicks.
+#[derive(Default)]
+struct LineLayout {
+    /// Index of the first rendered row currently visible at the top.
+    top: usize,
+    /// Owning `Lyrics::lines` index for every rendered row, in draw order.
+    row_line: Vec<Option<usize>>,
+}
+
+/// Playback position (ms) to seek to so that a line with `start_ms` becomes the
+/// active line under the current sync `offset_ms`. Inverts the `active_index`
+/// comparison (`progress + offset >= start_ms`). Clamped at zero.
+fn seek_target_ms(start_ms: u32, offset_ms: i64) -> u32 {
+    (start_ms as i64 - offset_ms).max(0) as u32
+}
+
+/// Resolve a click at visible row `rel_y` (0 = top visible row) to the owning
+/// lyric-line index, or `None` if the click lands below the last rendered row.
+fn row_at(rel_y: usize, top: usize, row_line: &[Option<usize>]) -> Option<usize> {
+    row_line.get(top + rel_y).copied().flatten()
+}
+
+/// Next cursor position. From `None`, reveal at the active line (or line 0)
+/// without moving; from `Some`, step by `delta` clamped to `[0, len-1]`.
+/// `None` when there are no lines.
+fn move_cursor(
+    current: Option<usize>,
+    active: Option<usize>,
+    len: usize,
+    delta: i64,
+) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    match current {
+        None => Some(active.unwrap_or(0).min(len - 1)),
+        Some(c) => Some((c as i64 + delta).clamp(0, len as i64 - 1) as usize),
+    }
+}
+
 /// Full-screen page that renders the lyrics of the currently playing track.
 ///
 /// Modeled on [`crate::ui::cover::CoverView`]: it polls the queue in `draw`,
@@ -36,8 +76,10 @@ pub struct LyricsView {
     state: Arc<RwLock<LyricsState>>,
     /// Cache key of the track we last kicked a fetch for (track-change detection).
     fetched_for: RwLock<Option<String>>,
-    /// Manual scroll offset as a top-line index; `None` means auto-follow.
-    manual_scroll: RwLock<Option<usize>>,
+    /// Selected line index; `None` means auto-follow the active playing line.
+    cursor_line: RwLock<Option<usize>>,
+    /// Row→line layout cached by `draw_lyrics`, read by `on_event` for clicks.
+    last_layout: RwLock<LineLayout>,
     /// Sync offset in ms, added to the playback position.
     offset_ms: RwLock<i64>,
 }
@@ -56,7 +98,8 @@ impl LyricsView {
             manager,
             state: Arc::new(RwLock::new(LyricsState::Idle)),
             fetched_for: RwLock::new(None),
-            manual_scroll: RwLock::new(None),
+            cursor_line: RwLock::new(None),
+            last_layout: RwLock::new(LineLayout::default()),
             offset_ms: RwLock::new(0),
         }
     }
@@ -96,7 +139,7 @@ impl LyricsView {
         }
 
         *self.fetched_for.write().unwrap() = Some(key.clone());
-        *self.manual_scroll.write().unwrap() = None;
+        *self.cursor_line.write().unwrap() = None;
         *self.offset_ms.write().unwrap() = 0;
         *self.state.write().unwrap() = LyricsState::Loading {
             track_id: key.clone(),
@@ -153,10 +196,74 @@ impl LyricsView {
         progress + *self.offset_ms.read().unwrap()
     }
 
-    fn scroll_by(&self, delta: i64) {
-        let mut manual = self.manual_scroll.write().unwrap();
-        let current = manual.unwrap_or(0) as i64;
-        *manual = Some((current + delta).max(0) as usize);
+    /// Move the selection cursor by `delta` lines, seeding from the active line.
+    fn move_cursor_by(&self, delta: i64) {
+        let (len, active) = {
+            let guard = self.state.read().unwrap();
+            match &*guard {
+                LyricsState::Loaded { lyrics, .. } => {
+                    let active = if lyrics.synced {
+                        lyrics.active_index(self.position_ms().max(0) as u32)
+                    } else {
+                        None
+                    };
+                    (lyrics.lines.len(), active)
+                }
+                _ => (0, None),
+            }
+        };
+        let current = *self.cursor_line.read().unwrap();
+        *self.cursor_line.write().unwrap() = move_cursor(current, active, len, delta);
+    }
+
+    /// Seek to line `line_idx`'s timestamp (offset-adjusted), then resume
+    /// auto-follow by clearing the cursor. No-op for unsynced lines or lines
+    /// without a timestamp.
+    fn seek_to_line(&self, line_idx: usize) {
+        let target = {
+            let guard = self.state.read().unwrap();
+            match &*guard {
+                LyricsState::Loaded { lyrics, .. } if lyrics.synced => lyrics
+                    .lines
+                    .get(line_idx)
+                    .and_then(|l| l.start_ms)
+                    .map(|start| seek_target_ms(start, *self.offset_ms.read().unwrap())),
+                _ => None,
+            }
+        };
+        if let Some(ms) = target {
+            self.queue.get_spotify().seek(ms);
+            *self.cursor_line.write().unwrap() = None;
+        }
+    }
+
+    /// Seek to the selected line, or the active playing line if no cursor is set.
+    fn seek_to_selected(&self) {
+        let line = {
+            let guard = self.state.read().unwrap();
+            match &*guard {
+                LyricsState::Loaded { lyrics, .. } if lyrics.synced => self
+                    .cursor_line
+                    .read()
+                    .unwrap()
+                    .or_else(|| lyrics.active_index(self.position_ms().max(0) as u32)),
+                _ => None,
+            }
+        };
+        if let Some(i) = line {
+            self.seek_to_line(i);
+        }
+    }
+
+    /// Handle a left-click at view-relative row `rel_y`: seek to the clicked line.
+    fn handle_click(&self, rel_y: usize) {
+        let line = {
+            let layout = self.last_layout.read().unwrap();
+            row_at(rel_y, layout.top, &layout.row_line)
+        };
+        if let Some(i) = line {
+            self.seek_to_line(i);
+        }
     }
 
     fn adjust_offset(&self, delta_ms: i64) {
@@ -166,7 +273,7 @@ impl LyricsView {
     /// Force a re-evaluation on the next draw (used by refetch/provider cycle).
     fn force_refetch(&self) {
         *self.fetched_for.write().unwrap() = None;
-        *self.manual_scroll.write().unwrap() = None;
+        *self.cursor_line.write().unwrap() = None;
         *self.state.write().unwrap() = LyricsState::Idle;
     }
 
@@ -243,13 +350,20 @@ impl LyricsView {
         };
 
         // Flatten the lyrics into rendered rows so translation/romanization
-        // lines participate in scrolling and centering.
+        // lines participate in scrolling and centering, tracking which line
+        // each row belongs to for click hit-testing.
+        let cursor = *self.cursor_line.read().unwrap();
         let mut rows: Vec<(&str, RowStyle)> = Vec::new();
+        let mut row_line: Vec<Option<usize>> = Vec::new();
         let mut active_row: Option<usize> = None;
+        let mut cursor_row: Option<usize> = None;
         for (i, line) in lyrics.lines.iter().enumerate() {
             let is_active = Some(i) == active;
             if is_active {
                 active_row = Some(rows.len());
+            }
+            if Some(i) == cursor {
+                cursor_row = Some(rows.len());
             }
             rows.push((
                 line.text.as_str(),
@@ -259,20 +373,27 @@ impl LyricsView {
                     RowStyle::Normal
                 },
             ));
+            row_line.push(Some(i));
             if show_translation && let Some(translation) = &line.translation {
                 rows.push((translation.as_str(), RowStyle::Secondary));
+                row_line.push(Some(i));
             }
             if show_romaji && let Some(romanization) = &line.romanization {
                 rows.push((romanization.as_str(), RowStyle::Secondary));
+                row_line.push(Some(i));
             }
         }
 
-        let top = match *self.manual_scroll.read().unwrap() {
-            Some(scroll) => scroll.min(rows.len().saturating_sub(1)),
+        // Center on the cursor when the user has selected a line, else on the
+        // active playing line (auto-follow).
+        let top = match cursor_row {
+            Some(cr) => cr.saturating_sub(height / 2),
             None => active_row
                 .map(|a| a.saturating_sub(height / 2))
                 .unwrap_or(0),
         };
+
+        *self.last_layout.write().unwrap() = LineLayout { top, row_line };
 
         let highlight = ColorStyle::new(
             ColorType::Color(*printer.theme.palette.custom("lyrics_highlight").unwrap()),
@@ -296,7 +417,16 @@ impl LyricsView {
             } else {
                 0
             };
-            printer.with_color(color, |printer| printer.print((x, visible_y), text));
+            let is_cursor = Some(row_idx) == cursor_row;
+            printer.with_color(color, |printer| {
+                if is_cursor {
+                    printer.with_effect(Effect::Reverse, |printer| {
+                        printer.print((x, visible_y), text)
+                    });
+                } else {
+                    printer.print((x, visible_y), text);
+                }
+            });
         }
     }
 }
@@ -344,14 +474,25 @@ impl View for LyricsView {
         let allow_scroll = cfg.allow_scroll.unwrap_or(true);
         let allow_offset = cfg.allow_offset.unwrap_or(true);
         let allow_copy = cfg.allow_copy.unwrap_or(true);
+        let allow_seek = cfg.allow_seek.unwrap_or(true);
 
         match event {
             Event::Char('j') | Event::Key(Key::Down) if allow_scroll => {
-                self.scroll_by(1);
+                self.move_cursor_by(1);
                 EventResult::Consumed(None)
             }
             Event::Char('k') | Event::Key(Key::Up) if allow_scroll => {
-                self.scroll_by(-1);
+                self.move_cursor_by(-1);
+                EventResult::Consumed(None)
+            }
+            Event::Key(Key::Enter) if allow_seek => {
+                self.seek_to_selected();
+                EventResult::Consumed(None)
+            }
+            // Clear the selection (resume auto-follow) only when one is set, so
+            // an unselected Esc still falls through to the global handler.
+            Event::Key(Key::Esc) if self.cursor_line.read().unwrap().is_some() => {
+                *self.cursor_line.write().unwrap() = None;
                 EventResult::Consumed(None)
             }
             Event::Char('[') if allow_offset => {
@@ -369,6 +510,28 @@ impl View for LyricsView {
             Event::Char('Y') if allow_copy => {
                 self.copy_all();
                 EventResult::Consumed(None)
+            }
+            Event::Mouse {
+                offset,
+                position,
+                event,
+            } => {
+                let rel = position.saturating_sub(offset);
+                match event {
+                    MouseEvent::WheelUp if allow_scroll => {
+                        self.move_cursor_by(-1);
+                        EventResult::Consumed(None)
+                    }
+                    MouseEvent::WheelDown if allow_scroll => {
+                        self.move_cursor_by(1);
+                        EventResult::Consumed(None)
+                    }
+                    MouseEvent::Press(MouseButton::Left) if allow_seek => {
+                        self.handle_click(rel.y);
+                        EventResult::Consumed(None)
+                    }
+                    _ => EventResult::Ignored,
+                }
             }
             _ => EventResult::Ignored,
         }
@@ -389,13 +552,19 @@ impl ViewExt for LyricsView {
         match cmd {
             Command::LyricsScrollUp => {
                 if cfg.allow_scroll.unwrap_or(true) {
-                    self.scroll_by(-1);
+                    self.move_cursor_by(-1);
                 }
                 Ok(CommandResult::Consumed(None))
             }
             Command::LyricsScrollDown => {
                 if cfg.allow_scroll.unwrap_or(true) {
-                    self.scroll_by(1);
+                    self.move_cursor_by(1);
+                }
+                Ok(CommandResult::Consumed(None))
+            }
+            Command::LyricsSeek => {
+                if cfg.allow_seek.unwrap_or(true) {
+                    self.seek_to_selected();
                 }
                 Ok(CommandResult::Consumed(None))
             }
@@ -432,5 +601,41 @@ impl ViewExt for LyricsView {
             }
             _ => Ok(CommandResult::Ignored),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seek_target_subtracts_offset_and_clamps() {
+        assert_eq!(seek_target_ms(10_000, 0), 10_000);
+        assert_eq!(seek_target_ms(10_000, 500), 9_500); // positive offset -> earlier seek
+        assert_eq!(seek_target_ms(10_000, -500), 10_500); // negative offset -> later seek
+        assert_eq!(seek_target_ms(300, 1_000), 0); // clamp at zero
+    }
+
+    #[test]
+    fn row_at_resolves_visible_row_to_owning_line() {
+        // Rows: line0 main, line0 translation, line1 main, line2 main.
+        let row_line = vec![Some(0), Some(0), Some(1), Some(2)];
+        // top = 1: first visible row is index 1 (line0's translation).
+        assert_eq!(row_at(0, 1, &row_line), Some(0)); // click translation -> parent line 0
+        assert_eq!(row_at(1, 1, &row_line), Some(1));
+        assert_eq!(row_at(2, 1, &row_line), Some(2));
+        assert_eq!(row_at(3, 1, &row_line), None); // below the last row
+    }
+
+    #[test]
+    fn move_cursor_reveals_at_active_then_steps_and_clamps() {
+        // From None: reveal at the active line, ignoring delta.
+        assert_eq!(move_cursor(None, Some(3), 10, 1), Some(3));
+        assert_eq!(move_cursor(None, None, 10, -1), Some(0)); // no active -> line 0
+        // From Some: step and clamp to [0, len-1].
+        assert_eq!(move_cursor(Some(3), Some(3), 10, 1), Some(4));
+        assert_eq!(move_cursor(Some(0), None, 10, -1), Some(0)); // clamp low
+        assert_eq!(move_cursor(Some(9), None, 10, 1), Some(9)); // clamp high
+        assert_eq!(move_cursor(Some(0), None, 0, 1), None); // empty list
     }
 }
