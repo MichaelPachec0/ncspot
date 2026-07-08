@@ -119,6 +119,7 @@ pub struct LyricsConfig {
     pub allow_offset: Option<bool>,
     pub allow_provider_switch: Option<bool>,
     pub allow_copy: Option<bool>,
+    pub allow_seek: Option<bool>,
 }
 
 impl LyricsConfig {
@@ -495,6 +496,12 @@ mod lyrics_cfg_tests {
                 crate::lyrics::model::ProviderId::Lrclib
             ]
         );
+    }
+
+    #[test]
+    fn allow_seek_defaults_to_enabled() {
+        let c = crate::config::LyricsConfig::default();
+        assert!(c.allow_seek.unwrap_or(true));
     }
 
     #[test]

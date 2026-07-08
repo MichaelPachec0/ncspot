@@ -332,6 +332,7 @@ impl CommandManager {
             | Command::LyricsRefetch
             | Command::LyricsCopyLine
             | Command::LyricsCopyAll
+            | Command::LyricsSeek
             | Command::JukeboxViewCycle
             | Command::JukeboxBounce
             | Command::JukeboxSeekToBeat
