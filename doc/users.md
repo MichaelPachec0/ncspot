@@ -157,21 +157,24 @@ When pressing <kbd>O</kbd>:
 
 ### Lyrics
 These keys are active only while the lyrics screen is focused (<kbd>F9</kbd> or `:focus lyrics`).
-The `[` and `]` keys override their global volume-change meaning on this screen.
+You can also **left-click** any line to jump playback there. The `[` and `]` keys override
+their global volume-change meaning on this screen.
 
 | Key                           | Command                                                                 |
 |-------------------------------|-------------------------------------------------------------------------|
-| <kbd>j</kbd> / <kbd>↓</kbd>  | Scroll down one line (manual override of auto-follow).                  |
-| <kbd>k</kbd> / <kbd>↑</kbd>  | Scroll up one line.                                                     |
+| <kbd>j</kbd> / <kbd>↓</kbd>  | Move the selection cursor down one line.                               |
+| <kbd>k</kbd> / <kbd>↑</kbd>  | Move the selection cursor up one line.                                 |
+| <kbd>Enter</kbd>              | Seek playback to the selected line (synced lyrics only).               |
+| <kbd>Esc</kbd>                | Clear the selection and resume auto-follow.                            |
 | <kbd>[</kbd>                  | Shift sync offset back by 500 ms.                                       |
 | <kbd>]</kbd>                  | Shift sync offset forward by 500 ms.                                    |
 | <kbd>y</kbd>                  | Copy the current line to the system clipboard.                          |
 | <kbd>Y</kbd>                  | Copy all lyrics to the system clipboard.                                |
 
-The underlying commands (`lyricsscrollup`, `lyricsscrolldown`, `lyricsoffset`, `lyricsprovider`,
-`lyricsrefetch`, `lyricscopyline`, `lyricscopyall`) can be bound to any key via `[keybindings]`.
-Each interaction can be individually disabled via the `allow_*` fields in `[lyrics]`
-(see [Lyrics settings](#lyrics-settings)).
+The underlying commands (`lyricsscrollup`, `lyricsscrolldown`, `lyricsseek`, `lyricsoffset`,
+`lyricsprovider`, `lyricsrefetch`, `lyricscopyline`, `lyricscopyall`) can be bound to any key
+via `[keybindings]`. Each interaction can be individually disabled via the `allow_*` fields in
+`[lyrics]` (see [Lyrics settings](#lyrics-settings)).
 
 ### Jukebox
 The Eternal Jukebox plays the current track endlessly by seeking between similar-sounding
@@ -551,6 +554,10 @@ allow_provider_switch = true
 
 # Allow copying lyrics to the clipboard (y / Y keys, or lyricscopyline / lyricscopyall commands).
 allow_copy = true
+
+# Allow seeking by clicking a line or pressing Enter on the selected line
+# (synced lyrics only; via the lyricsseek command).
+allow_seek = true
 ```
 
 The `musixmatch_token` field is intentionally optional and opt-in: Musixmatch will not be

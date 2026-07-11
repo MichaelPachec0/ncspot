@@ -164,6 +164,7 @@ pub enum Command {
     LyricsRefetch,
     LyricsCopyLine,
     LyricsCopyAll,
+    LyricsSeek,
     JukeboxToggle,
     JukeboxViewCycle,
     JukeboxBounce,
@@ -243,6 +244,7 @@ impl fmt::Display for Command {
             | Self::LyricsRefetch
             | Self::LyricsCopyLine
             | Self::LyricsCopyAll
+            | Self::LyricsSeek
             | Self::JukeboxToggle
             | Self::JukeboxViewCycle
             | Self::JukeboxBounce
@@ -310,6 +312,7 @@ impl Command {
             Self::LyricsRefetch => "lyricsrefetch",
             Self::LyricsCopyLine => "lyricscopyline",
             Self::LyricsCopyAll => "lyricscopyall",
+            Self::LyricsSeek => "lyricsseek",
             Self::JukeboxToggle => "jukeboxtoggle",
             Self::JukeboxViewCycle => "jukeboxview",
             Self::JukeboxBounce => "jukeboxbounce",
@@ -831,6 +834,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 "lyricsrefetch" => Command::LyricsRefetch,
                 "lyricscopyline" => Command::LyricsCopyLine,
                 "lyricscopyall" => Command::LyricsCopyAll,
+                "lyricsseek" => Command::LyricsSeek,
                 "jukeboxtoggle" => Command::JukeboxToggle,
                 "jukeboxview" => Command::JukeboxViewCycle,
                 "jukeboxbounce" => Command::JukeboxBounce,
@@ -859,6 +863,14 @@ mod tests {
         assert!(matches!(
             parse("jukeboxsongsettings").as_deref(),
             Ok([Command::JukeboxSongSettings])
+        ));
+    }
+
+    #[test]
+    fn parses_lyrics_seek() {
+        assert!(matches!(
+            parse("lyricsseek").as_deref(),
+            Ok([Command::LyricsSeek])
         ));
     }
 }
