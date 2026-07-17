@@ -100,6 +100,15 @@
           # Link against the system OpenSSL via pkg-config instead of vendoring it.
           OPENSSL_NO_VENDOR = 1;
 
+          # buildRustPackage's install phase only copies the compiled binary, so the
+          # desktop launcher and app icon that ship in the source tree would be lost.
+          # Install them the same way nixpkgs' ncspot does so the app appears in menus
+          # and app launchers (misc/ncspot.desktop sets Terminal=true for the TUI).
+          postInstall = ''
+            install -D --mode=444 misc/ncspot.desktop $out/share/applications/ncspot.desktop
+            install -D --mode=444 images/logo.svg $out/share/icons/hicolor/scalable/apps/ncspot.svg
+          '';
+
           meta = {
             description = "Cross-platform ncurses Spotify client written in Rust, using librespot";
             homepage = "https://github.com/hrkfdn/ncspot";
