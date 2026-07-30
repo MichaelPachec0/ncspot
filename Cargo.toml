@@ -139,14 +139,22 @@ section = "sound"
 # an HTTP 500 from a draining node), which otherwise marks the track Unavailable even
 # though working CDN URLs are in the same storage-resolve response.
 #
-# Pinned to the merge commit on `dev` (still version 0.8.0). All librespot crates are
+# Also pull the oauth refresh-token fix (librespot-org/librespot#1732): Spotify's
+# token endpoint stopped including a refresh_token in refresh-grant responses, and
+# librespot used to overwrite the stored token with "" in that case, forcing a full
+# interactive re-auth on every token expiry. The fix retains the previous refresh
+# token when the response omits one (RFC 6749 §6 behaviour).
+#
+# Pinned to the head commit of PR #1732, which sits directly on the `dev` tip and
+# includes the #1722 merge commit (still version 0.8.0). All librespot crates are
 # patched to the same rev so they resolve from a single git workspace (avoids a
 # duplicate librespot-core/-protocol from mixing crates.io + git sources). Drop this
-# once a librespot release that includes #1722 is published and the deps are bumped.
+# once a librespot release that includes #1722 and #1732 is published and the deps
+# are bumped; if #1732 gets rebased before merging, re-pin to whatever lands on `dev`.
 [patch.crates-io]
-librespot-audio = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
-librespot-core = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
-librespot-metadata = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
-librespot-oauth = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
-librespot-playback = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
-librespot-protocol = { git = "https://github.com/librespot-org/librespot", rev = "db1ef7ab8c5ebd78edea0ba20f34feb21bd0e195" }
+librespot-audio = { git = "https://github.com/librespot-org/librespot", rev = "db65eb152d82b48326bf6ee2652cccac9b96def4" }
+librespot-core = { git = "https://github.com/librespot-org/librespot", rev = "db65eb152d82b48326bf6ee2652cccac9b96def4" }
+librespot-metadata = { git = "https://github.com/librespot-org/librespot", rev = "db65eb152d82b48326bf6ee2652cccac9b96def4" }
+librespot-oauth = { git = "https://github.com/librespot-org/librespot", rev = "db65eb152d82b48326bf6ee2652cccac9b96def4" }
+librespot-playback = { git = "https://github.com/librespot-org/librespot", rev = "db65eb152d82b48326bf6ee2652cccac9b96def4" }
+librespot-protocol = { git = "https://github.com/librespot-org/librespot", rev = "db65eb152d82b48326bf6ee2652cccac9b96def4" }

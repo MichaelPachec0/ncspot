@@ -71,17 +71,17 @@
 
           # Reuse the committed lockfile. The librespot-* crates are pinned to a git
           # rev via [patch.crates-io] (see Cargo.toml) to pull the unreleased CDN-URL
-          # fallback fix; git sources need an explicit output hash here. All six share
-          # one git rev, so the hashes are identical.
+          # fallback and oauth refresh-token fixes; git sources need an explicit output
+          # hash here. All six share one git rev, so the hashes are identical.
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "librespot-audio-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
-              "librespot-core-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
-              "librespot-metadata-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
-              "librespot-oauth-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
-              "librespot-playback-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
-              "librespot-protocol-0.8.0" = "sha256-614pRHU1bAolxZVu1jFyO44s23rxGYtHQGtOs9qVUnI=";
+              "librespot-audio-0.8.0" = "sha256-RZWJFXeSaiCaR5kRd9uZQc2xMIBT/BEyI23EFaqwUac=";
+              "librespot-core-0.8.0" = "sha256-RZWJFXeSaiCaR5kRd9uZQc2xMIBT/BEyI23EFaqwUac=";
+              "librespot-metadata-0.8.0" = "sha256-RZWJFXeSaiCaR5kRd9uZQc2xMIBT/BEyI23EFaqwUac=";
+              "librespot-oauth-0.8.0" = "sha256-RZWJFXeSaiCaR5kRd9uZQc2xMIBT/BEyI23EFaqwUac=";
+              "librespot-playback-0.8.0" = "sha256-RZWJFXeSaiCaR5kRd9uZQc2xMIBT/BEyI23EFaqwUac=";
+              "librespot-protocol-0.8.0" = "sha256-RZWJFXeSaiCaR5kRd9uZQc2xMIBT/BEyI23EFaqwUac=";
             };
           };
 
