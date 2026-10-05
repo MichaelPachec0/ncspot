@@ -6,6 +6,128 @@ use std::sync::OnceLock;
 
 use strum_macros::Display;
 
+const QUIT_CMD: &str = "quit";
+const TOGGLE_PLAY_CMD: &str = "playpause";
+const STOP_CMD: &str = "stop";
+const PREVIOUS_CMD: &str = "previous";
+const NEXT_CMD: &str = "next";
+const CLEAR_CMD: &str = "clear";
+const QUEUE_CMD: &str = "queue";
+const PLAY_NEXT_CMD: &str = "playnext";
+const PLAY: &str = "play";
+const UPDATE_LIBRARY_CMD: &str = "update";
+const SAVE_CMD: &str = "save";
+const SAVE_CURRENT_CMD: &str = "save current";
+const SAVE_QUEUE_CMD: &str = "save queue";
+const ADD: &str = "add";
+const ADD_CURRENT_CMD: &str = "add current";
+const DELETE_CMD: &str = "delete";
+const FOCUS: &str = "focus";
+const SEEK: &str = "seek";
+const VOLUME_UP_CMD: &str = "volup";
+const VOLUME_DOWN_CMD: &str = "voldown";
+const REPEAT_CMD: &str = "repeat";
+const SHUFFLE_CMD: &str = "shuffle";
+#[cfg(feature = "share_clipboard")]
+const SHARE_CMD: &str = "share";
+const BACK_CMD: &str = "back";
+const OPEN_CMD: &str = "open";
+const GOTO_CMD: &str = "goto";
+const MOVE_CMD: &str = "move";
+const SHIFT_CMD: &str = "shift";
+const SEARCH_CMD: &str = "search";
+const JUMP_PREVIOUS_CMD: &str = "jumpprevious";
+const JUMP_NEXT_CMD: &str = "jumpnext";
+const JUMP_CMD: &str = "jump";
+const HELP_CMD: &str = "help";
+const RELOAD_CONFIG_CMD: &str = "reload";
+const NOOP_CMD: &str = "noop";
+const INSERT_CMD: &str = "insert";
+const NEW_PLAYLIST_CMD: &str = "newplaylist";
+const SORT_CMD: &str = "sort";
+const LOGOUT_CMD: &str = "logout";
+const SHOW_RECOMMENDATIONS_CMD: &str = "similar";
+const REDRAW_CMD: &str = "redraw";
+const EXECUTE_CMD: &str = "exec";
+const RECONNECT_CMD: &str = "reconnect";
+const LYRICS_SCROLL_UP_CMD: &str = "lyricsscrollup";
+const LYRICS_SCROLL_DOWN_CMD: &str = "lyricsscrolldown";
+const LYRICS_OFFSET_CMD: &str = "lyricsoffset";
+const LYRICS_PROVIDER_CMD: &str = "lyricsprovider";
+const LYRICS_REFETCH_CMD: &str = "lyricsrefetch";
+const LYRICS_COPY_LINE_CMD: &str = "lyricscopyline";
+const LYRICS_COPY_ALL_CMD: &str = "lyricscopyall";
+const LYRICS_SEEK_CMD: &str = "lyricsseek";
+const JUKEBOX_TOGGLE_CMD: &str = "jukeboxtoggle";
+const JUKEBOX_VIEW_CMD: &str = "jukeboxview";
+const JUKEBOX_BOUNCE_CMD: &str = "jukeboxbounce";
+const JUKEBOX_SEEK_CMD: &str = "jukeboxseek";
+const JUKEBOX_SETTINGS_CMD: &str = "jukeboxsettings";
+const JUKEBOX_GRAPHICS_CMD: &str = "jukeboxgraphics";
+const JUKEBOX_SONG_SETTINGS_CMD: &str = "jukeboxsongsettings";
+
+pub const ALL_COMMANDS: &[&str] = &[
+    QUIT_CMD,
+    TOGGLE_PLAY_CMD,
+    STOP_CMD,
+    PREVIOUS_CMD,
+    NEXT_CMD,
+    CLEAR_CMD,
+    QUEUE_CMD,
+    PLAY_NEXT_CMD,
+    PLAY,
+    UPDATE_LIBRARY_CMD,
+    SAVE_CMD,
+    SAVE_CURRENT_CMD,
+    SAVE_QUEUE_CMD,
+    ADD,
+    ADD_CURRENT_CMD,
+    DELETE_CMD,
+    FOCUS,
+    SEEK,
+    VOLUME_UP_CMD,
+    VOLUME_DOWN_CMD,
+    REPEAT_CMD,
+    SHUFFLE_CMD,
+    #[cfg(feature = "share_clipboard")]
+    SHARE_CMD,
+    BACK_CMD,
+    OPEN_CMD,
+    GOTO_CMD,
+    MOVE_CMD,
+    SHIFT_CMD,
+    SEARCH_CMD,
+    JUMP_PREVIOUS_CMD,
+    JUMP_NEXT_CMD,
+    JUMP_CMD,
+    HELP_CMD,
+    RELOAD_CONFIG_CMD,
+    NOOP_CMD,
+    INSERT_CMD,
+    NEW_PLAYLIST_CMD,
+    SORT_CMD,
+    LOGOUT_CMD,
+    SHOW_RECOMMENDATIONS_CMD,
+    REDRAW_CMD,
+    EXECUTE_CMD,
+    RECONNECT_CMD,
+    LYRICS_SCROLL_UP_CMD,
+    LYRICS_SCROLL_DOWN_CMD,
+    LYRICS_OFFSET_CMD,
+    LYRICS_PROVIDER_CMD,
+    LYRICS_REFETCH_CMD,
+    LYRICS_COPY_LINE_CMD,
+    LYRICS_COPY_ALL_CMD,
+    LYRICS_SEEK_CMD,
+    JUKEBOX_TOGGLE_CMD,
+    JUKEBOX_VIEW_CMD,
+    JUKEBOX_BOUNCE_CMD,
+    JUKEBOX_SEEK_CMD,
+    JUKEBOX_SETTINGS_CMD,
+    JUKEBOX_GRAPHICS_CMD,
+    JUKEBOX_SONG_SETTINGS_CMD,
+];
+
 #[derive(Display, Clone, Serialize, Deserialize, Debug)]
 #[strum(serialize_all = "lowercase")]
 pub enum TargetMode {
@@ -261,65 +383,108 @@ impl fmt::Display for Command {
 impl Command {
     pub fn basename(&self) -> &str {
         match self {
-            Self::Quit => "quit",
-            Self::TogglePlay => "playpause",
-            Self::Stop => "stop",
-            Self::Previous => "previous",
-            Self::Next => "next",
-            Self::Clear => "clear",
-            Self::Queue => "queue",
-            Self::PlayNext => "playnext",
-            Self::Play => "play",
-            Self::UpdateLibrary => "update",
-            Self::Save => "save",
-            Self::SaveCurrent => "save current",
-            Self::SaveQueue => "save queue",
-            Self::Add => "add",
-            Self::AddCurrent => "add current",
-            Self::Delete => "delete",
-            Self::Focus(_) => "focus",
-            Self::Seek(_) => "seek",
-            Self::VolumeUp(_) => "volup",
-            Self::VolumeDown(_) => "voldown",
-            Self::Repeat(_) => "repeat",
-            Self::Shuffle(_) => "shuffle",
+            Self::Quit => QUIT_CMD,
+            Self::TogglePlay => TOGGLE_PLAY_CMD,
+            Self::Stop => STOP_CMD,
+            Self::Previous => PREVIOUS_CMD,
+            Self::Next => NEXT_CMD,
+            Self::Clear => CLEAR_CMD,
+            Self::Queue => QUEUE_CMD,
+            Self::PlayNext => PLAY_NEXT_CMD,
+            Self::Play => PLAY,
+            Self::UpdateLibrary => UPDATE_LIBRARY_CMD,
+            Self::Save => SAVE_CMD,
+            Self::SaveCurrent => SAVE_CURRENT_CMD,
+            Self::SaveQueue => SAVE_QUEUE_CMD,
+            Self::Add => ADD,
+            Self::AddCurrent => ADD_CURRENT_CMD,
+            Self::Delete => DELETE_CMD,
+            Self::Focus(_) => FOCUS,
+            Self::Seek(_) => SEEK,
+            Self::VolumeUp(_) => VOLUME_UP_CMD,
+            Self::VolumeDown(_) => VOLUME_DOWN_CMD,
+            Self::Repeat(_) => REPEAT_CMD,
+            Self::Shuffle(_) => SHUFFLE_CMD,
             #[cfg(feature = "share_clipboard")]
-            Self::Share(_) => "share",
-            Self::Back => "back",
-            Self::Open(_) => "open",
-            Self::Goto(_) => "goto",
-            Self::Move(_, _) => "move",
-            Self::Shift(_, _) => "shift",
-            Self::Search(_) => "search",
-            Self::Jump(JumpMode::Previous) => "jumpprevious",
-            Self::Jump(JumpMode::Next) => "jumpnext",
-            Self::Jump(JumpMode::Query(_)) => "jump",
-            Self::Help => "help",
-            Self::ReloadConfig => "reload",
-            Self::Noop => "noop",
-            Self::Insert(_) => "insert",
-            Self::NewPlaylist(_) => "newplaylist",
-            Self::Sort(_, _) => "sort",
-            Self::Logout => "logout",
-            Self::ShowRecommendations(_) => "similar",
-            Self::Redraw => "redraw",
-            Self::Execute(_) => "exec",
-            Self::Reconnect => "reconnect",
-            Self::LyricsScrollUp => "lyricsscrollup",
-            Self::LyricsScrollDown => "lyricsscrolldown",
-            Self::LyricsOffset(_) => "lyricsoffset",
-            Self::LyricsProviderCycle => "lyricsprovider",
-            Self::LyricsRefetch => "lyricsrefetch",
-            Self::LyricsCopyLine => "lyricscopyline",
-            Self::LyricsCopyAll => "lyricscopyall",
-            Self::LyricsSeek => "lyricsseek",
-            Self::JukeboxToggle => "jukeboxtoggle",
-            Self::JukeboxViewCycle => "jukeboxview",
-            Self::JukeboxBounce => "jukeboxbounce",
-            Self::JukeboxSeekToBeat => "jukeboxseek",
-            Self::JukeboxSettings => "jukeboxsettings",
-            Self::JukeboxGraphics => "jukeboxgraphics",
-            Self::JukeboxSongSettings => "jukeboxsongsettings",
+            Self::Share(_) => SHARE_CMD,
+            Self::Back => BACK_CMD,
+            Self::Open(_) => OPEN_CMD,
+            Self::Goto(_) => GOTO_CMD,
+            Self::Move(_, _) => MOVE_CMD,
+            Self::Shift(_, _) => SHIFT_CMD,
+            Self::Search(_) => SEARCH_CMD,
+            Self::Jump(JumpMode::Previous) => JUMP_PREVIOUS_CMD,
+            Self::Jump(JumpMode::Next) => JUMP_NEXT_CMD,
+            Self::Jump(JumpMode::Query(_)) => JUMP_CMD,
+            Self::Help => HELP_CMD,
+            Self::ReloadConfig => RELOAD_CONFIG_CMD,
+            Self::Noop => NOOP_CMD,
+            Self::Insert(_) => INSERT_CMD,
+            Self::NewPlaylist(_) => NEW_PLAYLIST_CMD,
+            Self::Sort(_, _) => SORT_CMD,
+            Self::Logout => LOGOUT_CMD,
+            Self::ShowRecommendations(_) => SHOW_RECOMMENDATIONS_CMD,
+            Self::Redraw => REDRAW_CMD,
+            Self::Execute(_) => EXECUTE_CMD,
+            Self::Reconnect => RECONNECT_CMD,
+            Self::LyricsScrollUp => LYRICS_SCROLL_UP_CMD,
+            Self::LyricsScrollDown => LYRICS_SCROLL_DOWN_CMD,
+            Self::LyricsOffset(_) => LYRICS_OFFSET_CMD,
+            Self::LyricsProviderCycle => LYRICS_PROVIDER_CMD,
+            Self::LyricsRefetch => LYRICS_REFETCH_CMD,
+            Self::LyricsCopyLine => LYRICS_COPY_LINE_CMD,
+            Self::LyricsCopyAll => LYRICS_COPY_ALL_CMD,
+            Self::LyricsSeek => LYRICS_SEEK_CMD,
+            Self::JukeboxToggle => JUKEBOX_TOGGLE_CMD,
+            Self::JukeboxViewCycle => JUKEBOX_VIEW_CMD,
+            Self::JukeboxBounce => JUKEBOX_BOUNCE_CMD,
+            Self::JukeboxSeekToBeat => JUKEBOX_SEEK_CMD,
+            Self::JukeboxSettings => JUKEBOX_SETTINGS_CMD,
+            Self::JukeboxGraphics => JUKEBOX_GRAPHICS_CMD,
+            Self::JukeboxSongSettings => JUKEBOX_SONG_SETTINGS_CMD,
+        }
+    }
+
+    /// Whether a vim-style count prefix (e.g. `10j`) may repeat this command.
+    /// True for movement, seeking, volume, track skipping and search-jumps. A
+    /// binding accepts a count only if all of its commands do.
+    pub fn accepts_count(&self) -> bool {
+        matches!(
+            self,
+            Self::Move(_, _)
+                | Self::Queue
+                | Self::PlayNext
+                | Self::Next
+                | Self::Previous
+                | Self::Seek(_)
+                | Self::VolumeUp(_)
+                | Self::VolumeDown(_)
+                | Self::Jump(_)
+        )
+    }
+
+    /// Returns a single command equivalent to executing `self` `count` times.
+    ///
+    /// This optimization is used when repetition simply scales a single
+    /// parameter. It allows a count-prefixed binding to act once rather than
+    /// looping, which prevents redundant side effects (such as re-reading the
+    /// async player position on every seek, or sending an individual volume
+    /// update per step).
+    ///
+    /// Returns `None` if the command cannot be scaled and must be executed
+    /// sequentially (e.g., movement, jumps, queueing, or track skips). In these
+    /// cases, the caller is responsible for looping the execution.
+    ///
+    /// Expects `count` within `MAX_COUNT`; larger values truncate when cast to
+    /// the parameter's type. The sole caller passes a `MAX_COUNT`-clamped count.
+    pub fn scaled(&self, count: usize) -> Option<Self> {
+        match self {
+            Self::Seek(SeekDirection::Relative(delta)) => Some(Self::Seek(
+                SeekDirection::Relative(delta.saturating_mul(count as i32)),
+            )),
+            Self::VolumeUp(amount) => Some(Self::VolumeUp(amount.saturating_mul(count as u16))),
+            Self::VolumeDown(amount) => Some(Self::VolumeDown(amount.saturating_mul(count as u16))),
+            _ => None,
         }
     }
 }
@@ -338,13 +503,13 @@ fn handle_aliases(input: &str) -> &str {
     let aliases = ALIASES.get_or_init(|| {
         let mut m = HashMap::new();
 
-        register_aliases(&mut m, "quit", vec!["q", "x"]);
+        register_aliases(&mut m, QUIT_CMD, vec!["q", "x"]);
         register_aliases(
             &mut m,
-            "playpause",
+            TOGGLE_PLAY_CMD,
             vec!["pause", "toggleplay", "toggleplayback"],
         );
-        register_aliases(&mut m, "repeat", vec!["loop"]);
+        register_aliases(&mut m, REPEAT_CMD, vec!["loop"]);
         m
     });
 
@@ -438,17 +603,17 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
             let command = handle_aliases(command);
             use CommandParseError as E;
             let command = match command {
-                "quit" => Command::Quit,
-                "playpause" => Command::TogglePlay,
-                "stop" => Command::Stop,
-                "previous" => Command::Previous,
-                "next" => Command::Next,
-                "clear" => Command::Clear,
-                "queue" => Command::Queue,
-                "playnext" => Command::PlayNext,
-                "play" => Command::Play,
-                "update" => Command::UpdateLibrary,
-                "add" => match args.first().cloned() {
+                QUIT_CMD => Command::Quit,
+                TOGGLE_PLAY_CMD => Command::TogglePlay,
+                STOP_CMD => Command::Stop,
+                PREVIOUS_CMD => Command::Previous,
+                NEXT_CMD => Command::Next,
+                CLEAR_CMD => Command::Clear,
+                QUEUE_CMD => Command::Queue,
+                PLAY_NEXT_CMD => Command::PlayNext,
+                PLAY => Command::Play,
+                UPDATE_LIBRARY_CMD => Command::UpdateLibrary,
+                ADD => match args.first().cloned() {
                     Some("current") => Ok(Command::AddCurrent),
                     Some(arg) => Err(E::BadEnumArg {
                         arg: arg.into(),
@@ -457,7 +622,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }),
                     None => Ok(Command::Add),
                 }?,
-                "save" => match args.first().cloned() {
+                SAVE_CMD => match args.first().cloned() {
                     Some("queue") => Ok(Command::SaveQueue),
                     Some("current") => Ok(Command::SaveCurrent),
                     Some(arg) => Err(E::BadEnumArg {
@@ -467,8 +632,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }),
                     None => Ok(Command::Save),
                 }?,
-                "delete" => Command::Delete,
-                "focus" => {
+                DELETE_CMD => Command::Delete,
+                FOCUS => {
                     let &target = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("queue|search|library".into()),
@@ -476,7 +641,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     // TODO: this really should be strongly typed
                     Command::Focus(target.into())
                 }
-                "seek" => {
+                SEEK => {
                     if args.is_empty() {
                         return Err(E::InsufficientArgs {
                             cmd: command.into(),
@@ -521,7 +686,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     })?;
                     Command::Seek(seek_direction)
                 }
-                "volup" => {
+                VOLUME_UP_CMD => {
                     let amount = match args.first() {
                         Some(&amount_raw) => {
                             amount_raw.parse::<u16>().map_err(|err| E::ArgParseError {
@@ -533,7 +698,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     };
                     Command::VolumeUp(amount)
                 }
-                "voldown" => {
+                VOLUME_DOWN_CMD => {
                     let amount = match args.first() {
                         Some(&amount_raw) => {
                             amount_raw.parse::<u16>().map_err(|err| E::ArgParseError {
@@ -545,7 +710,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     };
                     Command::VolumeDown(amount)
                 }
-                "repeat" => {
+                REPEAT_CMD => {
                     let mode = match args.first().cloned() {
                         Some("list" | "playlist" | "queue") => {
                             Ok(Some(RepeatSetting::RepeatPlaylist))
@@ -570,7 +735,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Repeat(mode)
                 }
-                "shuffle" => {
+                SHUFFLE_CMD => {
                     let switch = match args.first().cloned() {
                         Some("on") => Ok(Some(true)),
                         Some("off") => Ok(Some(false)),
@@ -584,7 +749,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     Command::Shuffle(switch)
                 }
                 #[cfg(feature = "share_clipboard")]
-                "share" => {
+                SHARE_CMD => {
                     let &target_mode_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("selected|current".into()),
@@ -600,8 +765,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Share(target_mode)
                 }
-                "back" => Command::Back,
-                "open" => {
+                BACK_CMD => Command::Back,
+                OPEN_CMD => {
                     let &target_mode_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("selected|current".into()),
@@ -617,7 +782,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Open(target_mode)
                 }
-                "goto" => {
+                GOTO_CMD => {
                     let &goto_mode_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("album|artist".into()),
@@ -633,7 +798,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Goto(goto_mode)
                 }
-                "move" => {
+                MOVE_CMD => {
                     let &move_mode_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("a direction".into()),
@@ -700,7 +865,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Move(move_mode, move_amount)
                 }
-                "shift" => {
+                SHIFT_CMD => {
                     let &shift_dir_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("up|down".into()),
@@ -727,14 +892,14 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     };
                     Command::Shift(shift_dir, amount)
                 }
-                "search" => Command::Search(args.join(" ")),
-                "jump" => Command::Jump(JumpMode::Query(args.join(" "))),
-                "jumpnext" => Command::Jump(JumpMode::Next),
-                "jumpprevious" => Command::Jump(JumpMode::Previous),
-                "help" => Command::Help,
-                "reload" => Command::ReloadConfig,
-                "noop" => Command::Noop,
-                "insert" => {
+                SEARCH_CMD => Command::Search(args.join(" ")),
+                JUMP_CMD => Command::Jump(JumpMode::Query(args.join(" "))),
+                JUMP_NEXT_CMD => Command::Jump(JumpMode::Next),
+                JUMP_PREVIOUS_CMD => Command::Jump(JumpMode::Previous),
+                HELP_CMD => Command::Help,
+                RELOAD_CONFIG_CMD => Command::ReloadConfig,
+                NOOP_CMD => Command::Noop,
+                INSERT_CMD => {
                     let insert_source = match args.first().cloned() {
                         #[cfg(feature = "share_clipboard")]
                         Some("") | None => Ok(InsertSource::Clipboard),
@@ -753,7 +918,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Insert(insert_source)
                 }
-                "newplaylist" => {
+                NEW_PLAYLIST_CMD => {
                     if !args.is_empty() {
                         Ok(Command::NewPlaylist(args.join(" ")))
                     } else {
@@ -763,7 +928,7 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                         })
                     }?
                 }
-                "sort" => {
+                SORT_CMD => {
                     let &key_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("a sort key".into()),
@@ -805,8 +970,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::Sort(key, direction)
                 }
-                "logout" => Command::Logout,
-                "similar" => {
+                LOGOUT_CMD => Command::Logout,
+                SHOW_RECOMMENDATIONS_CMD => {
                     let &target_mode_raw = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some("selected|current".into()),
@@ -822,26 +987,26 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }?;
                     Command::ShowRecommendations(target_mode)
                 }
-                "redraw" => Command::Redraw,
-                "exec" => Command::Execute(args.join(" ")),
-                "reconnect" => Command::Reconnect,
-                "lyricsscrollup" => Command::LyricsScrollUp,
-                "lyricsscrolldown" => Command::LyricsScrollDown,
-                "lyricsoffset" => {
+                REDRAW_CMD => Command::Redraw,
+                EXECUTE_CMD => Command::Execute(args.join(" ")),
+                RECONNECT_CMD => Command::Reconnect,
+                LYRICS_SCROLL_UP_CMD => Command::LyricsScrollUp,
+                LYRICS_SCROLL_DOWN_CMD => Command::LyricsScrollDown,
+                LYRICS_OFFSET_CMD => {
                     Command::LyricsOffset(args.first().and_then(|a| a.parse().ok()).unwrap_or(100))
                 }
-                "lyricsprovider" => Command::LyricsProviderCycle,
-                "lyricsrefetch" => Command::LyricsRefetch,
-                "lyricscopyline" => Command::LyricsCopyLine,
-                "lyricscopyall" => Command::LyricsCopyAll,
-                "lyricsseek" => Command::LyricsSeek,
-                "jukeboxtoggle" => Command::JukeboxToggle,
-                "jukeboxview" => Command::JukeboxViewCycle,
-                "jukeboxbounce" => Command::JukeboxBounce,
-                "jukeboxseek" => Command::JukeboxSeekToBeat,
-                "jukeboxsettings" => Command::JukeboxSettings,
-                "jukeboxgraphics" => Command::JukeboxGraphics,
-                "jukeboxsongsettings" => Command::JukeboxSongSettings,
+                LYRICS_PROVIDER_CMD => Command::LyricsProviderCycle,
+                LYRICS_REFETCH_CMD => Command::LyricsRefetch,
+                LYRICS_COPY_LINE_CMD => Command::LyricsCopyLine,
+                LYRICS_COPY_ALL_CMD => Command::LyricsCopyAll,
+                LYRICS_SEEK_CMD => Command::LyricsSeek,
+                JUKEBOX_TOGGLE_CMD => Command::JukeboxToggle,
+                JUKEBOX_VIEW_CMD => Command::JukeboxViewCycle,
+                JUKEBOX_BOUNCE_CMD => Command::JukeboxBounce,
+                JUKEBOX_SEEK_CMD => Command::JukeboxSeekToBeat,
+                JUKEBOX_SETTINGS_CMD => Command::JukeboxSettings,
+                JUKEBOX_GRAPHICS_CMD => Command::JukeboxGraphics,
+                JUKEBOX_SONG_SETTINGS_CMD => Command::JukeboxSongSettings,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),
@@ -867,10 +1032,116 @@ mod tests {
     }
 
     #[test]
+    fn eligible_commands_accept_count() {
+        let eligible = [
+            Command::Move(MoveMode::Down, MoveAmount::default()),
+            Command::Move(MoveMode::Up, MoveAmount::Extreme),
+            Command::Queue,
+            Command::PlayNext,
+            Command::Next,
+            Command::Previous,
+            Command::Seek(SeekDirection::Relative(1000)),
+            Command::VolumeUp(1),
+            Command::VolumeDown(5),
+            Command::Jump(JumpMode::Next),
+            Command::Jump(JumpMode::Previous),
+        ];
+        for cmd in eligible {
+            assert!(cmd.accepts_count(), "{cmd:?} should accept a count");
+        }
+    }
+
+    #[test]
+    fn one_shot_and_menu_commands_ignore_count() {
+        let ineligible = [
+            Command::Open(TargetMode::Selected),
+            Command::Goto(GotoMode::Album),
+            Command::Play,
+            Command::TogglePlay,
+            Command::Stop,
+            Command::Repeat(None),
+            Command::Shuffle(None),
+            Command::Help,
+            Command::Back,
+            Command::Delete,
+            Command::Quit,
+            Command::Focus("queue".into()),
+            Command::Shift(ShiftMode::Up, None),
+        ];
+        for cmd in ineligible {
+            assert!(!cmd.accepts_count(), "{cmd:?} should ignore a count");
+        }
+    }
+
+    #[test]
+    fn binding_accepts_count_only_if_all_commands_do() {
+        let space = [
+            Command::Queue,
+            Command::Move(MoveMode::Down, MoveAmount::default()),
+        ];
+        let dot = [
+            Command::PlayNext,
+            Command::Move(MoveMode::Down, MoveAmount::default()),
+        ];
+        let open = [Command::Open(TargetMode::Selected)];
+        assert!(space.iter().all(Command::accepts_count));
+        assert!(dot.iter().all(Command::accepts_count));
+        assert!(!open.iter().all(Command::accepts_count));
+    }
+
+    #[test]
+    fn scaled_multiplies_seek_and_volume() {
+        // `Command` has no `PartialEq`, so match on the collapsed variants.
+        assert!(matches!(
+            Command::Seek(SeekDirection::Relative(-1000)).scaled(3),
+            Some(Command::Seek(SeekDirection::Relative(-3000)))
+        ));
+        assert!(matches!(
+            Command::VolumeUp(5).scaled(4),
+            Some(Command::VolumeUp(20))
+        ));
+        assert!(matches!(
+            Command::VolumeDown(2).scaled(3),
+            Some(Command::VolumeDown(6))
+        ));
+    }
+
+    #[test]
     fn parses_lyrics_seek() {
         assert!(matches!(
             parse("lyricsseek").as_deref(),
             Ok([Command::LyricsSeek])
         ));
+    }
+
+    #[test]
+    fn scaled_saturates_instead_of_overflowing() {
+        assert!(matches!(
+            Command::VolumeUp(u16::MAX).scaled(9999),
+            Some(Command::VolumeUp(u16::MAX))
+        ));
+        assert!(matches!(
+            Command::Seek(SeekDirection::Relative(i32::MIN)).scaled(9999),
+            Some(Command::Seek(SeekDirection::Relative(i32::MIN)))
+        ));
+    }
+
+    #[test]
+    fn scaled_is_none_for_repeat_by_execution_commands() {
+        // These skip/move commands are collapsed elsewhere or must genuinely
+        // repeat, so they have no scaled form.
+        assert!(Command::Next.scaled(3).is_none());
+        assert!(Command::Previous.scaled(3).is_none());
+        assert!(Command::Queue.scaled(3).is_none());
+        assert!(
+            Command::Move(MoveMode::Down, MoveAmount::default())
+                .scaled(3)
+                .is_none()
+        );
+        assert!(
+            Command::Seek(SeekDirection::Absolute(1000))
+                .scaled(3)
+                .is_none()
+        );
     }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use cursive::align::HAlign;
@@ -14,7 +15,7 @@ use cursive::{Cursive, Printer};
 use unicode_width::UnicodeWidthStr;
 
 use crate::application::UserData;
-use crate::command::{self, Command, JumpMode};
+use crate::command::{self, ALL_COMMANDS, Command, JumpMode};
 use crate::commands::CommandResult;
 use crate::config::{self, Config};
 use crate::events;
@@ -35,6 +36,9 @@ pub struct Layout {
     ev: events::EventManager,
     theme: Theme,
     configuration: Arc<Config>,
+    /// Pending count prefix, cleared when a prompt opens so it can't leak onto
+    /// the next keypress.
+    pending_count: Arc<AtomicUsize>,
 }
 
 impl Layout {
@@ -43,6 +47,7 @@ impl Layout {
         ev: &events::EventManager,
         theme: Theme,
         configuration: Arc<Config>,
+        pending_count: Arc<AtomicUsize>,
     ) -> Self {
         let style = ColorStyle::new(
             ColorType::Color(*theme.palette.custom("cmdline").unwrap()),
@@ -104,11 +109,13 @@ impl Layout {
             ev: ev.clone(),
             theme,
             configuration,
+            pending_count,
         }
     }
 
     pub fn enable_cmdline(&mut self, prefix: char) {
         if !self.cmdline_focus {
+            self.pending_count.store(0, Ordering::Relaxed);
             self.cmdline.set_content(prefix);
             self.cmdline_focus = true;
         }
@@ -116,6 +123,7 @@ impl Layout {
 
     pub fn enable_jump(&mut self) {
         if !self.cmdline_focus {
+            self.pending_count.store(0, Ordering::Relaxed);
             self.cmdline.set_content("/");
             self.cmdline_focus = true;
         }
@@ -270,7 +278,11 @@ impl Layout {
     /// Propagate the given event to the command line.
     fn command_line_handle_event(&mut self, event: Event) -> EventResult {
         let is_left_right_event = matches!(event, Event::Key(Key::Left) | Event::Key(Key::Right));
-        let result = self.cmdline.on_event(event);
+        let result = match event {
+            // [Key::Tab] isn't actually handled by EditView internally.
+            Event::Key(Key::Tab) => self.command_completion(),
+            _ => self.cmdline.on_event(event),
+        };
 
         if self.cmdline.get_content().is_empty() {
             self.clear_cmdline();
@@ -281,6 +293,29 @@ impl Layout {
         } else {
             result
         }
+    }
+
+    /// Completes the command line when the `cmdline` input uniquely matches a command.
+    ///
+    /// TODO: Add support for aliases.
+    ///
+    /// # Returns
+    ///
+    /// [EventResult::Consumed]
+    fn command_completion(&mut self) -> EventResult {
+        let content = self.cmdline.get_content();
+
+        // Strip the prefix from the content and store it for further processing.
+        let mut content_chars = content.chars();
+        let prefix = content_chars.next();
+        let command_without_prefix = content_chars.as_str();
+
+        let command = word_completion(command_without_prefix, ALL_COMMANDS);
+        let _ = match prefix {
+            Some(prefix) => self.cmdline.set_content(format!("{prefix}{command}")),
+            None => self.cmdline.set_content(command),
+        };
+        EventResult::consumed()
     }
 }
 
@@ -516,5 +551,63 @@ impl ViewExt for Layout {
                 }
             }
         }
+    }
+}
+
+/// Completes the `input` using words from the `dictionary`.
+///
+/// # Returns
+///
+/// If no words match, `input` is returned unchanged. \
+/// If a single word matches, that word is returned. \
+/// If multiple words match, their common prefix is returned.
+fn word_completion(input: &str, dictionary: &[&str]) -> String {
+    let matching_words: Vec<_> = dictionary
+        .iter()
+        .filter(|word| word.starts_with(input))
+        .collect();
+    let Some(first_word) = matching_words.first() else {
+        return input.into();
+    };
+
+    let mut prefix: Vec<char> = first_word.chars().collect();
+
+    for word in matching_words {
+        let common_len = prefix
+            .iter()
+            .copied()
+            .zip(word.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+
+        prefix.truncate(common_len);
+
+        if prefix.is_empty() {
+            break;
+        }
+    }
+
+    prefix.into_iter().collect::<String>()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_DICTIONARY: &[&str] = &["test1", "test2", "tset"];
+
+    #[test]
+    fn test_word_completion() {
+        // One case from the dictionary matches the input.
+        assert_eq!(word_completion("ts", TEST_DICTIONARY), "tset");
+
+        // No cases from the dictionary match the input.
+        assert_eq!(word_completion("Luna", TEST_DICTIONARY), "Luna");
+
+        // Multiple cases from the dictionary with common prefix match the input.
+        assert_eq!(word_completion("te", TEST_DICTIONARY), "test");
+
+        // Multiple cases from the dictionary without common prefix match the input.
+        assert_eq!(word_completion("t", TEST_DICTIONARY), "t");
     }
 }
