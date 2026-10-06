@@ -36,6 +36,9 @@
           cargo = rustToolchain;
           rustc = rustToolchain;
         };
+        rustToolchainDev = rustToolchain.override {
+          extensions = (lib.importTOML ./rust-toolchain.toml).toolchain.components ++ ["rust-src"];
+        };
 
         # System libraries the *-sys crates link against, derived from the crates
         # actually compiled for the default feature set (see Cargo.lock):
@@ -130,7 +133,7 @@
         # libraries are present in the shell's inputs.
         devShells.default = pkgs.mkShell {
           inherit buildInputs;
-          nativeBuildInputs = nativeBuildInputs ++ [ rustToolchain ];
+          nativeBuildInputs = nativeBuildInputs ++ [rustToolchainDev];
         };
 
         formatter = pkgs.nixfmt-rfc-style;
