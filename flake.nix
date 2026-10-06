@@ -11,18 +11,16 @@
     };
   };
 
-  outputs =
-    {
-      self,
-      nixpkgs,
-      flake-utils,
-      rust-overlay,
-    }:
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+    rust-overlay,
+  }:
     flake-utils.lib.eachDefaultSystem (
-      system:
-      let
-        overlays = [ (import rust-overlay) ];
-        pkgs = import nixpkgs { inherit system overlays; };
+      system: let
+        overlays = [(import rust-overlay)];
+        pkgs = import nixpkgs {inherit system overlays;};
         inherit (pkgs) lib stdenv;
 
         # Honour the toolchain pinned in ./rust-toolchain.toml (currently 1.96.0 with
@@ -47,8 +45,8 @@
         # The clipboard stack (arboard) uses pure-Rust x11rb and a dlopen'd
         # libwayland, so it needs nothing at build time.
         buildInputs =
-          [ pkgs.openssl ]
-          ++ lib.optionals stdenv.isLinux [ pkgs.libpulseaudio ]
+          [pkgs.openssl]
+          ++ lib.optionals stdenv.isLinux [pkgs.libpulseaudio]
           ++ lib.optionals stdenv.isDarwin [
             pkgs.darwin.apple_sdk.frameworks.AppKit
             pkgs.darwin.apple_sdk.frameworks.Security
@@ -62,8 +60,7 @@
           # any future -sys crate whose build.rs shells out to python).
           pkgs.python3
         ];
-      in
-      {
+      in {
         packages.default = self.packages.${system}.ncspot;
 
         packages.ncspot = rustPlatform.buildRustPackage {
