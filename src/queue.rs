@@ -432,10 +432,10 @@ impl Queue {
             let q = self.queue.write().unwrap();
             let index = match after_id {
                 None => 0,
-                Some(aid) => match self.ids.read().unwrap().iter().position(|&i| i == aid) {
-                    Some(pos) => pos + 1,
-                    None => return None,
-                },
+                Some(aid) => {
+                    let pos = self.ids.read().unwrap().iter().position(|&i| i == aid)?;
+                    pos + 1
+                }
             };
             drop(q);
             index
