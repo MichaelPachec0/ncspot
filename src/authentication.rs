@@ -11,9 +11,10 @@ use crate::config::{self, Config};
 use crate::spotify::Spotify;
 
 pub const SPOTIFY_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
-/// Client ID of the shared ncspot app, used for Web API calls when no personal client ID is
-/// configured, and always for endpoints that are restricted for newer apps.
-pub const DEFAULT_WEB_API_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
+
+// This is a client ID issued specifically for ncspot tied to my personal Spotify account.
+// Please do not use it without my permission.
+pub const NCSPOT_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
 
 static OAUTH_SCOPES: &[&str] = &[
     "playlist-modify",
