@@ -5,7 +5,7 @@ use std::sync::{Arc, OnceLock};
 
 use cursive::traits::Nameable;
 use cursive::{Cursive, CursiveRunner};
-use log::{error, info, trace};
+use log::{error, info, trace, warn};
 
 #[cfg(unix)]
 use signal_hook::{consts::SIGHUP, consts::SIGTERM, iterator::Signals};
@@ -14,6 +14,7 @@ use crate::command::Command;
 use crate::commands::CommandManager;
 use crate::config::{Config, PlaybackState};
 use crate::events::{Event, EventManager};
+use crate::ext_traits::CursiveExt;
 use crate::library::Library;
 use crate::queue::Queue;
 use crate::spotify::{PlayerEvent, Spotify};
@@ -67,6 +68,9 @@ pub struct Application {
     spotify: Spotify,
     /// Internally shared
     event_manager: EventManager,
+    /// The ncspot configuration.
+    #[cfg_attr(not(feature = "notify"), allow(dead_code))]
+    configuration: Arc<Config>,
     /// An IPC implementation using the D-Bus MPRIS protocol, used to control and inspect ncspot.
     #[cfg(unix)]
     ipc: Option<IpcSocket>,
@@ -80,7 +84,11 @@ impl Application {
     /// # Arguments
     ///
     /// * `configuration_file_path` - Relative path to the configuration file inside the base path
-    pub fn new(configuration_file_path: Option<String>) -> Result<Self, Box<dyn Error>> {
+    /// * `client_id_flag` - Value of the `--client-id` command line flag, if given
+    pub fn new(
+        configuration_file_path: Option<String>,
+        client_id_flag: Option<String>,
+    ) -> Result<Self, Box<dyn Error>> {
         // Things here may cause the process to abort; we must do them before creating curses
         // windows otherwise the error message will not be seen by a user
 
@@ -93,12 +101,35 @@ impl Application {
             )
             .unwrap();
 
-        let configuration = Arc::new(Config::new(configuration_file_path));
+        let configuration = Arc::new(Config::new(configuration_file_path, client_id_flag));
         let credentials = authentication::get_credentials(&configuration)?;
         let theme = configuration.build_theme();
 
-        if let Err(e) = authentication::get_rspotify_token() {
+        if let Err(e) =
+            authentication::get_rspotify_token(authentication::DEFAULT_WEB_API_CLIENT_ID)
+        {
             error!("Failed to get rspotify token: {e}");
+        }
+
+        match configuration.personal_client_id() {
+            Some(personal) => {
+                info!(
+                    "Using personal Web API client ID {} from {}",
+                    personal.redacted(),
+                    personal.source
+                );
+                if let Err(e) = authentication::ensure_personal_token(&personal.id) {
+                    error!(
+                        "Can't use the personal Web API client ID, \
+                         falling back to the shared one: {e}"
+                    );
+                    eprintln!(
+                        "Can't use the personal Web API client ID ({e}), using the shared one"
+                    );
+                    configuration.disable_personal_client_id();
+                }
+            }
+            None => info!("Using the default shared Web API client ID"),
         }
 
         println!("Connecting to Spotify..");
@@ -300,6 +331,7 @@ impl Application {
             queue,
             spotify,
             event_manager,
+            configuration,
             #[cfg(unix)]
             ipc,
             cursive,
@@ -373,6 +405,43 @@ impl Application {
                         }
                         Err(e) => error!("Parsing error: {e}"),
                     },
+                    Event::RateLimited {
+                        client,
+                        retry_after,
+                    } => {
+                        info!(
+                            "{client} client ID is rate limited for {}s",
+                            retry_after.as_secs()
+                        );
+                        #[cfg(feature = "notify")]
+                        if self
+                            .configuration
+                            .values()
+                            .notify_rate_limit
+                            .unwrap_or(true)
+                        {
+                            std::thread::spawn(move || {
+                                crate::rate_limit::send_rate_limit_notification(client, retry_after)
+                            });
+                        }
+                    }
+                    Event::PersonalClientDisabled { reason } => {
+                        let message = format!(
+                            "Personal client ID needs a new login, using the shared one until \
+                             restart: {reason}"
+                        );
+                        warn!("{message}");
+                        self.cursive
+                            .on_layout(|_, mut layout| layout.set_result(Err(message)));
+                        // Not gated by notify_rate_limit: this is rare and needs action.
+                        #[cfg(feature = "notify")]
+                        std::thread::spawn(|| {
+                            crate::rate_limit::send_warning_notification(
+                                "ncspot: personal client ID needs a new login",
+                                "Using the shared client ID until ncspot restarts",
+                            )
+                        });
+                    }
                 }
             }
         }

@@ -18,10 +18,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remote DNS resolution (`socks5h://`), both with optional credentials.
   Without this option, the `http_proxy` environment variable is still
   honoured as before.
+- Use a personal Spotify Web API client ID, set with `--client-id`, the
+  `NCSPOT_CLIENT_ID` environment variable or `client_id` in the
+  configuration file. Bulk requests use it to avoid rate limits on the shared
+  client ID; endpoints restricted for new apps keep using the shared one
+- Show Spotify rate limiting (HTTP 429) in the status bar and as a desktop
+  notification (`notify_rate_limit`), with a new `statusbar_warning` theme
+  color
 
 ### Changed
 
 - Replace already existing queue notifications instead of stacking new ones.
+- Library updates only download new liked songs, and skip saved albums and
+  shows when they are unchanged, instead of downloading them again on every
+  update. Each list is still downloaded in full once a day so cached details
+  stay current
+
+### Fixed
+
+- Rate-limited Web API calls no longer block the user interface: background
+  calls wait through short limits and fail fast on long ones, and a library
+  update left incomplete by a rate limit resumes on its own after the limit
+  ends. A library update requested while one is running is skipped
 
 ## [1.4.0]
 

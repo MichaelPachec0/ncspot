@@ -13,6 +13,7 @@ use ncspot::program_arguments;
 mod application;
 mod authentication;
 mod cli;
+mod client_id;
 mod command;
 mod commands;
 mod config;
@@ -20,10 +21,12 @@ mod events;
 mod ext_traits;
 mod jukebox;
 mod library;
+mod library_sync;
 mod lyrics;
 mod model;
 mod panic;
 mod queue;
+mod rate_limit;
 mod serialization;
 mod sharing;
 mod spotify;
@@ -68,15 +71,22 @@ fn main() -> Result<(), String> {
             config::preload_proxy_environment(matches.get_one::<String>("config").cloned());
 
             // Create the application.
-            let mut application =
-                match Application::new(matches.get_one::<String>("config").cloned()) {
-                    Ok(application) => application,
-                    Err(error) => {
-                        eprintln!("{error}");
-                        error!("{error}");
-                        exit(-1);
-                    }
-                };
+            let mut application = match Application::new(
+                matches.get_one::<String>("config").cloned(),
+                matches.get_one::<String>("client-id").cloned(),
+            ) {
+                Ok(application) => application,
+                Err(error) => {
+                    eprintln!("{error}");
+                    error!("{error}");
+                    exit(-1);
+                }
+            };
+
+            // From here on this thread runs the UI: its Web API calls never wait out a rate
+            // limit. Startup work in Application::new above may still wait like a background
+            // thread.
+            rate_limit::set_ui_thread();
 
             // Start the application event loop.
             application.run()
