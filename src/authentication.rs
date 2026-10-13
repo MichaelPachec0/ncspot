@@ -14,7 +14,7 @@ pub const SPOTIFY_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
 
 // This is a client ID issued specifically for ncspot tied to my personal Spotify account.
 // Please do not use it without my permission.
-pub const NCSPOT_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
+pub const DEFAULT_WEB_API_CLIENT_ID: &str = "d420a117a32841c2b3474932e49fb54b";
 
 static OAUTH_SCOPES: &[&str] = &[
     "playlist-modify",
