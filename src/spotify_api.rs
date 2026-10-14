@@ -184,8 +184,11 @@ impl WebApi {
             self.internal.skip(area),
             || {
                 let session = self.internal.session().ok_or(InternalError::NoSession)?;
+                // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
+                // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
+                let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
                 run_attempts(
-                    is_ui_thread(),
+                    no_waits,
                     &self.internal.throttle,
                     || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
                     |window| {

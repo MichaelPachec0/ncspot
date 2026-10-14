@@ -1,7 +1,12 @@
 //! The one sync boundary into the async internal API. A future is spawned on the runtime and
-//! the caller waits on a std channel, so this works from any thread: the cursive UI thread,
-//! plain `std::thread`s, and threads inside the runtime (`spawn_blocking`, MPRIS handlers),
-//! where `block_on` would panic. It blocks the caller like the blocking Web API calls do.
+//! the caller waits on a std channel (never `block_on`, which panics inside a runtime). It
+//! blocks the caller like the blocking Web API calls do. Per caller kind:
+//! - the cursive UI thread and plain `std::thread`s wait on the channel directly;
+//! - `spawn_blocking` threads wait directly too (they are not runtime workers);
+//! - async tasks on a multi-thread runtime worker (MPRIS handlers) wait inside
+//!   `tokio::task::block_in_place`, which hands the worker's other tasks to another thread, so
+//!   the spawned future still runs on a runtime with one worker;
+//! - async tasks on a current-thread runtime wait directly (`block_in_place` would panic).
 
 use std::future::Future;
 use std::sync::mpsc;
@@ -40,7 +45,15 @@ where
         // The receiver is gone after a timeout; nothing to do then.
         let _ = tx.send(fut.await);
     });
-    match rx.recv_timeout(timeout) {
+    let on_multi_thread_runtime = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    let received = if on_multi_thread_runtime {
+        // Outside a worker (spawn_blocking threads) block_in_place just runs the closure.
+        tokio::task::block_in_place(|| rx.recv_timeout(timeout))
+    } else {
+        rx.recv_timeout(timeout)
+    };
+    match received {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
             task.abort();
@@ -111,6 +124,28 @@ mod tests {
             !finished.load(Ordering::SeqCst),
             "task kept running after the timeout"
         );
+    }
+
+    #[test]
+    fn works_inside_an_async_task_on_a_one_worker_runtime() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        let out = rt.block_on(async move {
+            tokio::spawn(async move {
+                run_on(
+                    &handle,
+                    async { Ok::<_, InternalError>(5) },
+                    Duration::from_secs(2),
+                )
+            })
+            .await
+            .unwrap()
+        });
+        assert_eq!(out, Ok(5));
     }
 
     #[test]
