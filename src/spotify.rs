@@ -318,8 +318,10 @@ impl Spotify {
                 return;
             }
         };
-        user_tx.map(|tx| tx.send(session.username()));
+        // Set the handle before unblocking startup: the library's first current_user call runs
+        // right after Spotify::new returns and must find the session.
         *session_handle.write().unwrap() = Some(session.clone());
+        user_tx.map(|tx| tx.send(session.username()));
 
         let mixer_factory_opt = librespot_playback::mixer::find(Some(SoftMixer::NAME));
         let factory = mixer_factory_opt.expect("could not find softvol mixer factory");
