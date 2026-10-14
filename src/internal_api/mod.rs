@@ -3,11 +3,12 @@
 //! the Web API stays as the fallback for every call.
 
 pub mod bridge;
-// Used by metadata.rs from the next commit.
-#[allow(dead_code)]
 pub mod convert;
 pub mod error;
 pub mod fallback;
+// WebApi calls these from the next commit (Task 8).
+#[allow(dead_code)]
+pub mod metadata;
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
