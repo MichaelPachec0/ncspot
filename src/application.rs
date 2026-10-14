@@ -409,12 +409,9 @@ impl Application {
                         client,
                         retry_after,
                     } => {
-                        let label_text = match client {
-                            crate::rate_limit::ClientLabel::Internal => client.to_string(),
-                            _ => format!("{client} client ID"),
-                        };
                         info!(
-                            "{label_text} is rate limited for {}s",
+                            "{} is rate limited for {}s",
+                            client.describe(),
                             retry_after.as_secs()
                         );
                         #[cfg(feature = "notify")]

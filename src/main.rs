@@ -19,11 +19,9 @@ mod commands;
 mod config;
 mod events;
 mod ext_traits;
+mod internal_api;
 mod jukebox;
 mod library;
-// Wired into WebApi in a later commit.
-#[allow(dead_code)]
-mod internal_api;
 mod library_sync;
 mod lyrics;
 mod model;

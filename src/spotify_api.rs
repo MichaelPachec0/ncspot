@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -5,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use librespot_core::Session;
 use log::{debug, error, info, warn};
 use rspotify::http::HttpError;
 use rspotify::model::{
@@ -19,6 +21,8 @@ use tokio::task::JoinHandle;
 
 use crate::authentication::DEFAULT_WEB_API_CLIENT_ID;
 use crate::events::{Event, EventManager};
+use crate::internal_api::error::InternalError;
+use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
 use crate::model::category::Category;
@@ -116,6 +120,8 @@ pub struct WebApi {
     worker_channel: Arc<RwLock<Option<mpsc::UnboundedSender<WorkerCommand>>>>,
     /// Event manager used to report rate limits to the UI. Unset in tests.
     events: Option<EventManager>,
+    /// Spotify's internal API client, shared by all clones.
+    internal: InternalApi,
 }
 
 impl WebApi {
@@ -125,12 +131,15 @@ impl WebApi {
         let personal = cfg
             .personal_client_id()
             .map(|personal| ApiClient::new(&personal.id, ClientLabel::Personal));
+        let settings = Settings::from_values(&cfg.values());
+        info!("{}", settings.describe());
         Self {
             shared: ApiClient::new(DEFAULT_WEB_API_CLIENT_ID, ClientLabel::Shared),
             personal,
             user: None,
             worker_channel: Arc::new(RwLock::new(None)),
             events: None,
+            internal: InternalApi::new(settings),
         }
     }
 
@@ -151,6 +160,55 @@ impl WebApi {
     /// Set the event manager used to report rate limits to the UI.
     pub(crate) fn set_events(&mut self, events: EventManager) {
         self.events = Some(events);
+    }
+
+    /// Use `session` (filled by the Spotify worker when it connects) for internal API calls.
+    pub(crate) fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
+        self.internal.set_session(session);
+    }
+
+    /// Run one call through the internal API for `area`, falling back to `web` per the rules in
+    /// [fallback::run_with_fallback]. `internal` builds the future from a connected session.
+    // Task 8 routes the metadata methods through this; until then only tests call it.
+    #[allow(dead_code)]
+    fn with_fallback<T, F, Fut>(
+        &self,
+        area: Area,
+        internal: F,
+        web: impl FnOnce() -> Option<T>,
+    ) -> Option<T>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        fallback::run_with_fallback(
+            self.internal.skip(area),
+            || {
+                let session = self.internal.session().ok_or(InternalError::NoSession)?;
+                run_attempts(
+                    is_ui_thread(),
+                    &self.internal.throttle,
+                    || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
+                    |window| {
+                        self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window)
+                    },
+                    thread::sleep,
+                )
+            },
+            web,
+            |err| {
+                if self.internal.latch(area) {
+                    warn!("internal API {} latched to the Web API: {err}", area.name());
+                    if let Some(events) = &self.events {
+                        events.try_send(Event::InternalApiFallback {
+                            area: area.name(),
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            },
+        )
     }
 
     /// The personal client, if configured and not disabled.
@@ -290,25 +348,34 @@ impl WebApi {
         self.personal
             .iter()
             .chain(std::iter::once(&self.shared))
-            .filter_map(|client| {
-                client
-                    .throttle
+            .map(|client| (client.label, &client.throttle))
+            .chain(std::iter::once((
+                ClientLabel::Internal,
+                &self.internal.throttle,
+            )))
+            .filter_map(|(label, throttle)| {
+                throttle
                     .read()
                     .unwrap()
                     .remaining(now)
-                    .map(|remaining| (client.label, remaining))
+                    .map(|remaining| (label, remaining))
             })
             .collect()
     }
 
-    /// Record a 429 on `client` with a window of `window`. At the start of a throttle episode,
+    /// Record a 429 on the client `label` (rate-limit state `throttle`) with a window of `window`. At the start of a throttle episode,
     /// keep the status bar countdown redrawing until the window has passed; tell the UI (log
     /// line and notification) at most once per `NOTIFY_COOLDOWN`, so short backoff windows do
     /// not repeat the notification.
-    fn on_rate_limited(&self, client: &ApiClient, window: Duration) {
+    fn on_rate_limited(
+        &self,
+        label: ClientLabel,
+        throttle: &Arc<RwLock<ThrottleState>>,
+        window: Duration,
+    ) {
         let now = Instant::now();
         let (new_episode, announce) = {
-            let mut throttle = client.throttle.write().unwrap();
+            let mut throttle = throttle.write().unwrap();
             let new_episode = throttle.record_429(now, window);
             (new_episode, new_episode && throttle.should_announce(now))
         };
@@ -317,7 +384,7 @@ impl WebApi {
         };
         if announce {
             events.try_send(Event::RateLimited {
-                client: client.label,
+                client: label,
                 retry_after: window,
             });
         }
@@ -327,7 +394,7 @@ impl WebApi {
 
         // The UI refresh tick doesn't run while playback is stopped, so redraw the countdown
         // from here until the window has passed, then once more to clear it.
-        let throttle = client.throttle.clone();
+        let throttle = throttle.clone();
         thread::spawn(move || {
             while throttle.read().unwrap().is_active(Instant::now()) {
                 if !events.try_trigger() {
@@ -345,6 +412,12 @@ impl WebApi {
             .iter()
             .chain(std::iter::once(&self.shared))
             .any(|client| client.throttle.read().unwrap().rate_limited_since(since))
+            || self
+                .internal
+                .throttle
+                .read()
+                .unwrap()
+                .rate_limited_since(since)
     }
 
     /// Send `api_call` once on `client` and classify the result for [run_rate_limited].
@@ -395,7 +468,7 @@ impl WebApi {
                 is_ui_thread(),
                 random_jitter,
                 || Self::attempt(client, api_call),
-                |window| self.on_rate_limited(client, window),
+                |window| self.on_rate_limited(client.label, &client.throttle, window),
             );
             match result {
                 Err(Some(401)) if client.label == ClientLabel::Personal => {
@@ -1188,7 +1261,8 @@ mod test {
     #[test]
     fn on_rate_limited_opens_the_window_of_that_client_only() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
-        api.on_rate_limited(api.client(Route::Bulk), Duration::from_secs(30));
+        let client = api.client(Route::Bulk);
+        api.on_rate_limited(client.label, &client.throttle, Duration::from_secs(30));
         let status = api.rate_limit_status();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].0, ClientLabel::Personal);
@@ -1199,8 +1273,37 @@ mod test {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
         let start = Instant::now();
         assert!(!api.rate_limited_since(start));
-        api.on_rate_limited(&api.shared, Duration::from_millis(1));
+        api.on_rate_limited(
+            api.shared.label,
+            &api.shared.throttle,
+            Duration::from_millis(1),
+        );
         assert!(api.rate_limited_since(start));
         assert!(!api.rate_limited_since(Instant::now() + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn with_fallback_without_a_session_uses_the_web_api_once() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let out = api.with_fallback(
+            Area::Metadata,
+            |_session| async { Ok::<u8, InternalError>(1) },
+            || Some(2),
+        );
+        assert_eq!(out, Some(2));
+        assert!(
+            !api.internal.skip(Area::Metadata),
+            "no session must not latch"
+        );
+    }
+
+    #[test]
+    fn with_fallback_with_internal_api_off_never_tries_internal() {
+        let values = crate::config::ConfigValues {
+            internal_api: Some(false),
+            ..Default::default()
+        };
+        let api = WebApi::new(&crate::config::Config::new_for_test_with_values(values));
+        assert!(api.internal.skip(Area::Metadata));
     }
 }

@@ -5,6 +5,8 @@ use std::fmt;
 use librespot_core::error::ErrorKind;
 
 /// Why an internal API call failed.
+// `classify` (first called by the Task 7 fetchers) constructs the variants not built yet.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InternalError {
     /// Spotify changed something on its side (HTTP 412, a response that does not parse, a
@@ -37,6 +39,8 @@ impl fmt::Display for InternalError {
 
 /// Map a librespot error to its class. librespot already turns protobuf decode errors into
 /// `FailedPrecondition`, so those count as a protocol change too.
+// The Task 7 metadata fetchers call this.
+#[allow(dead_code)]
 pub fn classify(err: &librespot_core::Error) -> InternalError {
     match err.kind {
         ErrorKind::FailedPrecondition => InternalError::ProtocolChanged(err.to_string()),

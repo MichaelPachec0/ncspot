@@ -95,6 +95,16 @@ pub enum ClientLabel {
     Internal,
 }
 
+impl ClientLabel {
+    /// Name for log lines and notifications: `internal API`, or `<label> client ID`.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Internal => self.to_string(),
+            _ => format!("{self} client ID"),
+        }
+    }
+}
+
 impl fmt::Display for ClientLabel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -198,11 +208,11 @@ pub fn format_status_segment(status: &[(ClientLabel, Duration)]) -> String {
 /// Body text of the rate-limit desktop notification.
 #[cfg_attr(not(feature = "notify"), allow(dead_code))]
 pub fn notification_body(client: ClientLabel, retry_after: Duration) -> String {
-    let secs = ceil_secs(retry_after);
-    match client {
-        ClientLabel::Internal => format!("{client}, retrying in {secs}s"),
-        _ => format!("{client} client ID, retrying in {secs}s"),
-    }
+    format!(
+        "{}, retrying in {}s",
+        client.describe(),
+        ceil_secs(retry_after)
+    )
 }
 
 /// ID of the last warning notification (rate limit, personal client disabled), so a new one
@@ -285,7 +295,7 @@ pub fn run_rate_limited<R>(
                 Gate::Send => break,
                 Gate::Wait(delay) => thread::sleep(delay),
                 Gate::FailFast => {
-                    debug!("rate limited on the {label} client ID, request not sent");
+                    debug!("rate limited on the {}, request not sent", label.describe());
                     return Err(Some(429));
                 }
             }
@@ -303,13 +313,17 @@ pub fn run_rate_limited<R>(
                         .unwrap_or_else(|| backoff(retries)),
                 );
                 if on_ui_thread {
-                    debug!("rate limited on the {label} client ID, UI thread call not retried");
+                    debug!(
+                        "rate limited on the {}, UI thread call not retried",
+                        label.describe()
+                    );
                     return Err(Some(429));
                 }
                 if retries == MAX_RATE_LIMIT_RETRIES {
                     warn!(
-                        "giving up on a call to the {label} client ID after \
-                         {MAX_RATE_LIMIT_RETRIES} rate-limited retries"
+                        "giving up on a call to the {} after \
+                         {MAX_RATE_LIMIT_RETRIES} rate-limited retries",
+                        label.describe()
                     );
                     return Err(Some(429));
                 }
@@ -326,6 +340,13 @@ mod test {
 
     const SECS: fn(u64) -> Duration = Duration::from_secs;
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn describe_adds_client_id_except_for_internal() {
+        assert_eq!(ClientLabel::Shared.describe(), "shared client ID");
+        assert_eq!(ClientLabel::Personal.describe(), "personal client ID");
+        assert_eq!(ClientLabel::Internal.describe(), "internal API");
+    }
 
     #[test]
     fn internal_label_is_named_without_client_id() {
