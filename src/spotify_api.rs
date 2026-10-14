@@ -200,7 +200,8 @@ impl WebApi {
             web,
             |err| {
                 if self.internal.latch(area) {
-                    warn!("internal API {} latched to the Web API: {err}", area.name());
+                    // The InternalApiFallback handler logs the warning with the user-facing text.
+                    debug!("internal API {} latched to the Web API: {err}", area.name());
                     if let Some(events) = &self.events {
                         events.try_send(Event::InternalApiFallback {
                             area: area.name(),
@@ -364,10 +365,10 @@ impl WebApi {
             .collect()
     }
 
-    /// Record a 429 on the client `label` (rate-limit state `throttle`) with a window of `window`. At the start of a throttle episode,
-    /// keep the status bar countdown redrawing until the window has passed; tell the UI (log
-    /// line and notification) at most once per `NOTIFY_COOLDOWN`, so short backoff windows do
-    /// not repeat the notification.
+    /// Record a 429 on the client `label` (rate-limit state `throttle`) with a window of
+    /// `window`. At the start of a throttle episode, keep the status bar countdown redrawing
+    /// until the window has passed; tell the UI (log line and notification) at most once per
+    /// `NOTIFY_COOLDOWN`, so short backoff windows do not repeat the notification.
     fn on_rate_limited(
         &self,
         label: ClientLabel,

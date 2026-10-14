@@ -14,7 +14,7 @@ pub enum Event {
     Queue(QueueEvent),
     SessionDied,
     IpcInput(String),
-    /// A Web API client started being rate limited by Spotify (HTTP 429).
+    /// A Web API client or the internal API started being rate limited by Spotify (HTTP 429).
     RateLimited {
         client: ClientLabel,
         retry_after: Duration,
