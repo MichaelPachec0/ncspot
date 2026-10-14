@@ -2,6 +2,7 @@
 //! librespot session. Used for bulk metadata so it does not count against a Web API app quota;
 //! the Web API stays as the fallback for every call.
 
+pub mod bridge;
 pub mod error;
 pub mod fallback;
 
