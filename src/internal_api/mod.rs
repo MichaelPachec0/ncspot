@@ -8,6 +8,9 @@ pub mod error;
 pub mod fallback;
 pub mod metadata;
 
+#[cfg(test)]
+mod live_tests;
+
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
