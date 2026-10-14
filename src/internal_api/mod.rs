@@ -3,6 +3,9 @@
 //! the Web API stays as the fallback for every call.
 
 pub mod bridge;
+// Used by metadata.rs from the next commit.
+#[allow(dead_code)]
+pub mod convert;
 pub mod error;
 pub mod fallback;
 
