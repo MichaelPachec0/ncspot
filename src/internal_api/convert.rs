@@ -60,19 +60,22 @@ pub fn release_date(date: &Date) -> String {
     )
 }
 
-/// Whether `restrictions` allow playback in `country`.
-pub fn is_playable(restrictions: &Restrictions, country: &str) -> bool {
-    restrictions.iter().all(|r| {
-        let forbidden = r
-            .countries_forbidden
-            .as_ref()
-            .is_some_and(|list| list.iter().any(|c| c == country));
-        let not_allowed = r
-            .countries_allowed
-            .as_ref()
-            .is_some_and(|list| !list.iter().any(|c| c == country));
-        !forbidden && !not_allowed
-    })
+/// Whether `restrictions` allow playback in `country` for a user of `catalogue` (librespot's
+/// `allowed_for_user`): only restrictions naming the catalogue count, the first one decides, and
+/// no matching restriction means playable.
+pub fn is_playable(restrictions: &Restrictions, country: &str, catalogue: &str) -> bool {
+    for r in restrictions
+        .iter()
+        .filter(|r| r.catalogue_strs.iter().any(|c| c == catalogue))
+    {
+        if let Some(allowed) = &r.countries_allowed {
+            return allowed.iter().any(|c| c == country);
+        }
+        if let Some(forbidden) = &r.countries_forbidden {
+            return !forbidden.iter().any(|c| c == country);
+        }
+    }
+    true
 }
 
 macro_rules! id_conv {
@@ -147,6 +150,7 @@ pub fn simplified_album(a: &librespot_metadata::Album) -> Result<SimplifiedAlbum
 pub fn full_track(
     t: &librespot_metadata::Track,
     country: &str,
+    catalogue: &str,
 ) -> Result<FullTrack, InternalError> {
     let id = track_id(&t.id)?;
     Ok(FullTrack {
@@ -164,7 +168,7 @@ pub fn full_track(
         external_urls: spotify_url("track", id.id()),
         href: Some(href("track", id.id())),
         is_local: false,
-        is_playable: Some(is_playable(&t.restrictions, country)),
+        is_playable: Some(is_playable(&t.restrictions, country, catalogue)),
         linked_from: None,
         restrictions: None,
         name: non_empty(&t.name)?,
@@ -179,8 +183,9 @@ pub fn full_track(
 pub fn simplified_track(
     t: &librespot_metadata::Track,
     country: &str,
+    catalogue: &str,
 ) -> Result<SimplifiedTrack, InternalError> {
-    let full = full_track(t, country)?;
+    let full = full_track(t, country, catalogue)?;
     Ok(SimplifiedTrack {
         album: Some(full.album),
         artists: full.artists,
@@ -472,7 +477,7 @@ mod tests {
 
     #[test]
     fn playable_follows_country_restrictions() {
-        let restricted = |allowed: Option<&str>, forbidden: Option<&str>| {
+        let restricted_for = |catalogue: &str, allowed: Option<&str>, forbidden: Option<&str>| {
             Track::try_from(&proto::Track {
                 restriction: vec![proto::Restriction {
                     country_restriction: allowed
@@ -482,6 +487,7 @@ mod tests {
                         .or(forbidden.map(|c| {
                             proto::restriction::Country_restriction::CountriesForbidden(c.into())
                         })),
+                    catalogue_str: vec![catalogue.into()],
                     ..Default::default()
                 }],
                 ..track_msg()
@@ -489,18 +495,44 @@ mod tests {
             .unwrap()
             .restrictions
         };
+        let restricted = |allowed, forbidden| restricted_for("premium", allowed, forbidden);
         let free = Track::try_from(&track_msg()).unwrap().restrictions;
-        assert!(is_playable(&free, "US"));
-        assert!(!is_playable(&restricted(None, Some("USGB")), "US"));
-        assert!(is_playable(&restricted(None, Some("GB")), "US"));
-        assert!(!is_playable(&restricted(Some("GB"), None), "US"));
-        assert!(is_playable(&restricted(Some("GBUS"), None), "US"));
+        assert!(is_playable(&free, "US", "premium"));
+        assert!(!is_playable(
+            &restricted(None, Some("USGB")),
+            "US",
+            "premium"
+        ));
+        assert!(is_playable(&restricted(None, Some("GB")), "US", "premium"));
+        assert!(!is_playable(&restricted(Some("GB"), None), "US", "premium"));
+        assert!(is_playable(
+            &restricted(Some("GBUS"), None),
+            "US",
+            "premium"
+        ));
+        // A restriction for another catalogue is ignored.
+        let other = restricted_for("free", Some("GB"), None);
+        assert!(is_playable(&other, "US", "premium"));
+        assert!(!is_playable(&other, "US", "free"));
+        // Live data: no catalogue and an empty allowed list is ignored.
+        let live = Track::try_from(&proto::Track {
+            restriction: vec![proto::Restriction {
+                country_restriction: Some(
+                    proto::restriction::Country_restriction::CountriesAllowed(String::new()),
+                ),
+                ..Default::default()
+            }],
+            ..track_msg()
+        })
+        .unwrap()
+        .restrictions;
+        assert!(is_playable(&live, "US", "premium"));
     }
 
     #[test]
     fn full_track_copies_the_fields_ncspot_reads() {
         let track = Track::try_from(&track_msg()).unwrap();
-        let ft = full_track(&track, "US").unwrap();
+        let ft = full_track(&track, "US", "premium").unwrap();
         assert_eq!(ft.name, "Song");
         assert_eq!(ft.track_number, 4);
         assert_eq!(ft.disc_number, 1);
@@ -521,7 +553,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            full_track(&track, "US").unwrap_err(),
+            full_track(&track, "US", "premium").unwrap_err(),
             InternalError::NotFound
         );
     }

@@ -57,11 +57,51 @@ async fn get_one<T: Kind>(session: &Session, uri: &SpotifyUri) -> Result<T, Inte
     T::get(session, uri).await.map_err(|e| classify(&e))
 }
 
-/// Every item of `uris`, in request order. Any missing item fails the call with `NotFound`, so
-/// a page is never shorter than its window (callers page by `offset + items.len()`).
+/// What `get_many` does with an entity the response lacks or marks with an error status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Missing {
+    /// Fail the call with `NotFound`.
+    Fail,
+    /// Drop the entity (the result is shorter than the request).
+    Skip,
+}
+
+/// The payloads of `chunk` in request order. `found` maps a uri to its status code and payload
+/// (`None` when the response carried no data). A uri may appear twice in `chunk`.
+fn pick_in_order<'a>(
+    chunk: &'a [SpotifyUri],
+    found: &'a HashMap<String, (i32, Option<Vec<u8>>)>,
+    missing: Missing,
+) -> Result<Vec<(&'a SpotifyUri, &'a [u8])>, InternalError> {
+    let mut out = Vec::with_capacity(chunk.len());
+    for u in chunk {
+        // get, not remove: a uri may appear twice in one request.
+        match found.get(&u.to_uri()) {
+            Some((status, Some(bytes))) if *status == 0 || *status == 200 => {
+                out.push((u, bytes.as_slice()));
+            }
+            other => {
+                let status = other.map(|(s, _)| *s);
+                debug!(
+                    "internal metadata: {} missing, status {status:?}",
+                    u.to_uri()
+                );
+                if missing == Missing::Fail {
+                    return Err(InternalError::NotFound);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The items of `uris`, in request order. With `Missing::Fail` any missing item fails the call
+/// with `NotFound`, so a page is never shorter than its window; with `Missing::Skip` it is
+/// dropped.
 async fn get_many<T: Kind>(
     session: &Session,
     uris: &[SpotifyUri],
+    missing: Missing,
 ) -> Result<Vec<T>, InternalError> {
     let mut out = Vec::with_capacity(uris.len());
     for chunk in uris.chunks(BATCH_SIZE) {
@@ -85,34 +125,28 @@ async fn get_many<T: Kind>(
             .get_extended_metadata(request)
             .await
             .map_err(|e| classify(&e))?;
-        let mut by_uri: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut found: HashMap<String, (i32, Option<Vec<u8>>)> = HashMap::new();
         for array in response.extended_metadata {
             for data in array.extension_data {
                 let status = data.header.status_code;
-                if status != 0 && status != 200 {
-                    debug!("internal metadata: {} status {status}", data.entity_uri);
-                    return Err(InternalError::NotFound);
-                }
-                if let Some(any) = data.extension_data.into_option() {
-                    by_uri.insert(data.entity_uri, any.value);
-                }
+                let bytes = data.extension_data.into_option().map(|any| any.value);
+                found.insert(data.entity_uri, (status, bytes));
             }
         }
-        for u in chunk {
-            // get, not remove: a uri may appear twice in one request.
-            let Some(bytes) = by_uri.get(&u.to_uri()) else {
-                debug!(
-                    "internal metadata: {} missing from the response",
-                    u.to_uri()
-                );
-                return Err(InternalError::NotFound);
-            };
+        for (u, bytes) in pick_in_order(chunk, &found, missing)? {
             let msg = <T as Metadata>::Message::parse_from_bytes(bytes)
                 .map_err(|e| InternalError::ProtocolChanged(format!("{} parse: {e}", T::NAME)))?;
             out.push(T::parse(&msg, u).map_err(|e| classify(&e))?);
         }
     }
     Ok(out)
+}
+
+/// The user's catalogue as librespot reads it, "premium" when the session has none.
+fn catalogue(session: &Session) -> String {
+    session
+        .get_user_attribute("catalogue")
+        .unwrap_or_else(|| "premium".to_string())
 }
 
 /// The items of `items` from `offset`, at most `limit` of them; empty past the end.
@@ -124,7 +158,7 @@ pub fn window<T: Clone>(items: &[T], offset: usize, limit: usize) -> Vec<T> {
 
 pub async fn track(session: Session, id: String) -> Result<FullTrack, InternalError> {
     let t: Track = get_one(&session, &uri("track", &id)?).await?;
-    convert::full_track(&t, &session.country())
+    convert::full_track(&t, &session.country(), &catalogue(&session))
 }
 
 async fn simplified_tracks(
@@ -132,10 +166,13 @@ async fn simplified_tracks(
     uris: &[SpotifyUri],
 ) -> Result<Vec<SimplifiedTrack>, InternalError> {
     let country = session.country();
-    get_many::<Track>(session, uris)
+    let catalogue = catalogue(session);
+    // Fail: Album::load_all_tracks pages by offset + items.len(), so a short page would
+    // duplicate or loop.
+    get_many::<Track>(session, uris, Missing::Fail)
         .await?
         .iter()
-        .map(|t| convert::simplified_track(t, &country))
+        .map(|t| convert::simplified_track(t, &country, &catalogue))
         .collect()
 }
 
@@ -200,7 +237,8 @@ pub async fn albums_by_uri(
     session: Session,
     uris: Vec<SpotifyUri>,
 ) -> Result<Vec<SimplifiedAlbum>, InternalError> {
-    get_many::<Album>(&session, &uris)
+    // Skip: callers advance by the requested limit, so a short page is fine.
+    get_many::<Album>(&session, &uris, Missing::Skip)
         .await?
         .iter()
         .map(convert::simplified_album)
@@ -213,11 +251,13 @@ pub async fn artist_top_tracks(
 ) -> Result<Vec<FullTrack>, InternalError> {
     let a: Artist = get_one(&session, &uri("artist", &id)?).await?;
     let country = session.country();
+    let catalogue = catalogue(&session);
     let ids: Vec<SpotifyUri> = a.top_tracks.for_country(&country).0;
-    get_many::<Track>(&session, &ids)
+    // Skip: top tracks are not paged, so a dropped track is harmless.
+    get_many::<Track>(&session, &ids, Missing::Skip)
         .await?
         .iter()
-        .map(|t| convert::full_track(t, &country))
+        .map(|t| convert::full_track(t, &country, &catalogue))
         .collect()
 }
 
@@ -240,7 +280,9 @@ pub async fn episodes_by_uri(
     session: Session,
     uris: Vec<SpotifyUri>,
 ) -> Result<Vec<SimplifiedEpisode>, InternalError> {
-    get_many::<Episode>(&session, &uris)
+    // Skip: callers advance by the requested limit, so a short page is fine (and one pulled
+    // episode must not hide a whole show).
+    get_many::<Episode>(&session, &uris, Missing::Skip)
         .await?
         .iter()
         .map(convert::simplified_episode)
@@ -314,6 +356,63 @@ mod tests {
     use super::*;
     use rspotify::model::AlbumType;
     use rspotify::prelude::Id;
+
+    fn uris(ids: &[&str]) -> Vec<SpotifyUri> {
+        ids.iter()
+            .map(|i| SpotifyUri::from_uri(&format!("spotify:track:{i}")).unwrap())
+            .collect()
+    }
+
+    fn found(entries: &[(&str, i32, Option<&[u8]>)]) -> HashMap<String, (i32, Option<Vec<u8>>)> {
+        entries
+            .iter()
+            .map(|(i, st, b)| (format!("spotify:track:{i}"), (*st, b.map(<[u8]>::to_vec))))
+            .collect()
+    }
+
+    const A: &str = "4uLU6hMCjMI75M1A2tKUQC";
+    const B: &str = "0OdUWJ0sBjDrqHygGUXeCF";
+    const C: &str = "4rOoJ6Egrf8K2IrywzwOMk";
+
+    #[test]
+    fn pick_keeps_request_order_and_duplicates() {
+        let chunk = uris(&[B, A, B]);
+        let f = found(&[(A, 200, Some(b"a")), (B, 0, Some(b"b"))]);
+        for m in [Missing::Fail, Missing::Skip] {
+            let got: Vec<&[u8]> = pick_in_order(&chunk, &f, m)
+                .unwrap()
+                .into_iter()
+                .map(|(_, b)| b)
+                .collect();
+            assert_eq!(got, vec![&b"b"[..], b"a", b"b"]);
+        }
+    }
+
+    #[test]
+    fn pick_missing_entity() {
+        let chunk = uris(&[A, C, B]);
+        let f = found(&[(A, 200, Some(b"a")), (B, 200, Some(b"b"))]);
+        assert_eq!(
+            pick_in_order(&chunk, &f, Missing::Fail).unwrap_err(),
+            InternalError::NotFound
+        );
+        let got = pick_in_order(&chunk, &f, Missing::Skip).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].1, b"b");
+    }
+
+    #[test]
+    fn pick_bad_status_or_no_data() {
+        let chunk = uris(&[A, B, C]);
+        let f = found(&[(A, 451, None), (B, 200, None), (C, 200, Some(b"c"))]);
+        assert_eq!(
+            pick_in_order(&chunk, &f, Missing::Fail).unwrap_err(),
+            InternalError::NotFound
+        );
+        let got = pick_in_order(&chunk, &f, Missing::Skip).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, b"c");
+    }
 
     #[test]
     fn window_clamps() {

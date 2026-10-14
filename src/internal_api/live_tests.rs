@@ -9,7 +9,7 @@ use crate::authentication::SPOTIFY_CLIENT_ID;
 /// track's own album, so no album id needs maintaining.
 const TRACK: &str = "4uLU6hMCjMI75M1A2tKUQC";
 const ARTIST: &str = "0OdUWJ0sBjDrqHygGUXeCF";
-const SHOW: &str = "0ofXAdFIQQRsCYj9754UFx";
+const SHOW: &str = "4rOoJ6Egrf8K2IrywzwOMk";
 
 fn with_session<T>(f: impl FnOnce(&tokio::runtime::Runtime, Session) -> T) -> T {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -62,6 +62,10 @@ fn track_album_artist_show_load() {
             "album tracks: {}, is_playable == Some(false): {album_unplayable}",
             a.tracks.items.len()
         );
+        assert!(
+            a.tracks.items.iter().any(|t| t.is_playable == Some(true)),
+            "no album track is playable"
+        );
         let page = rt
             .block_on(metadata::album_tracks(s.clone(), album_id, 2, 1))
             .unwrap();
@@ -95,14 +99,17 @@ fn show_episode_order_is_newest_first() {
         let ids = rt
             .block_on(metadata::show_episode_ids(s.clone(), SHOW.into()))
             .unwrap();
+        // Some ids may be pulled episodes (dropped by episodes_by_uri), so look at a window.
         let eps = rt
             .block_on(metadata::episodes_by_uri(
                 s,
-                ids[..2.min(ids.len())].to_vec(),
+                ids[..5.min(ids.len())].to_vec(),
             ))
             .unwrap();
+        assert!(eps.len() >= 2, "fewer than two episodes loaded");
         assert!(
-            eps.len() == 2 && eps[0].release_date >= eps[1].release_date,
+            eps.windows(2)
+                .all(|w| w[0].release_date >= w[1].release_date),
             "librespot returned episodes oldest first: reverse in show_episode_ids"
         );
     });
