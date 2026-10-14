@@ -1,5 +1,5 @@
-//! Metadata from the internal API: single items through librespot-metadata, lists through
-//! batched extended-metadata requests (one request per 100 ids).
+//! Metadata from the internal API through batched extended-metadata requests (one request per
+//! 100 ids; a single item is a batch of one), parsed with librespot-metadata.
 
 use std::collections::HashMap;
 
@@ -52,9 +52,23 @@ fn uri(kind: &str, id: &str) -> Result<SpotifyUri, InternalError> {
     SpotifyUri::from_uri(&format!("spotify:{kind}:{id}")).map_err(|_| InternalError::NotFound)
 }
 
-async fn get_one<T: Kind>(session: &Session, uri: &SpotifyUri) -> Result<T, InternalError> {
+/// The raw message of one entity, through the batch path. librespot's single-item
+/// `get_metadata` reports an entity without data (a per-entity 404 or 451) as
+/// `FailedPrecondition`, which would latch the area; here it is `NotFound`.
+async fn get_one_bytes<T: Kind>(
+    session: &Session,
+    uri: &SpotifyUri,
+) -> Result<Vec<u8>, InternalError> {
     debug!("internal metadata: {} {}", T::NAME, uri.to_id());
-    T::get(session, uri).await.map_err(|e| classify(&e))
+    let found = fetch_chunk(session, T::KIND, std::slice::from_ref(uri)).await?;
+    pick_one(uri, &found).map(<[u8]>::to_vec)
+}
+
+async fn get_one<T: Kind>(session: &Session, uri: &SpotifyUri) -> Result<T, InternalError> {
+    let bytes = get_one_bytes::<T>(session, uri).await?;
+    let msg = <T as Metadata>::Message::parse_from_bytes(&bytes)
+        .map_err(|e| InternalError::ProtocolChanged(format!("{} parse: {e}", T::NAME)))?;
+    T::parse(&msg, uri).map_err(|e| classify(&e))
 }
 
 /// What `get_many` does with an entity the response lacks or marks with an error status.
@@ -95,6 +109,55 @@ fn pick_in_order<'a>(
     Ok(out)
 }
 
+/// The payload of the single entity `uri` in `found`; `NotFound` when it is missing, has no
+/// data or carries an error status.
+fn pick_one<'a>(
+    uri: &'a SpotifyUri,
+    found: &'a HashMap<String, (i32, Option<Vec<u8>>)>,
+) -> Result<&'a [u8], InternalError> {
+    pick_in_order(std::slice::from_ref(uri), found, Missing::Fail)?
+        .pop()
+        .map(|(_, bytes)| bytes)
+        .ok_or(InternalError::NotFound)
+}
+
+/// One extended-metadata request for `chunk` (at most [BATCH_SIZE] ids): each returned uri
+/// with its status code and payload (`None` when the response carried no data).
+async fn fetch_chunk(
+    session: &Session,
+    kind: ExtensionKind,
+    chunk: &[SpotifyUri],
+) -> Result<HashMap<String, (i32, Option<Vec<u8>>)>, InternalError> {
+    let request = BatchedEntityRequest {
+        entity_request: chunk
+            .iter()
+            .map(|u| EntityRequest {
+                entity_uri: u.to_uri(),
+                query: vec![ExtensionQuery {
+                    extension_kind: EnumOrUnknown::new(kind),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let response = session
+        .spclient()
+        .get_extended_metadata(request)
+        .await
+        .map_err(|e| classify(&e))?;
+    let mut found = HashMap::new();
+    for array in response.extended_metadata {
+        for data in array.extension_data {
+            let status = data.header.status_code;
+            let bytes = data.extension_data.into_option().map(|any| any.value);
+            found.insert(data.entity_uri, (status, bytes));
+        }
+    }
+    Ok(found)
+}
+
 /// The items of `uris`, in request order. With `Missing::Fail` any missing item fails the call
 /// with `NotFound`, so a page is never shorter than its window; with `Missing::Skip` it is
 /// dropped.
@@ -106,33 +169,7 @@ async fn get_many<T: Kind>(
     let mut out = Vec::with_capacity(uris.len());
     for chunk in uris.chunks(BATCH_SIZE) {
         debug!("internal metadata: {} {}s", chunk.len(), T::NAME);
-        let request = BatchedEntityRequest {
-            entity_request: chunk
-                .iter()
-                .map(|u| EntityRequest {
-                    entity_uri: u.to_uri(),
-                    query: vec![ExtensionQuery {
-                        extension_kind: EnumOrUnknown::new(T::KIND),
-                        ..Default::default()
-                    }],
-                    ..Default::default()
-                })
-                .collect(),
-            ..Default::default()
-        };
-        let response = session
-            .spclient()
-            .get_extended_metadata(request)
-            .await
-            .map_err(|e| classify(&e))?;
-        let mut found: HashMap<String, (i32, Option<Vec<u8>>)> = HashMap::new();
-        for array in response.extended_metadata {
-            for data in array.extension_data {
-                let status = data.header.status_code;
-                let bytes = data.extension_data.into_option().map(|any| any.value);
-                found.insert(data.entity_uri, (status, bytes));
-            }
-        }
+        let found = fetch_chunk(session, T::KIND, chunk).await?;
         for (u, bytes) in pick_in_order(chunk, &found, missing)? {
             let msg = <T as Metadata>::Message::parse_from_bytes(bytes)
                 .map_err(|e| InternalError::ProtocolChanged(format!("{} parse: {e}", T::NAME)))?;
@@ -299,11 +336,8 @@ pub fn show_uri_of(msg: &librespot_protocol::metadata::Episode) -> Option<Spotif
 
 pub async fn episode(session: Session, id: String) -> Result<FullEpisode, InternalError> {
     let u = uri("episode", &id)?;
-    debug!("internal metadata: episode {id}");
     // librespot-metadata's Episode drops the show id, so parse the message here once.
-    let bytes = <Episode as Metadata>::request(&session, &u)
-        .await
-        .map_err(|e| classify(&e))?;
+    let bytes = get_one_bytes::<Episode>(&session, &u).await?;
     let msg = librespot_protocol::metadata::Episode::parse_from_bytes(&bytes)
         .map_err(|e| InternalError::ProtocolChanged(format!("episode parse: {e}")))?;
     let e = Episode::parse(&msg, &u).map_err(|e| classify(&e))?;
@@ -412,6 +446,21 @@ mod tests {
         let got = pick_in_order(&chunk, &f, Missing::Skip).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].1, b"c");
+    }
+
+    #[test]
+    fn pick_one_without_data_or_with_451_is_not_found() {
+        let a = &uris(&[A])[0];
+        for f in [
+            found(&[(A, 451, None)]),
+            found(&[(A, 451, Some(b"a"))]),
+            found(&[(A, 200, None)]),
+            found(&[(A, 404, None)]),
+            found(&[]),
+        ] {
+            assert_eq!(pick_one(a, &f).unwrap_err(), InternalError::NotFound);
+        }
+        assert_eq!(pick_one(a, &found(&[(A, 200, Some(b"a"))])), Ok(&b"a"[..]));
     }
 
     #[test]

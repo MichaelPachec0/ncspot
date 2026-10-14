@@ -10,6 +10,8 @@ use crate::authentication::SPOTIFY_CLIENT_ID;
 const TRACK: &str = "4uLU6hMCjMI75M1A2tKUQC";
 const ARTIST: &str = "0OdUWJ0sBjDrqHygGUXeCF";
 const SHOW: &str = "4rOoJ6Egrf8K2IrywzwOMk";
+/// An episode Spotify pulled (status 451 on the batch path).
+const REMOVED_EPISODE: &str = "1N7Aaa9lBYZ7BjTuTJKMxv";
 
 fn with_session<T>(f: impl FnOnce(&tokio::runtime::Runtime, Session) -> T) -> T {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -112,5 +114,19 @@ fn show_episode_order_is_newest_first() {
                 .all(|w| w[0].release_date >= w[1].release_date),
             "librespot returned episodes oldest first: reverse in show_episode_ids"
         );
+    });
+}
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn removed_episode_is_not_found_and_does_not_latch() {
+    use super::error::InternalError;
+    use super::fallback::{Action, decide_after};
+    with_session(|rt, s| {
+        let err = rt
+            .block_on(metadata::episode(s, REMOVED_EPISODE.into()))
+            .unwrap_err();
+        assert_eq!(err, InternalError::NotFound);
+        assert_eq!(decide_after(&err), Action::WebOnce);
     });
 }
