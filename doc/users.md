@@ -347,6 +347,8 @@ Possible configuration values are:
 | `[jukebox]`                     | Eternal Jukebox settings                                       | See [jukebox settings](#jukebox-settings)                                             |                     |
 | `ap_port`                       | Set ap-port for librespot (for restrictive firewalls)          | `80`, `443`, `4070`                                                                   |                     |
 | `client_id`                     | Personal Spotify Web API client ID                             | 32 hex characters, see [personal client ID](#personal-web-api-client-id)              |                     |
+| `internal_api`                  | Use Spotify's internal API for metadata, Web API as fallback   | `true`, `false`                                                                       | `true`              |
+| `internal_api_areas.metadata`   | Use the internal API for tracks, albums, artists and shows     | `true`, `false`                                                                       | `true`              |
 
 1. If built with the `cover` feature.
 2. By default the statusbar will show a play icon when a track is playing and
@@ -451,6 +453,25 @@ working: search, recommendations, an artist's top tracks and related
 artists, browse categories, and Spotify-owned playlists such as Discover
 Weekly. Development Mode apps are also limited to 5 users, and the app owner
 needs Premium.
+
+### Internal API
+
+ncspot can load metadata (tracks, albums, artists, shows, episodes and your
+profile) through Spotify's internal API, the one the official desktop client
+uses, over the same connection it uses for playback. These requests do not
+count against the Web API client ID's rate limit.
+
+- `internal_api = false` turns it off: every request uses the Web API as
+  before.
+- `[internal_api_areas]` turns single areas off, for example
+  `metadata = false`.
+- If Spotify changes the internal API, ncspot shows "Spotify internal API
+  changed, using the Web API for ..." once and uses the Web API for that area
+  until it restarts. Rate limits on the internal API show as `internal API`
+  in the status bar.
+
+The internal API is undocumented and not covered by Spotify's developer
+terms. Use it at your own risk. It needs Spotify Premium, like playback.
 
 ### Proxy
 

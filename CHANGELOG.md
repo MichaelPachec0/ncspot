@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows when they are unchanged, instead of downloading them again on every
   update. Each list is still downloaded in full once a day so cached details
   stay current
+- Load metadata (tracks, albums, artists, shows, episodes, top tracks and the
+  user profile) through Spotify's internal API, with the Web API as fallback;
+  `internal_api` and `[internal_api_areas]` switch it off
 
 ### Fixed
 
