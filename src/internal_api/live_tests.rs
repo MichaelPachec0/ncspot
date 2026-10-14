@@ -89,7 +89,6 @@ fn track_album_artist_show_load() {
         let show = rt.block_on(metadata::show(s.clone(), SHOW.into())).unwrap();
         assert!(!show.episodes.items.is_empty());
         let user = rt.block_on(metadata::current_user(s)).unwrap();
-        eprintln!("user.id: {}", user.id);
         assert!(!user.id.to_string().is_empty());
     });
 }
