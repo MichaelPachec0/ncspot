@@ -91,6 +91,8 @@ pub fn is_ui_thread() -> bool {
 pub enum ClientLabel {
     Shared,
     Personal,
+    /// Spotify's internal API over the librespot session (per account, no app quota).
+    Internal,
 }
 
 impl fmt::Display for ClientLabel {
@@ -98,6 +100,7 @@ impl fmt::Display for ClientLabel {
         match self {
             Self::Shared => write!(f, "shared"),
             Self::Personal => write!(f, "personal"),
+            Self::Internal => write!(f, "internal API"),
         }
     }
 }
@@ -195,10 +198,11 @@ pub fn format_status_segment(status: &[(ClientLabel, Duration)]) -> String {
 /// Body text of the rate-limit desktop notification.
 #[cfg_attr(not(feature = "notify"), allow(dead_code))]
 pub fn notification_body(client: ClientLabel, retry_after: Duration) -> String {
-    format!(
-        "{client} client ID, retrying in {}s",
-        ceil_secs(retry_after)
-    )
+    let secs = ceil_secs(retry_after);
+    match client {
+        ClientLabel::Internal => format!("{client}, retrying in {secs}s"),
+        _ => format!("{client} client ID, retrying in {secs}s"),
+    }
 }
 
 /// ID of the last warning notification (rate limit, personal client disabled), so a new one
@@ -322,6 +326,19 @@ mod test {
 
     const SECS: fn(u64) -> Duration = Duration::from_secs;
     const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn internal_label_is_named_without_client_id() {
+        assert_eq!(ClientLabel::Internal.to_string(), "internal API");
+        assert_eq!(
+            notification_body(ClientLabel::Internal, SECS(5)),
+            "internal API, retrying in 5s"
+        );
+        assert_eq!(
+            format_status_segment(&[(ClientLabel::Internal, SECS(5))]),
+            "[rate limited: internal API 5s] "
+        );
+    }
 
     #[test]
     fn a_huge_retry_after_is_capped_and_does_not_panic() {

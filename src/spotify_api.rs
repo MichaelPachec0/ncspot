@@ -225,6 +225,9 @@ impl WebApi {
                 ClientLabel::Personal => {
                     crate::authentication::refresh_rspotify_token(&client_id, force)
                 }
+                ClientLabel::Internal => {
+                    unreachable!("the internal API has no Web API token")
+                }
             };
             match result {
                 Ok(token) => {

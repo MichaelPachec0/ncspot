@@ -409,8 +409,12 @@ impl Application {
                         client,
                         retry_after,
                     } => {
+                        let label_text = match client {
+                            crate::rate_limit::ClientLabel::Internal => client.to_string(),
+                            _ => format!("{client} client ID"),
+                        };
                         info!(
-                            "{client} client ID is rate limited for {}s",
+                            "{label_text} is rate limited for {}s",
                             retry_after.as_secs()
                         );
                         #[cfg(feature = "notify")]
@@ -424,6 +428,14 @@ impl Application {
                                 crate::rate_limit::send_rate_limit_notification(client, retry_after)
                             });
                         }
+                    }
+                    Event::InternalApiFallback { area, reason } => {
+                        let message = format!(
+                            "Spotify internal API changed, using the Web API for {area}: {reason}"
+                        );
+                        warn!("{message}");
+                        self.cursive
+                            .on_layout(|_, mut layout| layout.set_result(Err(message)));
                     }
                     Event::PersonalClientDisabled { reason } => {
                         let message = format!(

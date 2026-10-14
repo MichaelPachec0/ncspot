@@ -24,6 +24,12 @@ pub enum Event {
     PersonalClientDisabled {
         reason: String,
     },
+    /// An internal API area hit a protocol change and uses the Web API for the rest of the
+    /// session.
+    InternalApiFallback {
+        area: &'static str,
+        reason: String,
+    },
 }
 
 /// Manager that can be used to send and receive messages across threads.
