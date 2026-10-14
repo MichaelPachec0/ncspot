@@ -6,8 +6,6 @@ pub mod bridge;
 pub mod convert;
 pub mod error;
 pub mod fallback;
-// WebApi calls these from the next commit (Task 8).
-#[allow(dead_code)]
 pub mod metadata;
 
 use std::cell::RefCell;
@@ -73,8 +71,6 @@ impl Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Area {
     /// Tracks, albums, artists, shows, episodes and the current user.
-    // Task 8 constructs this in the metadata methods of WebApi.
-    #[allow(dead_code)]
     Metadata,
 }
 
@@ -119,12 +115,6 @@ impl InternalApi {
             .unwrap()
             .clone()
             .filter(|session| !session.is_invalid())
-    }
-
-    // No caller yet; kept as the read accessor for the resolved switches.
-    #[allow(dead_code)]
-    pub fn settings(&self) -> Settings {
-        self.settings
     }
 
     fn latch_flag(&self, area: Area) -> &AtomicBool {

@@ -1,19 +1,19 @@
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use librespot_core::Session;
+use librespot_core::{Session, SpotifyUri};
 use log::{debug, error, info, warn};
 use rspotify::http::HttpError;
 use rspotify::model::{
     AlbumId, AlbumType, ArtistId, CursorBasedPage, EpisodeId, FullAlbum, FullArtist, FullEpisode,
     FullPlaylist, FullShow, FullTrack, ItemPositions, LibraryId, Market, Page, PlayableId,
     PlaylistId, PlaylistResult, PrivateUser, Recommendations, SavedAlbum, SavedTrack, SearchResult,
-    SearchType, Show, ShowId, SimplifiedTrack, TrackId, UserId,
+    SearchType, Show, ShowId, SimplifiedAlbum, SimplifiedEpisode, SimplifiedTrack, TrackId, UserId,
 };
 use rspotify::{AuthCodeSpotify, ClientError, ClientResult, Config, prelude::*};
 use tokio::sync::mpsc;
@@ -22,7 +22,7 @@ use tokio::task::JoinHandle;
 use crate::authentication::DEFAULT_WEB_API_CLIENT_ID;
 use crate::events::{Event, EventManager};
 use crate::internal_api::error::InternalError;
-use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, run_attempts};
+use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
 use crate::model::category::Category;
@@ -169,8 +169,6 @@ impl WebApi {
 
     /// Run one call through the internal API for `area`, falling back to `web` per the rules in
     /// [fallback::run_with_fallback]. `internal` builds the future from a connected session.
-    // Task 8 routes the metadata methods through this; until then only tests call it.
-    #[allow(dead_code)]
     fn with_fallback<T, F, Fut>(
         &self,
         area: Area,
@@ -666,17 +664,29 @@ impl WebApi {
     pub fn album(&self, album_id: &str) -> Result<FullAlbum, ()> {
         debug!("fetching album {album_id}");
         let aid = AlbumId::from_id(album_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.album(aid.clone(), Some(Market::FromToken))
-        })
+        let id = album_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::album(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.album(aid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
     /// Fetch the artist with the given `artist_id`.
     pub fn artist(&self, artist_id: &str) -> Result<FullArtist, ()> {
         let aid = ArtistId::from_id(artist_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| api.artist(aid.clone()))
-            .ok_or(())
+        let id = artist_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::artist(session, id.clone()),
+            || self.api_with_retry(Route::Bulk, |api| api.artist(aid.clone())),
+        )
+        .ok_or(())
     }
 
     /// Fetch the playlist with the given `playlist_id`.
@@ -691,27 +701,48 @@ impl WebApi {
     /// Fetch the track with the given `track_id`.
     pub fn track(&self, track_id: &str) -> Result<FullTrack, ()> {
         let tid = TrackId::from_id(track_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.track(tid.clone(), Some(Market::FromToken))
-        })
+        let id = track_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::track(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.track(tid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
     /// Fetch the show with the given `show_id`.
     pub fn show(&self, show_id: &str) -> Result<FullShow, ()> {
         let sid = ShowId::from_id(show_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.get_a_show(sid.clone(), Some(Market::FromToken))
-        })
+        let id = show_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::show(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.get_a_show(sid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
     /// Fetch the episode with the given `episode_id`.
     pub fn episode(&self, episode_id: &str) -> Result<FullEpisode, ()> {
         let eid = EpisodeId::from_id(episode_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.get_an_episode(eid.clone(), Some(Market::FromToken))
-        })
+        let id = episode_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::episode(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.get_an_episode(eid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
@@ -849,14 +880,21 @@ impl WebApi {
         offset: u32,
     ) -> Result<Page<SimplifiedTrack>, ()> {
         debug!("fetching album tracks {album_id}");
-        self.api_with_retry(Route::Bulk, |api| {
-            api.album_track_manual(
-                AlbumId::from_id(album_id).unwrap(),
-                Some(Market::FromToken),
-                Some(limit),
-                Some(offset),
-            )
-        })
+        let id = album_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::album_tracks(session, id.clone(), limit, offset),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.album_track_manual(
+                        AlbumId::from_id(album_id).unwrap(),
+                        Some(Market::FromToken),
+                        Some(limit),
+                        Some(offset),
+                    )
+                })
+            },
+        )
         .ok_or(())
     }
 
@@ -870,29 +908,62 @@ impl WebApi {
         const MAX_SIZE: u32 = 50;
         let spotify = self.clone();
         let artist_id = artist_id.to_string();
+        // Album ids of the artist, fetched once from the internal API and paged locally.
+        let ids: Arc<Mutex<Option<Vec<SpotifyUri>>>> = Default::default();
         let fetch_page = move |offset: u32| {
             debug!("fetching artist {artist_id} albums, offset: {offset}");
-            spotify.api_with_retry(Route::Bulk, |api| {
-                match api.artist_albums_manual(
-                    ArtistId::from_id(&artist_id).unwrap(),
-                    album_type.as_ref().copied(),
-                    Some(Market::FromToken),
-                    Some(MAX_SIZE),
-                    Some(offset),
-                ) {
-                    Ok(page) => {
-                        let mut albums: Vec<Album> =
-                            page.items.iter().map(|sa| sa.into()).collect();
-                        albums.sort_by(|a, b| b.year.cmp(&a.year));
-                        Ok(ApiPage {
-                            offset: page.offset,
-                            total: page.total,
-                            items: albums,
-                        })
-                    }
-                    Err(e) => Err(e),
+            let to_page = |items: Vec<SimplifiedAlbum>, total: u32| {
+                let mut albums: Vec<Album> = items.iter().map(|sa| sa.into()).collect();
+                albums.sort_by(|a, b| b.year.cmp(&a.year));
+                ApiPage {
+                    offset,
+                    total,
+                    items: albums,
                 }
-            })
+            };
+            let (artist, ids_cache) = (artist_id.clone(), ids.clone());
+            spotify
+                .with_fallback(
+                    Area::Metadata,
+                    move |session| {
+                        let (artist, ids_cache) = (artist.clone(), ids_cache.clone());
+                        async move {
+                            // Clone out of the lock so no guard is held across an await.
+                            let cached = ids_cache.lock().unwrap().clone();
+                            let all = match cached {
+                                Some(all) => all,
+                                None => {
+                                    let all = metadata::artist_album_ids(
+                                        session.clone(),
+                                        artist,
+                                        album_type,
+                                    )
+                                    .await?;
+                                    *ids_cache.lock().unwrap() = Some(all.clone());
+                                    all
+                                }
+                            };
+                            let page_ids =
+                                metadata::window(&all, offset as usize, MAX_SIZE as usize);
+                            let items = metadata::albums_by_uri(session, page_ids).await?;
+                            Ok((items, all.len() as u32))
+                        }
+                    },
+                    || {
+                        spotify
+                            .api_with_retry(Route::Bulk, |api| {
+                                api.artist_albums_manual(
+                                    ArtistId::from_id(&artist_id).unwrap(),
+                                    album_type.as_ref().copied(),
+                                    Some(Market::FromToken),
+                                    Some(MAX_SIZE),
+                                    Some(offset),
+                                )
+                            })
+                            .map(|page| (page.items, page.total))
+                    },
+                )
+                .map(|(items, total)| to_page(items, total))
         };
 
         ApiResult::new(MAX_SIZE, Arc::new(fetch_page))
@@ -903,23 +974,53 @@ impl WebApi {
         const MAX_SIZE: u32 = 50;
         let spotify = self.clone();
         let show_id = show_id.to_string();
+        // Episode ids of the show, fetched once from the internal API and paged locally.
+        let ids: Arc<Mutex<Option<Vec<SpotifyUri>>>> = Default::default();
         let fetch_page = move |offset: u32| {
             debug!("fetching show {} episodes, offset: {}", show_id, offset);
-            spotify.api_with_retry(Route::Bulk, |api| {
-                match api.get_shows_episodes_manual(
-                    ShowId::from_id(&show_id).unwrap(),
-                    Some(Market::FromToken),
-                    Some(50),
-                    Some(offset),
-                ) {
-                    Ok(page) => Ok(ApiPage {
-                        offset: page.offset,
-                        total: page.total,
-                        items: page.items.iter().map(|se| se.into()).collect(),
-                    }),
-                    Err(e) => Err(e),
-                }
-            })
+            let to_page = |items: Vec<SimplifiedEpisode>, total: u32| ApiPage {
+                offset,
+                total,
+                items: items.iter().map(|se| se.into()).collect(),
+            };
+            let (show, ids_cache) = (show_id.clone(), ids.clone());
+            spotify
+                .with_fallback(
+                    Area::Metadata,
+                    move |session| {
+                        let (show, ids_cache) = (show.clone(), ids_cache.clone());
+                        async move {
+                            // Clone out of the lock so no guard is held across an await.
+                            let cached = ids_cache.lock().unwrap().clone();
+                            let all = match cached {
+                                Some(all) => all,
+                                None => {
+                                    let all =
+                                        metadata::show_episode_ids(session.clone(), show).await?;
+                                    *ids_cache.lock().unwrap() = Some(all.clone());
+                                    all
+                                }
+                            };
+                            let page_ids =
+                                metadata::window(&all, offset as usize, MAX_SIZE as usize);
+                            let items = metadata::episodes_by_uri(session, page_ids).await?;
+                            Ok((items, all.len() as u32))
+                        }
+                    },
+                    || {
+                        spotify
+                            .api_with_retry(Route::Bulk, |api| {
+                                api.get_shows_episodes_manual(
+                                    ShowId::from_id(&show_id).unwrap(),
+                                    Some(Market::FromToken),
+                                    Some(50),
+                                    Some(offset),
+                                )
+                            })
+                            .map(|page| (page.items, page.total))
+                    },
+                )
+                .map(|(items, total)| to_page(items, total))
         };
 
         ApiResult::new(MAX_SIZE, Arc::new(fetch_page))
@@ -1067,10 +1168,17 @@ impl WebApi {
 
     /// Get the top tracks of the artist with the given `id`.
     pub fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ()> {
+        let artist = id.to_string();
         #[allow(deprecated)]
-        self.api_with_retry(Route::Restricted, |api| {
-            api.artist_top_tracks(ArtistId::from_id(id).unwrap(), Some(Market::FromToken))
-        })
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::artist_top_tracks(session, artist.clone()),
+            || {
+                self.api_with_retry(Route::Restricted, |api| {
+                    api.artist_top_tracks(ArtistId::from_id(id).unwrap(), Some(Market::FromToken))
+                })
+            },
+        )
         .map(|ft| ft.iter().map(|t| t.into()).collect())
         .ok_or(())
     }
@@ -1140,8 +1248,10 @@ impl WebApi {
 
     /// Get details about the logged in user.
     pub fn current_user(&self) -> Result<PrivateUser, ()> {
-        self.api_with_retry(Route::Bulk, |api| api.current_user())
-            .ok_or(())
+        self.with_fallback(Area::Metadata, metadata::current_user, || {
+            self.api_with_retry(Route::Bulk, |api| api.current_user())
+        })
+        .ok_or(())
     }
 }
 

@@ -99,14 +99,15 @@ async fn get_many<T: Kind>(
             }
         }
         for u in chunk {
-            let Some(bytes) = by_uri.remove(&u.to_uri()) else {
+            // get, not remove: a uri may appear twice in one request.
+            let Some(bytes) = by_uri.get(&u.to_uri()) else {
                 debug!(
                     "internal metadata: {} missing from the response",
                     u.to_uri()
                 );
                 return Err(InternalError::NotFound);
             };
-            let msg = <T as Metadata>::Message::parse_from_bytes(&bytes)
+            let msg = <T as Metadata>::Message::parse_from_bytes(bytes)
                 .map_err(|e| InternalError::ProtocolChanged(format!("{} parse: {e}", T::NAME)))?;
             out.push(T::parse(&msg, u).map_err(|e| classify(&e))?);
         }
