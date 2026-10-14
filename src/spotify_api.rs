@@ -1412,6 +1412,46 @@ mod test {
     }
 
     #[test]
+    fn with_fallback_latches_once_on_a_protocol_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = ASYNC_RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        // An unconnected session is enough: the internal closure below never uses it.
+        let session = {
+            let _guard = rt.enter();
+            Session::new(librespot_core::SessionConfig::default(), None)
+        };
+        let mut api = WebApi::new(&crate::config::Config::new_for_test());
+        api.set_session(Arc::new(RwLock::new(Some(session))));
+        let internal_calls = Arc::new(AtomicUsize::new(0));
+        let call = || {
+            let calls = internal_calls.clone();
+            api.with_fallback(
+                Area::Metadata,
+                move |_session| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err::<u8, _>(InternalError::ProtocolChanged("412".into())) }
+                },
+                || Some(2),
+            )
+        };
+        assert_eq!(call(), Some(2));
+        assert_eq!(internal_calls.load(Ordering::SeqCst), 1);
+        assert!(api.internal.skip(Area::Metadata), "protocol change latches");
+        assert_eq!(call(), Some(2));
+        assert_eq!(
+            internal_calls.load(Ordering::SeqCst),
+            1,
+            "a latched area skips the internal API"
+        );
+        assert!(!api.internal.latch(Area::Metadata), "latched exactly once");
+    }
+
+    #[test]
     fn with_fallback_with_internal_api_off_never_tries_internal() {
         let values = crate::config::ConfigValues {
             internal_api: Some(false),
