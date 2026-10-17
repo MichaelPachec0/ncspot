@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls wait through short limits and fail fast on long ones, and a library
   update left incomplete by a rate limit resumes on its own after the limit
   ends. A library update requested while one is running is skipped
+- A long rate limit (Spotify can send a `Retry-After` of many hours) no longer
+  blocks a client ID until it ends: a background request checks every 5
+  minutes whether the limit was lifted. Rate-limit windows also count time
+  the machine spends suspended
 
 ## [1.4.0]
 

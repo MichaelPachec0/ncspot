@@ -31,7 +31,7 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::track::Track;
 use crate::rate_limit::{
-    Attempt, ClientLabel, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
+    Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
 };
 use crate::spotify_worker::WorkerCommand;
@@ -346,7 +346,7 @@ impl WebApi {
 
     /// Remaining rate-limit window of each throttled client, personal first.
     pub fn rate_limit_status(&self) -> Vec<(ClientLabel, Duration)> {
-        let now = Instant::now();
+        let now = Stamp::now();
         self.personal
             .iter()
             .chain(std::iter::once(&self.shared))
@@ -375,7 +375,7 @@ impl WebApi {
         throttle: &Arc<RwLock<ThrottleState>>,
         window: Duration,
     ) {
-        let now = Instant::now();
+        let now = Stamp::now();
         let (new_episode, announce) = {
             let mut throttle = throttle.write().unwrap();
             let new_episode = throttle.record_429(now, window);
@@ -398,7 +398,7 @@ impl WebApi {
         // from here until the window has passed, then once more to clear it.
         let throttle = throttle.clone();
         thread::spawn(move || {
-            while throttle.read().unwrap().is_active(Instant::now()) {
+            while throttle.read().unwrap().is_active(Stamp::now()) {
                 if !events.try_trigger() {
                     return;
                 }
@@ -409,7 +409,7 @@ impl WebApi {
     }
 
     /// Whether any client got a 429 at or after `since`, even if its window has closed since.
-    pub fn rate_limited_since(&self, since: Instant) -> bool {
+    pub fn rate_limited_since(&self, since: Stamp) -> bool {
         self.personal
             .iter()
             .chain(std::iter::once(&self.shared))
@@ -1351,7 +1351,7 @@ mod test {
     #[test]
     fn rate_limit_status_lists_throttled_clients_personal_first() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
-        let now = Instant::now();
+        let now = Stamp::now();
         api.shared
             .throttle
             .write()
@@ -1385,7 +1385,7 @@ mod test {
     #[test]
     fn rate_limited_since_sees_a_429_on_any_client() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
-        let start = Instant::now();
+        let start = Stamp::now();
         assert!(!api.rate_limited_since(start));
         api.on_rate_limited(
             api.shared.label,
@@ -1393,7 +1393,7 @@ mod test {
             Duration::from_millis(1),
         );
         assert!(api.rate_limited_since(start));
-        assert!(!api.rate_limited_since(Instant::now() + Duration::from_secs(1)));
+        assert!(!api.rate_limited_since(Stamp::now() + Duration::from_secs(1)));
     }
 
     #[test]
