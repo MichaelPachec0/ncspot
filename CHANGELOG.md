@@ -47,6 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blocks a client ID until it ends: a background request checks every 5
   minutes whether the limit was lifted. Rate-limit windows also count time
   the machine spends suspended
+- The jukebox finds the analysis of tracks relinked in the user's market
+  (played through an alternative track), which reported no analysis before
 
 ## [1.4.0]
 
