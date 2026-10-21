@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use http::Method;
@@ -165,10 +165,28 @@ struct EternalboxResponse {
     analysis: AudioAnalysis,
 }
 
+/// How long an eternalbox instance that could not be reached is skipped.
+const ETERNALBOX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Longest wait for a connection to the eternalbox instance.
+const ETERNALBOX_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Fallback source: a public eternalbox instance (configurable). Serves only already-cached
-/// analyses (non-200 for un-analyzed tracks -> treated as "no analysis").
+/// analyses (non-200 for un-analyzed tracks -> treated as "no analysis"). When the instance
+/// cannot be reached it is skipped for [ETERNALBOX_COOLDOWN], so a dead instance does not
+/// cost a timeout on every track.
 pub struct EternalboxSource {
-    pub base_url: String,
+    base_url: String,
+    down_until: Mutex<Option<Instant>>,
+}
+
+impl EternalboxSource {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            base_url,
+            down_until: Mutex::new(None),
+        }
+    }
 }
 
 impl AnalysisSource for EternalboxSource {
@@ -177,7 +195,10 @@ impl AnalysisSource for EternalboxSource {
     }
 
     fn enabled(&self) -> bool {
-        true
+        self.down_until
+            .lock()
+            .unwrap()
+            .is_none_or(|until| until <= Instant::now())
     }
 
     fn fetch(&self, track_id: &str) -> anyhow::Result<Option<AudioAnalysis>> {
@@ -185,10 +206,23 @@ impl AnalysisSource for EternalboxSource {
             "{}/api/analysis/analyse/{track_id}",
             self.base_url.trim_end_matches('/')
         );
-        let resp = reqwest::blocking::Client::new()
-            .get(&url)
+        let sent = reqwest::blocking::Client::builder()
+            .connect_timeout(ETERNALBOX_CONNECT_TIMEOUT)
             .timeout(Duration::from_secs(10))
-            .send()?;
+            .build()?
+            .get(&url)
+            .send();
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) => {
+                *self.down_until.lock().unwrap() = Some(Instant::now() + ETERNALBOX_COOLDOWN);
+                return Err(anyhow!(
+                    "{} unreachable, skipped for {}s: {e}",
+                    self.base_url,
+                    ETERNALBOX_COOLDOWN.as_secs()
+                ));
+            }
+        };
         if !resp.status().is_success() {
             return Ok(None);
         }
@@ -198,6 +232,17 @@ impl AnalysisSource for EternalboxSource {
         }
         Ok(Some(parsed.analysis))
     }
+}
+
+/// Outcome of looking up the analysis of a track across the sources.
+#[derive(Debug)]
+pub enum Lookup {
+    Found(AudioAnalysis),
+    /// Every source answered and none has an analysis of the track.
+    Missing,
+    /// No analysis found and at least one source failed (timeout, network), so a later
+    /// lookup may succeed.
+    Failed,
 }
 
 pub struct AnalysisManager {
@@ -215,11 +260,12 @@ impl AnalysisManager {
     }
 
     /// Returns the first analysis produced by an enabled source in `order`, caching it.
-    pub fn fetch(&self, order: &[String], track_id: &str) -> Option<AudioAnalysis> {
+    pub fn fetch(&self, order: &[String], track_id: &str) -> Lookup {
         let key = Self::cache_key(track_id);
         if let Some(hit) = self.cache.get(&key) {
-            return Some(hit);
+            return Lookup::Found(hit);
         }
+        let mut failed = false;
         for id in order {
             let Some(src) = self.sources.iter().find(|s| s.id() == id) else {
                 continue;
@@ -230,13 +276,20 @@ impl AnalysisManager {
             match src.fetch(track_id) {
                 Ok(Some(a)) => {
                     self.cache.put(&key, &a);
-                    return Some(a);
+                    return Lookup::Found(a);
                 }
                 Ok(None) => {}
-                Err(e) => log::warn!("analysis source {id} failed: {e}"),
+                Err(e) => {
+                    log::warn!("analysis source {id} failed: {e}");
+                    failed = true;
+                }
             }
         }
-        None
+        if failed {
+            Lookup::Failed
+        } else {
+            Lookup::Missing
+        }
     }
 }
 
@@ -325,8 +378,89 @@ mod tests {
             AnalysisCache::new(dir.clone()),
         );
         let order = vec!["spclient".to_string(), "eternalbox".to_string()];
-        assert!(mgr.fetch(&order, "trackid1").is_some());
+        assert!(matches!(mgr.fetch(&order, "trackid1"), Lookup::Found(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct Failing;
+    impl AnalysisSource for Failing {
+        fn id(&self) -> &str {
+            "failing"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn fetch(&self, _t: &str) -> anyhow::Result<Option<AudioAnalysis>> {
+            Err(anyhow!("timed out"))
+        }
+    }
+
+    fn manager(name: &str, sources: Vec<Box<dyn AnalysisSource>>) -> (AnalysisManager, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ncspot-jb-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            AnalysisManager::new(sources, AnalysisCache::new(dir.clone())),
+            dir,
+        )
+    }
+
+    #[test]
+    fn manager_reports_missing_when_every_source_has_none() {
+        let (mgr, dir) = manager(
+            "missing",
+            vec![Box::new(Mock {
+                id: "spclient",
+                result: None,
+            })],
+        );
+        assert!(matches!(
+            mgr.fetch(&["spclient".to_string()], "t"),
+            Lookup::Missing
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manager_reports_failed_when_a_source_errored_and_none_found() {
+        let (mgr, dir) = manager(
+            "failed",
+            vec![
+                Box::new(Failing),
+                Box::new(Mock {
+                    id: "spclient",
+                    result: None,
+                }),
+            ],
+        );
+        let order = vec!["failing".to_string(), "spclient".to_string()];
+        assert!(matches!(mgr.fetch(&order, "t"), Lookup::Failed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manager_prefers_a_found_analysis_over_an_earlier_error() {
+        let (mgr, dir) = manager(
+            "found-after-error",
+            vec![
+                Box::new(Failing),
+                Box::new(Mock {
+                    id: "spclient",
+                    result: Some(sample()),
+                }),
+            ],
+        );
+        let order = vec!["failing".to_string(), "spclient".to_string()];
+        assert!(matches!(mgr.fetch(&order, "t"), Lookup::Found(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreachable_eternalbox_is_skipped_for_a_cooldown() {
+        // Port 9 (discard) on localhost refuses the connection at once.
+        let src = EternalboxSource::new("http://127.0.0.1:9".to_string());
+        assert!(src.enabled());
+        assert!(src.fetch("4cOdK2wGLETKBW3PvgPWqT").is_err());
+        assert!(!src.enabled());
     }
 
     use std::cell::RefCell;

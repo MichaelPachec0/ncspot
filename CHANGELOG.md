@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the machine spends suspended
 - The jukebox finds the analysis of tracks relinked in the user's market
   (played through an alternative track), which reported no analysis before
+- A jukebox analysis lookup that failed (timeout, network) is retried up to 3
+  times while the track plays, and an unreachable eternalbox instance is
+  skipped for 10 minutes instead of costing a timeout on every track
 
 ## [1.4.0]
 

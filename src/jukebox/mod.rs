@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::events::EventManager;
-use crate::jukebox::analysis::AnalysisManager;
+use crate::jukebox::analysis::{AnalysisManager, Lookup};
 use crate::jukebox::driver::{Driver, DriverAction, SystemClock, XorShiftRandom};
 use crate::jukebox::graph::{Edge, SongGraph};
 use crate::jukebox::remixer::remix;
@@ -24,6 +24,48 @@ use crate::queue::Queue;
 use crate::traits::ListItem;
 
 const TICK_MS: u64 = 60;
+
+/// Delay before the first new lookup of an analysis that failed (timeout, network); the
+/// `n`th retry waits `n` times this long.
+const ANALYSIS_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// New lookups of a failed analysis per track.
+const MAX_ANALYSIS_RETRIES: u32 = 3;
+
+/// When to look up the analysis of the current track again after a failed lookup.
+#[derive(Debug, Default)]
+struct AnalysisRetry {
+    attempts: u32,
+    at: Option<Instant>,
+}
+
+impl AnalysisRetry {
+    /// Start over, for a new track.
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Record a failed lookup at `now` and schedule the next one. False once the retries are
+    /// used up.
+    fn failed(&mut self, now: Instant) -> bool {
+        if self.attempts == MAX_ANALYSIS_RETRIES {
+            self.at = None;
+            return false;
+        }
+        self.attempts += 1;
+        self.at = Some(now + ANALYSIS_RETRY_DELAY * self.attempts);
+        true
+    }
+
+    /// Whether the scheduled lookup is due at `now`; true once per scheduled lookup.
+    fn due(&mut self, now: Instant) -> bool {
+        if self.at.is_some_and(|at| at <= now) {
+            self.at = None;
+            return true;
+        }
+        false
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -219,25 +261,38 @@ fn publish_no_analysis(inner: &JukeboxInner, events: &EventManager, playable: &P
     events.trigger();
 }
 
+/// Why no driver could be built for a track.
+#[derive(Debug, PartialEq, Eq)]
+enum NoDriver {
+    /// No analysis exists, or it has no beats.
+    Missing,
+    /// The lookup failed; a later one may succeed.
+    Failed,
+}
+
 /// Build a driver for `track_id` from cached/fetched analysis. Returns the driver and the
-/// shared graph, or None if no analysis is available.
+/// shared graph.
 fn build_driver(
     analysis: &AnalysisManager,
     cfg: &Config,
     settings: &JukeboxSettings,
     track_id: &str,
     seed: u64,
-) -> Option<(Driver, Arc<SongGraph>)> {
+) -> Result<(Driver, Arc<SongGraph>), NoDriver> {
     let order = cfg
         .values()
         .jukebox
         .clone()
         .unwrap_or_default()
         .analysis_source_order();
-    let a = analysis.fetch(&order, track_id)?;
+    let a = match analysis.fetch(&order, track_id) {
+        Lookup::Found(a) => a,
+        Lookup::Missing => return Err(NoDriver::Missing),
+        Lookup::Failed => return Err(NoDriver::Failed),
+    };
     let remixed = remix(&a);
     if remixed.beats.is_empty() {
-        return None;
+        return Err(NoDriver::Missing);
     }
     let g = graph::generate(settings, &remixed);
     let shared = Arc::new(g.clone());
@@ -247,7 +302,7 @@ fn build_driver(
         Box::new(XorShiftRandom::new(seed | 1)),
         Box::new(SystemClock),
     );
-    Some((driver, shared))
+    Ok((driver, shared))
 }
 
 fn run_driver_loop(
@@ -267,6 +322,7 @@ fn run_driver_loop(
     let mut started = Instant::now();
     let mut seek_cooldown: u32 = 0;
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut retry = AnalysisRetry::default();
 
     loop {
         std::thread::sleep(Duration::from_millis(TICK_MS));
@@ -287,17 +343,26 @@ fn run_driver_loop(
         };
         let track_id = playable.id();
 
+        let mut lookup = false;
         if current_track_id != track_id {
             current_track_id = track_id.clone();
             driver = None;
+            retry.reset();
 
-            let Some(id) = track_id else {
+            if track_id.is_none() {
                 publish_no_analysis(&inner, &events, &playable);
                 continue;
-            };
+            }
             seed = seed
                 .wrapping_mul(6364136223846793005)
                 .wrapping_add(1442695040888963407);
+            lookup = true;
+        }
+
+        if driver.is_none()
+            && (lookup || retry.due(Instant::now()))
+            && let Some(id) = current_track_id.clone()
+        {
             let (eff, src, partial) = {
                 let base = inner.settings.read().unwrap().clone();
                 let st = cfg.state();
@@ -309,7 +374,7 @@ fn run_driver_loop(
                 )
             };
             match build_driver(&analysis, &cfg, &eff, &id, seed) {
-                Some((d, g)) => {
+                Ok((d, g)) => {
                     driver = Some(d);
                     current_graph = g;
                     current_title = playable.track().map(|t| t.title).unwrap_or_default();
@@ -318,7 +383,10 @@ fn run_driver_loop(
                     current_partial = partial;
                     started = Instant::now();
                 }
-                None => {
+                Err(why) => {
+                    if why == NoDriver::Failed && retry.failed(Instant::now()) {
+                        log::debug!("jukebox analysis of {id} failed, retrying");
+                    }
                     publish_no_analysis(&inner, &events, &playable);
                     continue;
                 }
@@ -338,7 +406,7 @@ fn run_driver_loop(
                     &id,
                 )
             };
-            if let Some((d, g)) = build_driver(&analysis, &cfg, &eff, &id, seed | 2) {
+            if let Ok((d, g)) = build_driver(&analysis, &cfg, &eff, &id, seed | 2) {
                 driver = Some(d);
                 current_graph = g;
                 current_effective = eff;
@@ -392,6 +460,34 @@ fn run_driver_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn analysis_retry_backs_off_and_gives_up() {
+        let now = Instant::now();
+        let mut retry = AnalysisRetry::default();
+        assert!(!retry.due(now));
+        for attempt in 1..=MAX_ANALYSIS_RETRIES {
+            assert!(retry.failed(now));
+            let delay = ANALYSIS_RETRY_DELAY * attempt;
+            assert!(!retry.due(now + delay - Duration::from_millis(1)));
+            assert!(retry.due(now + delay));
+            assert!(!retry.due(now + delay), "a retry fires once");
+        }
+        assert!(!retry.failed(now));
+        assert!(!retry.due(now + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn analysis_retry_reset_clears_attempts() {
+        let now = Instant::now();
+        let mut retry = AnalysisRetry::default();
+        for _ in 0..MAX_ANALYSIS_RETRIES {
+            retry.failed(now);
+        }
+        retry.reset();
+        assert!(retry.failed(now));
+        assert!(retry.due(now + ANALYSIS_RETRY_DELAY));
+    }
 
     #[test]
     fn resolve_effective_precedence() {

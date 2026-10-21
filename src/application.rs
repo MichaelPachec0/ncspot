@@ -213,15 +213,15 @@ impl Application {
                 Box::new(crate::jukebox::analysis::SpclientSource {
                     spotify: Arc::new(spotify.clone()),
                 }),
-                Box::new(crate::jukebox::analysis::EternalboxSource {
-                    base_url: configuration
+                Box::new(crate::jukebox::analysis::EternalboxSource::new(
+                    configuration
                         .values()
                         .jukebox
                         .clone()
                         .unwrap_or_default()
                         .eternalbox_url
                         .unwrap_or_else(|| "https://eternalbox.dev".to_string()),
-                }),
+                )),
             ],
             crate::jukebox::analysis::AnalysisCache::new(crate::config::cache_path("jukebox")),
         ));
