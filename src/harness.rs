@@ -1,7 +1,28 @@
 //! Drive harness (feature `harness`): IPC commands that open a view by URI and write a JSON
 //! snapshot of the current view, so a script can drive ncspot and check what it shows.
 
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::Serialize;
+
+use crate::activity::ACTIVITY;
+use crate::internal_api::{Area, AreaCounts};
+use crate::library::Library;
+use crate::model::album::Album;
+use crate::model::artist::Artist;
+use crate::model::playlist::Playlist;
+use crate::model::show::Show;
+use crate::model::track::Track;
+use crate::queue::Queue;
+use crate::rate_limit::{ClientLabel, Stamp};
+use crate::spotify::UriType;
+use crate::spotify_api::{WebApi, WebCalls};
+use crate::spotify_url::SpotifyUrl;
+use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
+use crate::ui::{album::AlbumView, artist::ArtistView, playlist::PlaylistView, show::ShowView};
 
 /// One list in the current view.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -25,15 +46,6 @@ pub struct HarnessState {
     pub tab: Option<String>,
     pub tabs: Vec<TabState>,
 }
-
-use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use crate::activity::ACTIVITY;
-use crate::internal_api::{Area, AreaCounts};
-use crate::rate_limit::{ClientLabel, Stamp};
-use crate::spotify_api::{WebApi, WebCalls};
 
 /// Internal API counters per area.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -118,20 +130,6 @@ pub fn write_dump(path: &Path, dump: &Dump) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
-use std::sync::Arc;
-
-use crate::library::Library;
-use crate::model::album::Album;
-use crate::model::artist::Artist;
-use crate::model::playlist::Playlist;
-use crate::model::show::Show;
-use crate::model::track::Track;
-use crate::queue::Queue;
-use crate::spotify::UriType;
-use crate::spotify_url::SpotifyUrl;
-use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
-use crate::ui::{album::AlbumView, artist::ArtistView, playlist::PlaylistView, show::ShowView};
-
 /// Parse the target of `harness open`.
 pub fn parse_target(target: &str) -> Result<SpotifyUrl, String> {
     SpotifyUrl::parse_any(target)
@@ -184,12 +182,9 @@ pub fn open_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::internal_api::AreaCounts;
-    use crate::spotify_api::WebCalls;
 
     #[test]
     fn parse_target_accepts_every_uri_kind_and_urls() {
-        use crate::spotify::UriType;
         let cases = [
             ("spotify:album:a1", "a1"),
             ("spotify:artist:a2", "a2"),

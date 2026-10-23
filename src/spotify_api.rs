@@ -1311,7 +1311,6 @@ impl WebApi {
 mod test {
     use super::*;
     use crate::config::Config;
-    use crate::internal_api::AreaCounts;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
 
