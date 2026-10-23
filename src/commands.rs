@@ -403,8 +403,11 @@ impl CommandManager {
                 Ok(None)
             }
             #[cfg(feature = "harness")]
-            Command::Harness(crate::command::HarnessCommand::Open(_)) => {
-                Err("harness open: not wired yet".into())
+            Command::Harness(crate::command::HarnessCommand::Open(target)) => {
+                let view =
+                    crate::harness::open_view(self.queue.clone(), self.library.clone(), target)?;
+                s.call_on_name("main", move |v: &mut Layout| v.push_view(view));
+                Ok(None)
             }
         }
     }

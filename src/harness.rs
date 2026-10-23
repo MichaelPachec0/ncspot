@@ -118,11 +118,101 @@ pub fn write_dump(path: &Path, dump: &Dump) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+use std::sync::Arc;
+
+use crate::library::Library;
+use crate::model::album::Album;
+use crate::model::artist::Artist;
+use crate::model::playlist::Playlist;
+use crate::model::show::Show;
+use crate::model::track::Track;
+use crate::queue::Queue;
+use crate::spotify::UriType;
+use crate::spotify_url::SpotifyUrl;
+use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
+use crate::ui::{album::AlbumView, artist::ArtistView, playlist::PlaylistView, show::ShowView};
+
+/// Parse the target of `harness open`.
+pub fn parse_target(target: &str) -> Result<SpotifyUrl, String> {
+    SpotifyUrl::parse_any(target)
+        .ok_or_else(|| format!("harness open: not a Spotify URI or URL: {target}"))
+}
+
+/// Build the view for `target` the way `goto` does, on the calling (UI) thread: an album,
+/// artist, show or playlist opens its own view, a track its album, an episode its show.
+pub fn open_view(
+    queue: Arc<Queue>,
+    library: Arc<Library>,
+    target: &str,
+) -> Result<Box<dyn ViewExt>, String> {
+    let url = parse_target(target)?;
+    let spotify = queue.get_spotify();
+    let api = &spotify.api;
+    let failed = |what: &str| format!("harness open: could not load {what} {}", url.id);
+    let view = match url.uri_type {
+        UriType::Album => {
+            let album = api.album(&url.id).map_err(|_| failed("album"))?;
+            AlbumView::new(queue, library, &Album::from(&album)).into_boxed_view_ext()
+        }
+        UriType::Track => {
+            let track = api.track(&url.id).map_err(|_| failed("track"))?;
+            let album = Track::from(&track)
+                .album(&queue)
+                .ok_or_else(|| failed("album of track"))?;
+            AlbumView::new(queue, library, &album).into_boxed_view_ext()
+        }
+        UriType::Artist => {
+            let artist = api.artist(&url.id).map_err(|_| failed("artist"))?;
+            ArtistView::new(queue, library, &Artist::from(&artist)).into_boxed_view_ext()
+        }
+        UriType::Show => {
+            let show = api.show(&url.id).map_err(|_| failed("show"))?;
+            ShowView::new(queue, library, &Show::from(&show)).into_boxed_view_ext()
+        }
+        UriType::Episode => {
+            let episode = api.episode(&url.id).map_err(|_| failed("episode"))?;
+            ShowView::new(queue, library, &Show::from(&episode.show)).into_boxed_view_ext()
+        }
+        UriType::Playlist => {
+            let playlist = api.playlist(&url.id).map_err(|_| failed("playlist"))?;
+            PlaylistView::new(queue, library, &Playlist::from(&playlist)).into_boxed_view_ext()
+        }
+    };
+    Ok(view)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::internal_api::AreaCounts;
     use crate::spotify_api::WebCalls;
+
+    #[test]
+    fn parse_target_accepts_every_uri_kind_and_urls() {
+        use crate::spotify::UriType;
+        let cases = [
+            ("spotify:album:a1", "a1"),
+            ("spotify:artist:a2", "a2"),
+            ("spotify:show:s1", "s1"),
+            ("spotify:playlist:p1", "p1"),
+            ("spotify:track:t1", "t1"),
+            ("spotify:episode:e1", "e1"),
+            ("https://open.spotify.com/album/a3", "a3"),
+        ];
+        for (input, id) in cases {
+            assert_eq!(parse_target(input).unwrap().id, id, "{input}");
+        }
+        assert!(matches!(
+            parse_target("spotify:episode:e1").unwrap().uri_type,
+            UriType::Episode
+        ));
+    }
+
+    #[test]
+    fn parse_target_names_a_bad_target() {
+        let err = parse_target("not-a-uri").unwrap_err();
+        assert!(err.contains("not-a-uri"), "{err}");
+    }
 
     fn sample() -> Dump {
         Dump {
