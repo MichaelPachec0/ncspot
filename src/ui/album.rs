@@ -60,6 +60,16 @@ impl ViewWrapper for AlbumView {
 }
 
 impl ViewExt for AlbumView {
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let mut state = self.tabs.harness_state()?;
+        state.view = "album".into();
+        if let Some(tracks) = state.tabs.iter_mut().find(|t| t.name == "Tracks") {
+            tracks.max = tracks.max.or(self.album.total_tracks);
+        }
+        Some(state)
+    }
+
     fn title(&self) -> String {
         format!("{} ({})", self.album.title, self.album.year)
     }

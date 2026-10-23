@@ -497,9 +497,40 @@ impl<I: ListItem + Clone> View for ListView<I> {
     }
 }
 
+#[cfg(feature = "harness")]
+fn tab_state<I: ListItem>(
+    name: &str,
+    items: &[I],
+    max: Option<usize>,
+    busy: bool,
+) -> crate::harness::TabState {
+    crate::harness::TabState {
+        name: name.to_string(),
+        rows: items.len(),
+        playable: items.iter().filter(|i| i.is_playable()).count(),
+        max,
+        busy,
+    }
+}
+
 impl<I: ListItem + Clone> ViewExt for ListView<I> {
     fn title(&self) -> String {
         self.title.clone()
+    }
+
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let content = self.content.read().unwrap();
+        Some(crate::harness::HarnessState {
+            view: "list".into(),
+            tab: None,
+            tabs: vec![tab_state(
+                &self.title,
+                &content,
+                self.pagination.max_content(),
+                self.pagination.is_busy(),
+            )],
+        })
     }
 
     fn on_command(&mut self, _s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
@@ -805,5 +836,27 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
         };
 
         Ok(CommandResult::Ignored)
+    }
+}
+
+#[cfg(all(test, feature = "harness"))]
+mod harness_tests {
+    use super::*;
+    use crate::model::artist::Artist;
+
+    #[test]
+    fn tab_state_counts_rows_and_reports_paging() {
+        let items = vec![
+            Artist::new("a".into(), "A".into()),
+            Artist::new("b".into(), "B".into()),
+        ];
+        let expected_playable = items.iter().filter(|i| i.is_playable()).count();
+        let busy = tab_state("Artists", &items, Some(10), true);
+        assert_eq!(busy.rows, 2);
+        assert_eq!(busy.playable, expected_playable);
+        assert_eq!(busy.max, Some(10));
+        assert!(busy.busy);
+        let done = tab_state("Artists", &items, None, false);
+        assert_eq!((done.max, done.busy), (None, false));
     }
 }

@@ -20,6 +20,8 @@ mod commands;
 mod config;
 mod events;
 mod ext_traits;
+#[cfg(feature = "harness")]
+mod harness;
 mod internal_api;
 mod jukebox;
 mod library;

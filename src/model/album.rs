@@ -27,7 +27,7 @@ pub struct Album {
     pub url: Option<String>,
     pub tracks: Option<Vec<Track>>,
     pub added_at: Option<DateTime<Utc>>,
-    total_tracks: Option<usize>,
+    pub(crate) total_tracks: Option<usize>,
 }
 
 impl Album {

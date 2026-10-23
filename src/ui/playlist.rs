@@ -59,6 +59,13 @@ impl ViewWrapper for PlaylistView {
 }
 
 impl ViewExt for PlaylistView {
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let mut state = self.list.harness_state()?;
+        state.view = "playlist".into();
+        Some(state)
+    }
+
     fn title(&self) -> String {
         self.playlist.name.clone()
     }

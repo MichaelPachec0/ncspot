@@ -150,7 +150,7 @@ impl<I: ListItem + Clone> Pagination<I> {
         *self.max_content.read().unwrap()
     }
 
-    fn is_busy(&self) -> bool {
+    pub(crate) fn is_busy(&self) -> bool {
         *self.busy.read().unwrap()
     }
 
