@@ -19,6 +19,7 @@ class SettleTest(unittest.TestCase):
         self.assertFalse(drive.settled(dump([{"busy": True}])))
         self.assertFalse(drive.settled(dump(idle, in_flight=1)))
         self.assertFalse(drive.settled(dump(idle, quiet_ms=499)))
+        self.assertTrue(drive.settled(dump(idle, quiet_ms=500)))
         self.assertFalse(drive.settled(dump(idle, quiet_ms=None)))
 
 

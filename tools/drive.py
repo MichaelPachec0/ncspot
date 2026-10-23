@@ -14,6 +14,7 @@ import argparse
 import glob
 import json
 import os
+import shlex
 import shutil
 import signal
 import socket
@@ -25,6 +26,9 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_CACHE = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "ncspot"
+)
+REAL_CONFIG = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ncspot"
 )
 SECRET_WORDS = ("token", "bearer", "auth")
 SOCKET_WAIT = 15.0
@@ -106,7 +110,12 @@ def exit_code(results):
 
 class Instance:
     def __init__(self, binary, config, keep):
+        self.binary = binary
+        self.config = config
         self.keep = keep
+        self.closed = False
+        self.last = None
+        self.base_dump = None
         self.tmp = tempfile.mkdtemp(prefix="ncspot-drive-")
         self.base = os.path.join(self.tmp, "base")
         self.run = os.path.join(self.tmp, "run")
@@ -117,8 +126,12 @@ class Instance:
         self.username = None
         self.pid = None
         self.seq = 0
-        self._setup_files(config)
-        self._start(binary)
+
+    def start(self):
+        """Set up files and launch ncspot. Separate from __init__ so the caller
+        holds the instance (and can close it) even when this raises."""
+        self._setup_files(self.config)
+        self._start(self.binary)
 
     def _setup_files(self, config):
         creds = os.path.join(REAL_CACHE, "librespot", "credentials.json")
@@ -131,7 +144,16 @@ class Instance:
             self.username = json.load(f).get("username")
         for token in glob.glob(os.path.join(REAL_CACHE, "rspotify_token*.json")):
             shutil.copy2(token, cache)
+        # Library caches and user state keep the startup sync incremental instead of
+        # a full sync per scenario against the account. Contents are never printed.
+        for name in ("albums.db", "artists.db", "playlists.db", "tracks.db"):
+            src = os.path.join(REAL_CACHE, name)
+            if os.path.exists(src):
+                shutil.copy2(src, cache)
         os.makedirs(os.path.join(self.base, ".config"))
+        state = os.path.join(REAL_CONFIG, "userstate.cbor")
+        if os.path.exists(state):
+            shutil.copy2(state, os.path.join(self.base, ".config"))
         with open(os.path.join(self.base, ".config", "config.toml"), "w") as f:
             f.write(render_config(config))
         os.makedirs(self.run, mode=0o700)
@@ -139,13 +161,21 @@ class Instance:
     def tmux(self, *args, check=True):
         tmux = shutil.which("tmux")
         cmd = [tmux] if tmux else ["nix", "shell", "nixpkgs#tmux", "-c", "tmux"]
-        return subprocess.run(
-            cmd + ["-L", self.server, *args], check=check, capture_output=True, text=True
-        )
+        try:
+            return subprocess.run(
+                cmd + ["-L", self.server, *args], check=check, capture_output=True, text=True
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError) as e:
+            raise SetupError(f"tmux failed: {type(e).__name__}") from e
 
     def _start(self, binary):
+        env = f"XDG_RUNTIME_DIR={shlex.quote(self.run)}"
+        pulse = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "pulse", "native")
+        if os.environ.get("XDG_RUNTIME_DIR") and os.path.exists(pulse):
+            env += f" PULSE_SERVER={shlex.quote('unix:' + pulse)}"
         env_cmd = (
-            f"XDG_RUNTIME_DIR={self.run} exec {binary} -b {self.base} -d {self.log}"
+            f"{env} exec {shlex.quote(binary)} -b {shlex.quote(self.base)} "
+            f"-d {shlex.quote(self.log)}"
         )
         self.tmux("new-session", "-d", "-s", "ncspot", "-x", "200", "-y", "50", env_cmd)
         self.tmux("set-option", "-t", "ncspot", "remain-on-exit", "on", check=False)
@@ -228,19 +258,21 @@ class Instance:
                 raise Fail(f"never settled within {timeout} s")
             time.sleep(0.25)
 
-    def wait_calm(self, timeout):
-        """Wait out the startup library sync and any rate limit it caused, so a
-        scenario measures its own calls and not the sync's."""
+    def wait_idle(self, timeout):
+        """Bounded wait for the startup sync to go idle and its rate limit to lapse; never fails. The dump it
+        ends on is the baseline scenarios take counter deltas from."""
         deadline = time.monotonic() + timeout
         while True:
             d = self.dump()
-            if settled(d) and not any(d["throttled"].values()):
+            if (
+                d["in_flight"] == 0
+                and (d.get("quiet_ms") or 0) >= QUIET_MS
+                and not any(d["throttled"].values())
+            ) or (
+                time.monotonic() > deadline
+            ):
+                self.base_dump = d
                 return d
-            if time.monotonic() > deadline:
-                hit = [c for c, v in d["throttled"].items() if v]
-                if hit:
-                    raise Blocked(f"rate limited at startup: {', '.join(hit)}")
-                raise Fail(f"startup never calmed within {timeout} s")
             time.sleep(1.0)
 
     def load_fully(self, timeout, tab=0):
@@ -269,14 +301,20 @@ class Instance:
         if os.path.exists(bt):
             with open(bt, errors="replace") as f:
                 out += ["--- backtrace.log ---", *redact(f.read().splitlines(), self.username)]
-        if getattr(self, "last", None):
+        if self.last:
             out += ["--- last dump ---", json.dumps(self.last)]
         return out
 
     def close(self):
-        self.tmux("kill-server", check=False)
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.tmux("kill-server", check=False)
+        except SetupError:
+            pass
         # kill-server only sends SIGHUP; make sure a wedged ncspot is really gone.
-        if getattr(self, "pid", None):
+        if self.pid:
             try:
                 os.kill(self.pid, signal.SIGKILL)
             except OSError:
@@ -301,6 +339,18 @@ def blocked_if_throttled(d, clients):
         raise Blocked(f"rate limited: {', '.join(hit)}")
 
 
+def delta(inst, d):
+    """Metadata and Web API counters since the post-startup baseline."""
+    b = inst.base_dump
+    bm, m = b["areas"]["metadata"], d["areas"]["metadata"]
+    return {
+        "internal_ok": m["internal_ok"] - bm["internal_ok"],
+        "fallback": m["fallback"] - bm["fallback"],
+        "web": (d["web"]["shared"] + d["web"]["personal"])
+        - (b["web"]["shared"] + b["web"]["personal"]),
+    }
+
+
 def tab(d, name):
     for t in d["tabs"]:
         if t["name"] == name:
@@ -318,7 +368,7 @@ def sc_album(inst, args):
     expect(d["view"] == "album", "an album view", d["view"])
     t = tab(d, "Tracks")
     expect(t["rows"] >= 1 and t["rows"] == t["max"], "all tracks loaded", t)
-    m = d["areas"]["metadata"]
+    m = delta(inst, d)
     expect(m["internal_ok"] >= 1 and m["fallback"] == 0, "metadata on the internal API", m)
 
 
@@ -339,6 +389,7 @@ def sc_show(inst, args):
     blocked_if_throttled(d, ["internal"])
     expect(d["view"] == "show", "a show view", d["view"])
     t = d["tabs"][0]
+    expect(t["max"] is not None, "a known episode total", t)
     expect(
         t["rows"] > 50 and t["rows"] <= t["max"] and t["rows"] * 100 >= t["max"] * 99,
         "every episode page loaded",
@@ -350,19 +401,19 @@ def sc_removed(inst, args):
     inst.send(f"harness open spotify:episode:{REMOVED_EPISODE}")
     d = inst.wait_settled(args.settle_timeout)
     blocked_if_throttled(d, ["internal", "shared", "personal"])
-    m = d["areas"]["metadata"]
+    m = delta(inst, d)
     expect(m["fallback"] >= 1, "a Web API fallback", m)
-    expect(not m["latched"], "the area not latched", m)
+    expect(not d["areas"]["metadata"]["latched"], "the area not latched", d["areas"]["metadata"])
 
 
 def _web_only(inst, args):
     inst.send(f"harness open spotify:track:{TRACK}")
     d = inst.wait_settled(args.settle_timeout)
     blocked_if_throttled(d, ["shared", "personal"])
-    m = d["areas"]["metadata"]
+    expect(d["view"] == "album", "an album view", d["view"])
+    m = delta(inst, d)
     expect(m["internal_ok"] == 0 and m["fallback"] == 0, "zero internal calls", m)
-    web = d["web"]
-    expect(web["shared"] + web["personal"] >= 1, "Web API calls", web)
+    expect(m["web"] >= 1, "Web API calls", m)
 
 
 def sc_play(inst, args):
@@ -429,7 +480,8 @@ def main(argv=None):
         try:
             inst = Instance(binary, config, args.keep)
             current["inst"] = inst
-            inst.wait_calm(args.settle_timeout * 4)
+            inst.start()
+            inst.wait_idle(args.settle_timeout * 2)
             func(inst, args)
             results.append("PASS")
             print(f"PASS     {name}")
