@@ -319,7 +319,7 @@ class Instance:
             with open(bt, errors="replace") as f:
                 out += ["--- backtrace.log ---", *redact(f.read().splitlines(), self.username)]
         if self.last:
-            out += ["--- last dump ---", json.dumps(self.last)]
+            out += ["--- last dump ---", *redact([json.dumps(self.last)], self.username)]
         return out
 
     def _write_back_tokens(self):
@@ -539,6 +539,11 @@ def main(argv=None):
         except Fail as e:
             results.append("FAIL")
             print(f"FAIL     {name}: {e}")
+            if inst:
+                print("\n".join("  " + line for line in inst.evidence()))
+        except Exception as e:
+            results.append("FAIL")
+            print(f"FAIL     {name}: unexpected {type(e).__name__}: {e}")
             if inst:
                 print("\n".join("  " + line for line in inst.evidence()))
         finally:
