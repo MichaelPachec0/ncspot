@@ -60,5 +60,28 @@ class ExitCodeTest(unittest.TestCase):
         self.assertEqual(drive.exit_code([]), 0)
 
 
+class WriteBackTest(unittest.TestCase):
+    OLD = b'{"access_token": "a"}'
+    NEW = b'{"access_token": "b"}'
+
+    def test_unchanged_temp_is_not_written(self):
+        self.assertFalse(drive.should_write_back(self.OLD, self.OLD, self.OLD))
+
+    def test_changed_temp_with_unchanged_real_is_written(self):
+        self.assertTrue(drive.should_write_back(self.OLD, self.NEW, self.OLD))
+
+    def test_real_changed_meanwhile_is_left_alone(self):
+        self.assertFalse(drive.should_write_back(self.OLD, self.NEW, b'{"access_token": "c"}'))
+
+    def test_unusable_temp_is_not_written(self):
+        self.assertFalse(drive.should_write_back(self.OLD, None, self.OLD))
+        self.assertFalse(drive.should_write_back(self.OLD, b"not json", self.OLD))
+        self.assertFalse(drive.should_write_back(self.OLD, b'{"access_token": ""}', self.OLD))
+        self.assertFalse(drive.should_write_back(self.OLD, b"{}", self.OLD))
+
+    def test_missing_real_is_not_written(self):
+        self.assertFalse(drive.should_write_back(self.OLD, self.NEW, None))
+
+
 if __name__ == "__main__":
     unittest.main()

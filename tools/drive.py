@@ -56,6 +56,19 @@ class SetupError(Exception):
 # --- pure helpers (unit tested) ---
 
 
+def should_write_back(copied, temp, real_now):
+    """Whether a token refreshed in the temp instance should replace the cached one.
+
+    True only when the temp copy changed, still holds a non-empty access_token, and
+    the real file is still exactly what was copied (nobody else wrote it meanwhile)."""
+    if temp is None or real_now is None or temp == copied or real_now != copied:
+        return False
+    try:
+        return bool(json.loads(temp).get("access_token"))
+    except (ValueError, AttributeError):
+        return False
+
+
 def settled(d):
     """Every tab idle, no call in flight, and quiet for at least QUIET_MS."""
     quiet = d.get("quiet_ms")
@@ -124,6 +137,7 @@ class Instance:
         self.sock = os.path.join(self.run, "ncspot", "ncspot.sock")
         self.server = f"ncspot-drive-{os.getpid()}"
         self.username = None
+        self.tokens = []  # (real path, temp path, bytes copied)
         self.pid = None
         self.seq = 0
 
@@ -144,6 +158,9 @@ class Instance:
             self.username = json.load(f).get("username")
         for token in glob.glob(os.path.join(REAL_CACHE, "rspotify_token*.json")):
             shutil.copy2(token, cache)
+            with open(token, "rb") as f:
+                copied = f.read()
+            self.tokens.append((token, os.path.join(cache, os.path.basename(token)), copied))
         # Library caches and user state keep the startup sync incremental instead of
         # a full sync per scenario against the account. Contents are never printed.
         for name in ("albums.db", "artists.db", "playlists.db", "tracks.db"):
@@ -305,6 +322,33 @@ class Instance:
             out += ["--- last dump ---", json.dumps(self.last)]
         return out
 
+    def _write_back_tokens(self):
+        for real, temp, copied in self.tokens:
+            try:
+                with open(temp, "rb") as f:
+                    new = f.read()
+            except OSError:
+                new = None
+            try:
+                with open(real, "rb") as f:
+                    now = f.read()
+            except OSError:
+                now = None
+            if not should_write_back(copied, new, now):
+                continue
+            try:
+                part = real + ".tmp"
+                fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(new)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.chmod(part, 0o600)
+                os.replace(part, real)
+                print("  updated a cached Web API token")
+            except OSError:
+                pass
+
     def close(self):
         if self.closed:
             return
@@ -319,6 +363,7 @@ class Instance:
                 os.kill(self.pid, signal.SIGKILL)
             except OSError:
                 pass
+        self._write_back_tokens()
         if self.keep:
             print(f"  kept {self.tmp}")
         else:

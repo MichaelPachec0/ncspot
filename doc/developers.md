@@ -65,7 +65,9 @@ user state are copied in, so the startup sync stays incremental. Your own instan
 config are not touched, and the temp directory is deleted unless `--keep`. Each run still costs
 some Web API quota for that startup sync. The driver waits for idle before checking, and reports
 BLOCKED when a client a scenario needs is rate limited. The driver never prints credentials,
-tokens or your username.
+tokens or your username. A Web API token refreshed by a run is written back to the cache when
+the cache file was not changed meanwhile. The test instance registers its own MPRIS player and
+may show a desktop notification with `--play`.
 
 A view counts as loaded when no tab is busy, no call is in flight and no call has ended for
 500 ms. Exit codes: 0 all passed, 1 a scenario failed, 2 setup error, 3 only rate limited.
