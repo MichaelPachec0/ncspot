@@ -390,7 +390,22 @@ impl CommandManager {
                 cmd.basename()
             )),
             #[cfg(feature = "harness")]
-            Command::Harness(_) => Err("harness: not wired yet".into()),
+            Command::Harness(crate::command::HarnessCommand::Dump(path)) => {
+                // Read before this command's own result replaces the last error.
+                let (title, state, error) = s
+                    .call_on_name("main", |v: &mut Layout| v.harness_view())
+                    .unwrap_or_default();
+                let dump = crate::harness::build_dump(title, state, error, &self.spotify.api);
+                crate::harness::write_dump(std::path::Path::new(path), &dump).map_err(|e| {
+                    error!("harness dump to {path} failed: {e}");
+                    format!("harness dump failed: {e}")
+                })?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::Open(_)) => {
+                Err("harness open: not wired yet".into())
+            }
         }
     }
 
