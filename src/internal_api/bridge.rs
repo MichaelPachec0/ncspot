@@ -13,6 +13,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use super::error::InternalError;
+use crate::activity::ACTIVITY;
 use crate::application::ASYNC_RUNTIME;
 
 /// How long one internal call may take before it is aborted.
@@ -40,6 +41,9 @@ where
     Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
     T: Send + 'static,
 {
+    // On the calling thread, not inside the task: a timeout aborts the task, and the call
+    // still ends when this function returns.
+    let _call = ACTIVITY.begin();
     let (tx, rx) = mpsc::channel();
     let task = handle.spawn(async move {
         // The receiver is gone after a timeout; nothing to do then.
@@ -80,6 +84,19 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn run_on_counts_the_call_as_in_flight() {
+        let rt = runtime();
+        // Other tests share the static gauge, so only a lower bound is stable.
+        let seen = run_on(
+            rt.handle(),
+            async { Ok::<usize, InternalError>(crate::activity::ACTIVITY.in_flight()) },
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(seen >= 1, "the bridge call itself is in flight");
     }
 
     #[test]

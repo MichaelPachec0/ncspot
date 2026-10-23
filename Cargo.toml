@@ -111,6 +111,7 @@ mpris = ["zbus"] # Allow ncspot to be controlled via MPRIS API
 ncurses_backend = ["cursive/ncurses-backend"]
 notify = ["notify-rust"] # Show what's playing via a notification
 crossterm_backend = ["cursive/crossterm-backend"]
+harness = [] # Drive harness IPC commands (developer tool, see doc/developers.md)
 pancurses_backend = ["cursive/pancurses-backend", "pancurses/win32"]
 portaudio_backend = ["librespot-playback/portaudio-backend"]
 pulseaudio_backend = ["librespot-playback/pulseaudio-backend"]

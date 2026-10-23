@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::activity::ACTIVITY;
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use librespot_core::{Session, SpotifyUri};
@@ -462,6 +463,9 @@ impl WebApi {
     where
         F: Fn(&AuthCodeSpotify) -> ClientResult<R>,
     {
+        // One guard for the whole call: rate-limit waits, the 401 refresh loop and the retry
+        // all count as loading.
+        let _call = ACTIVITY.begin();
         let mut refreshed = false;
         loop {
             let result = run_rate_limited(
@@ -1265,6 +1269,17 @@ mod test {
     use crate::config::Config;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn call_on_counts_the_call_as_in_flight() {
+        let api = WebApi::new(&Config::new_for_test());
+        let seen = api
+            .call_on(&api.shared, &|_api| {
+                Ok(crate::activity::ACTIVITY.in_flight())
+            })
+            .unwrap();
+        assert!(seen >= 1, "the Web API call itself is in flight");
+    }
 
     #[test]
     fn refresh_client_waits_out_the_backoff() {

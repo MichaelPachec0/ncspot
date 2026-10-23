@@ -142,6 +142,23 @@ impl Stamp {
         Self(clock_now())
     }
 
+    /// The current time, or `None` if the clock can't be read. For code that must not panic,
+    /// such as a `Drop` that may run during unwinding.
+    pub fn try_now() -> Option<Self> {
+        try_clock_now().map(Self)
+    }
+
+    /// Milliseconds since the clock's origin, for storing a stamp in an atomic.
+    pub fn as_millis(self) -> u64 {
+        u64::try_from(self.0.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The stamp `ms` milliseconds after the clock's origin (inverse of [Self::as_millis]).
+    #[cfg(any(test, feature = "harness"))]
+    pub fn from_millis(ms: u64) -> Self {
+        Self(Duration::from_millis(ms))
+    }
+
     /// `self + duration`, or `None` on overflow.
     pub fn checked_add(self, duration: Duration) -> Option<Self> {
         self.0.checked_add(duration).map(Self)
@@ -167,24 +184,27 @@ impl AddAssign<Duration> for Stamp {
     }
 }
 
+fn clock_now() -> Duration {
+    try_clock_now().expect("clock_gettime(CLOCK_BOOTTIME) failed")
+}
+
 /// Time since boot, including time spent suspended.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn clock_now() -> Duration {
+fn try_clock_now() -> Option<Duration> {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
     // SAFETY: `ts` is a valid, writable timespec. CLOCK_BOOTTIME exists since Linux 2.6.39.
     let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
-    assert_eq!(rc, 0, "clock_gettime(CLOCK_BOOTTIME) failed");
-    Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32)
+    (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
 }
 
 /// Time since the first call. Elsewhere, `Instant` is the best portable clock.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn clock_now() -> Duration {
+fn try_clock_now() -> Option<Duration> {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed()
+    Some(START.get_or_init(std::time::Instant::now).elapsed())
 }
 
 /// Rate-limit state of one client: when its current window ends, when it last got a 429, when
@@ -941,6 +961,24 @@ mod test {
         assert!(b >= a);
         assert_eq!((a + SECS(5)).saturating_duration_since(a), SECS(5));
         assert_eq!(a.saturating_duration_since(a + SECS(5)), Duration::ZERO);
+    }
+
+    #[test]
+    fn stamps_round_trip_through_milliseconds() {
+        let stamp = Stamp::from_millis(1_234);
+        assert_eq!(stamp.as_millis(), 1_234);
+        assert_eq!(
+            Stamp::from_millis(1_500).saturating_duration_since(stamp),
+            Duration::from_millis(266)
+        );
+    }
+
+    #[test]
+    fn try_now_reads_the_same_clock_as_now() {
+        let before = Stamp::now();
+        let read = Stamp::try_now().expect("the clock is readable");
+        assert!(read >= before);
+        assert!(Stamp::now() >= read);
     }
 
     #[test]
