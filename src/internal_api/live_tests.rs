@@ -11,7 +11,7 @@ const TRACK: &str = "4uLU6hMCjMI75M1A2tKUQC";
 const ARTIST: &str = "0OdUWJ0sBjDrqHygGUXeCF";
 const SHOW: &str = "4rOoJ6Egrf8K2IrywzwOMk";
 /// An episode Spotify pulled (status 451 on the batch path).
-const REMOVED_EPISODE: &str = "1N7Aaa9lBYZ7BjTuTJKMxv";
+const REMOVED_EPISODE: &str = "2rKMiQw2A58GL5ZHH8jfHo";
 
 fn with_session<T>(f: impl FnOnce(&tokio::runtime::Runtime, Session) -> T) -> T {
     let rt = tokio::runtime::Builder::new_multi_thread()
