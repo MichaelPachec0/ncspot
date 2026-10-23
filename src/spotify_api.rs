@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,6 +22,8 @@ use tokio::task::JoinHandle;
 
 use crate::authentication::DEFAULT_WEB_API_CLIENT_ID;
 use crate::events::{Event, EventManager};
+#[cfg(any(test, feature = "harness"))]
+use crate::internal_api::AreaCounts;
 use crate::internal_api::error::InternalError;
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
@@ -78,6 +80,8 @@ struct ApiClient {
     refreshing: Arc<AtomicBool>,
     /// Set after a transient personal refresh failure: no new refresh starts before this instant.
     refresh_backoff_until: Arc<RwLock<Option<Instant>>>,
+    /// Calls made on this client since startup, shared by all clones.
+    calls: Arc<AtomicU64>,
 }
 
 impl ApiClient {
@@ -100,12 +104,21 @@ impl ApiClient {
             disabled: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             refresh_backoff_until: Arc::new(RwLock::new(None)),
+            calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
     }
+}
+
+/// Web API calls per client since startup.
+#[cfg(any(test, feature = "harness"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct WebCalls {
+    pub shared: u64,
+    pub personal: u64,
 }
 
 /// Convenient wrapper around the rspotify web API functionality.
@@ -163,6 +176,24 @@ impl WebApi {
         self.events = Some(events);
     }
 
+    /// Web API calls per client since startup.
+    #[cfg(any(test, feature = "harness"))]
+    pub fn web_calls(&self) -> WebCalls {
+        WebCalls {
+            shared: self.shared.calls.load(Ordering::Relaxed),
+            personal: self
+                .personal
+                .as_ref()
+                .map_or(0, |client| client.calls.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Internal API counters of `area` since startup.
+    #[cfg(any(test, feature = "harness"))]
+    pub fn area_counts(&self, area: Area) -> AreaCounts {
+        self.internal.area_counts(area)
+    }
+
     /// Use `session` (filled by the Spotify worker when it connects) for internal API calls.
     pub(crate) fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
         self.internal.set_session(session);
@@ -181,14 +212,15 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
+        let skip = self.internal.skip(area);
         fallback::run_with_fallback(
-            self.internal.skip(area),
+            skip,
             || {
                 let session = self.internal.session().ok_or(InternalError::NoSession)?;
                 // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
                 // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
                 let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
-                run_attempts(
+                let result = run_attempts(
                     no_waits,
                     &self.internal.throttle,
                     || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
@@ -196,9 +228,18 @@ impl WebApi {
                         self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window)
                     },
                     thread::sleep,
-                )
+                );
+                if result.is_ok() {
+                    self.internal.count_ok(area);
+                }
+                result
             },
-            web,
+            || {
+                if !skip {
+                    self.internal.count_fallback(area);
+                }
+                web()
+            },
             |err| {
                 if self.internal.latch(area) {
                     // The InternalApiFallback handler logs the warning with the user-facing text.
@@ -466,6 +507,7 @@ impl WebApi {
         // One guard for the whole call: rate-limit waits, the 401 refresh loop and the retry
         // all count as loading.
         let _call = ACTIVITY.begin();
+        client.calls.fetch_add(1, Ordering::Relaxed);
         let mut refreshed = false;
         loop {
             let result = run_rate_limited(
@@ -1267,6 +1309,7 @@ impl WebApi {
 mod test {
     use super::*;
     use crate::config::Config;
+    use crate::internal_api::AreaCounts;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
 
@@ -1424,6 +1467,14 @@ mod test {
             !api.internal.skip(Area::Metadata),
             "no session must not latch"
         );
+        assert_eq!(
+            api.area_counts(Area::Metadata),
+            AreaCounts {
+                internal_ok: 0,
+                fallback: 1,
+                latched: false
+            }
+        );
     }
 
     #[test]
@@ -1464,6 +1515,15 @@ mod test {
             "a latched area skips the internal API"
         );
         assert!(!api.internal.latch(Area::Metadata), "latched exactly once");
+        assert_eq!(
+            api.area_counts(Area::Metadata),
+            AreaCounts {
+                internal_ok: 0,
+                fallback: 1,
+                latched: true
+            },
+            "the skipped second call is not a fallback"
+        );
     }
 
     #[test]
@@ -1474,5 +1534,60 @@ mod test {
         };
         let api = WebApi::new(&crate::config::Config::new_for_test_with_values(values));
         assert!(api.internal.skip(Area::Metadata));
+        assert_eq!(
+            api.with_fallback(
+                Area::Metadata,
+                |_s| async { Ok::<u8, InternalError>(1) },
+                || Some(2)
+            ),
+            Some(2)
+        );
+        assert_eq!(api.area_counts(Area::Metadata), AreaCounts::default());
+    }
+
+    #[test]
+    fn with_fallback_counts_an_internal_success() {
+        let rt = ASYNC_RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        let session = {
+            let _guard = rt.enter();
+            Session::new(librespot_core::SessionConfig::default(), None)
+        };
+        let mut api = WebApi::new(&crate::config::Config::new_for_test());
+        api.set_session(Arc::new(RwLock::new(Some(session))));
+        let out = api.with_fallback(
+            Area::Metadata,
+            |_session| async { Ok::<u8, InternalError>(1) },
+            || Some(2),
+        );
+        assert_eq!(out, Some(1));
+        assert_eq!(
+            api.area_counts(Area::Metadata),
+            AreaCounts {
+                internal_ok: 1,
+                fallback: 0,
+                latched: false
+            }
+        );
+    }
+
+    #[test]
+    fn call_on_counts_calls_per_client() {
+        let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
+        api.call_on(&api.shared, &|_api| Ok(())).unwrap();
+        let personal = api.personal.as_ref().unwrap();
+        api.call_on(personal, &|_api| Ok(())).unwrap();
+        api.call_on(personal, &|_api| Ok(())).unwrap();
+        assert_eq!(
+            api.web_calls(),
+            WebCalls {
+                shared: 1,
+                personal: 2
+            }
+        );
     }
 }

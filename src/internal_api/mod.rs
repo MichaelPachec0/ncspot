@@ -12,7 +12,7 @@ pub mod metadata;
 mod live_tests;
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -86,6 +86,23 @@ impl Area {
     }
 }
 
+/// What happened to the calls of one area: answered by the internal API, or sent to the Web
+/// API after an internal failure. Calls skipped because the area is off or latched count as
+/// neither.
+#[cfg(any(test, feature = "harness"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct AreaCounts {
+    pub internal_ok: u64,
+    pub fallback: u64,
+    pub latched: bool,
+}
+
+#[derive(Debug, Default)]
+struct AreaStats {
+    internal_ok: AtomicU64,
+    fallback: AtomicU64,
+}
+
 /// The internal API client: the librespot session, its own rate-limit window, and one latch
 /// per area. Clones share all state.
 #[derive(Clone)]
@@ -94,6 +111,7 @@ pub struct InternalApi {
     session: Arc<RwLock<Option<Session>>>,
     pub(crate) throttle: Arc<RwLock<ThrottleState>>,
     latched_metadata: Arc<AtomicBool>,
+    metadata_stats: Arc<AreaStats>,
 }
 
 impl InternalApi {
@@ -103,6 +121,7 @@ impl InternalApi {
             session: Arc::new(RwLock::new(None)),
             throttle: Arc::new(RwLock::new(ThrottleState::default())),
             latched_metadata: Arc::new(AtomicBool::new(false)),
+            metadata_stats: Arc::new(AreaStats::default()),
         }
     }
 
@@ -129,6 +148,33 @@ impl InternalApi {
     /// Whether calls in `area` go straight to the Web API.
     pub fn skip(&self, area: Area) -> bool {
         !self.settings.area_enabled(area) || self.latch_flag(area).load(Ordering::Relaxed)
+    }
+
+    fn stats(&self, area: Area) -> &AreaStats {
+        match area {
+            Area::Metadata => &self.metadata_stats,
+        }
+    }
+
+    /// Count a call in `area` answered by the internal API.
+    pub(crate) fn count_ok(&self, area: Area) {
+        self.stats(area).internal_ok.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a call in `area` that fell back to the Web API after an internal failure.
+    pub(crate) fn count_fallback(&self, area: Area) {
+        self.stats(area).fallback.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counters of `area` since startup.
+    #[cfg(any(test, feature = "harness"))]
+    pub fn area_counts(&self, area: Area) -> AreaCounts {
+        let stats = self.stats(area);
+        AreaCounts {
+            internal_ok: stats.internal_ok.load(Ordering::Relaxed),
+            fallback: stats.fallback.load(Ordering::Relaxed),
+            latched: self.latch_flag(area).load(Ordering::Relaxed),
+        }
     }
 
     /// Latch `area` for the rest of the session. True when this call set it.
