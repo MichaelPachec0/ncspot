@@ -63,7 +63,7 @@ fn assert_internal_only(api: &WebApi) {
 
 #[test]
 #[ignore = "needs cached librespot credentials and network"]
-fn probe_album_of_a_track_loads_every_track() {
+fn probe_album_of_a_track() {
     with_api(|api| {
         let track = api.track(TRACK).unwrap();
         let album_id = track.album.id.as_ref().unwrap().id().to_string();
@@ -86,16 +86,25 @@ fn probe_a_long_album_pages_to_its_total() {
             .filter_map(|a| a.id.clone())
             .take(20)
             .collect();
-        let long = candidates
-            .iter()
-            .find_map(|id| {
-                api.album(id)
-                    .ok()
-                    .filter(|a| a.tracks.total > 50)
-                    .map(|a| (id.clone(), a))
-            })
-            .expect("an album with more than 50 tracks among the first 20; pick another artist");
-        let (id, album) = long;
+        let mut errors = 0;
+        let mut long = None;
+        for id in &candidates {
+            match api.album(id) {
+                Ok(a) if a.tracks.total > 50 => {
+                    long = Some((id.clone(), a));
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => errors += 1,
+            }
+        }
+        let (id, album) = long.unwrap_or_else(|| {
+            panic!(
+                "an album with more than 50 tracks among the first 20 ({errors} album calls failed); \
+                 pick another artist"
+            )
+        });
+        assert_eq!(errors, 0, "no album call failed before the long album");
         let mut loaded = album.tracks.items.len() as u32;
         while loaded < album.tracks.total {
             let page = api.album_tracks(&id, 50, loaded).expect("next page");
@@ -103,6 +112,12 @@ fn probe_a_long_album_pages_to_its_total() {
             loaded += page.items.len() as u32;
         }
         assert_eq!(loaded, album.tracks.total);
+        // Album::load_all_tracks needs a Spotify (player, queue, events), which is not cheap to
+        // build headless, so the paging loop above mirrors it and the model conversion is
+        // checked against the paged count instead.
+        let model = crate::model::album::Album::from(&album);
+        assert_eq!(model.total_tracks, Some(loaded as usize));
+        assert_internal_only(api);
     });
 }
 
@@ -118,6 +133,7 @@ fn probe_artist_albums_and_top_tracks() {
         let top = api.artist_top_tracks(ARTIST).unwrap();
         assert!(!top.is_empty());
         assert!(top.iter().any(|t| t.is_playable()), "some top track plays");
+        assert_internal_only(api);
     });
 }
 
