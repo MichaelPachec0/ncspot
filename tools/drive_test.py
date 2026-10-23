@@ -1,0 +1,63 @@
+"""Unit tests for tools/drive.py. Run: python3 -m unittest tools/drive_test.py"""
+
+import os
+import sys
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import drive  # noqa: E402
+
+
+def dump(tabs, in_flight=0, quiet_ms=900):
+    return {"tabs": tabs, "in_flight": in_flight, "quiet_ms": quiet_ms}
+
+
+class SettleTest(unittest.TestCase):
+    def test_settled_needs_idle_tabs_no_calls_and_quiet(self):
+        idle = [{"busy": False}]
+        self.assertTrue(drive.settled(dump(idle)))
+        self.assertFalse(drive.settled(dump([{"busy": True}])))
+        self.assertFalse(drive.settled(dump(idle, in_flight=1)))
+        self.assertFalse(drive.settled(dump(idle, quiet_ms=499)))
+        self.assertFalse(drive.settled(dump(idle, quiet_ms=None)))
+
+
+class RedactTest(unittest.TestCase):
+    def test_masks_secret_lines_and_the_username(self):
+        lines = [
+            "plain line",
+            "got access_token abc",
+            "Authorization: Bearer x",
+            "auth failed",
+            "hello someuser",
+        ]
+        out = drive.redact(lines, "someuser")
+        self.assertEqual(out[0], "plain line")
+        self.assertTrue(all(line == "[redacted]" for line in out[1:]))
+
+    def test_no_username_masks_only_secret_words(self):
+        self.assertEqual(drive.redact(["a b"], None), ["a b"])
+
+
+class ConfigTest(unittest.TestCase):
+    def test_renders_scalars_and_one_level_tables(self):
+        text = drive.render_config(
+            {"internal_api": False, "internal_api_areas": {"metadata": False}, "x": "y"}
+        )
+        self.assertIn("internal_api = false\n", text)
+        self.assertIn('x = "y"\n', text)
+        self.assertIn("[internal_api_areas]\nmetadata = false\n", text)
+        # Tables come after top-level keys, as TOML requires.
+        self.assertLess(text.index("x ="), text.index("[internal_api_areas]"))
+
+
+class ExitCodeTest(unittest.TestCase):
+    def test_maps_results_to_exit_codes(self):
+        self.assertEqual(drive.exit_code(["PASS", "PASS"]), 0)
+        self.assertEqual(drive.exit_code(["PASS", "FAIL", "BLOCKED"]), 1)
+        self.assertEqual(drive.exit_code(["PASS", "BLOCKED"]), 3)
+        self.assertEqual(drive.exit_code([]), 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
