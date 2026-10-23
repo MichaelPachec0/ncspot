@@ -29,6 +29,8 @@ mod library_sync;
 mod lyrics;
 mod model;
 mod panic;
+#[cfg(test)]
+mod probe_tests;
 mod queue;
 mod rate_limit;
 mod serialization;
