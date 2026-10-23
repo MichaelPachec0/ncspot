@@ -389,6 +389,8 @@ impl CommandManager {
                 "The command \"{}\" is unsupported in this view",
                 cmd.basename()
             )),
+            #[cfg(feature = "harness")]
+            Command::Harness(_) => Err("harness: not wired yet".into()),
         }
     }
 
