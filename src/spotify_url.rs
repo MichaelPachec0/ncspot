@@ -76,6 +76,17 @@ impl SpotifyUrl {
 
         Some(Self::new(id, uri_type))
     }
+
+    /// Parse a `spotify:` URI or an open.spotify.com URL.
+    pub fn parse_any(s: &str) -> Option<Self> {
+        if s.contains("open.spotify.com") {
+            Self::from_url(s)
+        } else {
+            let uri_type: UriType = s.parse().ok()?;
+            let id = &s[s.rfind(':').map_or(0, |i| i + 1)..];
+            (!id.is_empty()).then(|| Self::new(id, uri_type))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -122,5 +133,29 @@ mod tests {
             assert_eq!(result.id, case.1.id);
             assert_eq!(result.uri_type, case.1.uri_type);
         }
+    }
+
+    #[test]
+    fn parse_any_accepts_uris_and_urls() {
+        let album = SpotifyUrl::parse_any("spotify:album:4LH4d3cOWNNsVw41Gqt2kv").unwrap();
+        assert_eq!(album.id, "4LH4d3cOWNNsVw41Gqt2kv");
+        assert_eq!(album.uri_type, UriType::Album);
+
+        let playlist =
+            SpotifyUrl::parse_any("spotify:user:someone:playlist:37i9dQZF1DXcBWIGoYBM5M").unwrap();
+        assert_eq!(playlist.id, "37i9dQZF1DXcBWIGoYBM5M");
+        assert_eq!(playlist.uri_type, UriType::Playlist);
+
+        let track =
+            SpotifyUrl::parse_any("https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC").unwrap();
+        assert_eq!(track.id, "4uLU6hMCjMI75M1A2tKUQC");
+        assert_eq!(track.uri_type, UriType::Track);
+    }
+
+    #[test]
+    fn parse_any_rejects_other_input() {
+        assert!(SpotifyUrl::parse_any("").is_none());
+        assert!(SpotifyUrl::parse_any("spotify:nothing:abc").is_none());
+        assert!(SpotifyUrl::parse_any("https://example.com/track/abc").is_none());
     }
 }
