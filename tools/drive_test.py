@@ -2,6 +2,7 @@
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -81,6 +82,42 @@ class WriteBackTest(unittest.TestCase):
 
     def test_missing_real_is_not_written(self):
         self.assertFalse(drive.should_write_back(self.OLD, self.NEW, None))
+
+
+class TokenFileTest(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+
+    def path(self, name):
+        return os.path.join(self.dir.name, name)
+
+    def test_copy_returns_exactly_the_bytes_written(self):
+        src, dst = self.path("real.json"), self.path("copy.json")
+        with open(src, "wb") as f:
+            f.write(b'{"access_token": "a"}')
+        copied = drive.copy_token(src, dst)
+        with open(dst, "rb") as f:
+            self.assertEqual(f.read(), copied)
+        self.assertEqual(copied, b'{"access_token": "a"}')
+        self.assertEqual(os.stat(dst).st_mode & 0o777, 0o600)
+
+    def test_atomic_write_replaces_the_file_private(self):
+        real = self.path("real.json")
+        with open(real, "wb") as f:
+            f.write(b"old")
+        drive.write_atomic(real, b"new")
+        with open(real, "rb") as f:
+            self.assertEqual(f.read(), b"new")
+        self.assertEqual(os.stat(real).st_mode & 0o777, 0o600)
+        self.assertFalse(os.path.exists(real + ".tmp"))
+
+    def test_failed_atomic_write_leaves_no_part_file(self):
+        real = self.path("real.json")
+        os.mkdir(real)  # os.replace onto a directory fails
+        with self.assertRaises(OSError):
+            drive.write_atomic(real, b"new")
+        self.assertFalse(os.path.exists(real + ".tmp"))
 
 
 if __name__ == "__main__":

@@ -69,6 +69,38 @@ def should_write_back(copied, temp, real_now):
         return False
 
 
+def write_private(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(path, 0o600)
+
+
+def copy_token(src, dst):
+    """Copy a token file and return the bytes copied: one read, so the write-back
+    compares against exactly what the temp instance started with."""
+    with open(src, "rb") as f:
+        data = f.read()
+    write_private(dst, data)
+    return data
+
+
+def write_atomic(path, data):
+    """Replace path with data via a private part file, removed if anything fails."""
+    part = path + ".tmp"
+    try:
+        write_private(part, data)
+        os.replace(part, path)
+    except BaseException:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        raise
+
+
 def settled(d):
     """Every tab idle, no call in flight, and quiet for at least QUIET_MS."""
     quiet = d.get("quiet_ms")
@@ -157,10 +189,8 @@ class Instance:
         with open(creds) as f:
             self.username = json.load(f).get("username")
         for token in glob.glob(os.path.join(REAL_CACHE, "rspotify_token*.json")):
-            shutil.copy2(token, cache)
-            with open(token, "rb") as f:
-                copied = f.read()
-            self.tokens.append((token, os.path.join(cache, os.path.basename(token)), copied))
+            temp = os.path.join(cache, os.path.basename(token))
+            self.tokens.append((token, temp, copy_token(token, temp)))
         # Library caches and user state keep the startup sync incremental instead of
         # a full sync per scenario against the account. Contents are never printed.
         for name in ("albums.db", "artists.db", "playlists.db", "tracks.db"):
@@ -337,14 +367,7 @@ class Instance:
             if not should_write_back(copied, new, now):
                 continue
             try:
-                part = real + ".tmp"
-                fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-                with os.fdopen(fd, "wb") as f:
-                    f.write(new)
-                    f.flush()
-                    os.fsync(f.fileno())
-                os.chmod(part, 0o600)
-                os.replace(part, real)
+                write_atomic(real, new)
                 print("  updated a cached Web API token")
             except OSError:
                 pass
@@ -363,11 +386,15 @@ class Instance:
                 os.kill(self.pid, signal.SIGKILL)
             except OSError:
                 pass
-        self._write_back_tokens()
-        if self.keep:
-            print(f"  kept {self.tmp}")
-        else:
-            shutil.rmtree(self.tmp, ignore_errors=True)
+        # The temp dir holds credential copies: remove it even if the write-back
+        # is interrupted.
+        try:
+            self._write_back_tokens()
+        finally:
+            if self.keep:
+                print(f"  kept {self.tmp}")
+            else:
+                shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 # --- checks ---
