@@ -304,7 +304,7 @@ impl Spotify {
             ..Default::default()
         };
 
-        let session = match Self::create_session(&cfg, credentials).await {
+        let session = match Self::create_session(&cfg, credentials.clone()).await {
             Ok(session) => session,
             Err(e) => {
                 // A transient DNS/network failure here is common right after a dropped
@@ -349,11 +349,12 @@ impl Spotify {
         mixer.set_volume(volume);
 
         let audio_format: librespot_playback::config::AudioFormat = Default::default();
+        let backend_cfg = cfg.clone();
         let player = Player::new(
             player_config,
             session.clone(),
             mixer.get_soft_volume(),
-            move || (backend)(cfg.values().backend_device.clone(), audio_format),
+            move || (backend)(backend_cfg.values().backend_device.clone(), audio_format),
         );
         let player_events = player.get_player_event_channel();
 
@@ -364,6 +365,8 @@ impl Spotify {
             session,
             player,
             mixer,
+            cfg,
+            credentials,
         );
         debug!("worker thread ready.");
         worker.run_loop().await;

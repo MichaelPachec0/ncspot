@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Playback dying on `:reconnect` an hour after logging in via the browser
+- Playback stopping when Spotify closes the connection
 
 ## [1.5.0]
 
