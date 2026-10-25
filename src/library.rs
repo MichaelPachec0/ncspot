@@ -17,7 +17,7 @@ use crate::config::Config;
 use crate::config::{self, CACHE_VERSION};
 use crate::events::EventManager;
 use crate::internal_api::Area;
-use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_SHOW};
+use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW};
 use crate::internal_api::error::InternalError;
 use crate::internal_api::fallback::{Action, decide_after};
 use crate::library_collection::{
@@ -27,6 +27,7 @@ use crate::library_collection::{
 use crate::library_sync::{SavedItem, SavedPage, Synced, full_fetch_due, sync_liked, sync_saved};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
+use crate::model::episode::Episode;
 use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
@@ -56,7 +57,6 @@ const CACHE_PLAYLISTS: &str = "playlists.db";
 const CACHE_SHOWS: &str = "shows.db";
 
 /// Cached Your Episodes database filename.
-#[expect(dead_code)]
 const CACHE_EPISODES: &str = "episodes.db";
 
 /// The user library with all their saved tracks, albums, playlists... High level interface to the
@@ -68,6 +68,10 @@ pub struct Library {
     pub artists: Arc<RwLock<Vec<Artist>>>,
     pub playlists: Arc<RwLock<Vec<Playlist>>>,
     pub shows: Arc<RwLock<Vec<Show>>>,
+    /// Saved episodes (Your Episodes), filled only over the internal API.
+    pub episodes: Arc<RwLock<Vec<Episode>>>,
+    /// The Your Episodes tab is offered: the internal API library area is on.
+    pub episodes_enabled: bool,
     pub is_done: Arc<RwLock<bool>>,
     /// Set while a library sync runs, so a second one (Shift+U twice, or during the startup
     /// sync) is skipped instead of doubling the API traffic.
@@ -101,6 +105,8 @@ impl Library {
             artists: Arc::new(RwLock::new(Vec::new())),
             playlists: Arc::new(RwLock::new(Vec::new())),
             shows: Arc::new(RwLock::new(Vec::new())),
+            episodes: Arc::new(RwLock::new(Vec::new())),
+            episodes_enabled: false,
             is_done: Arc::new(RwLock::new(false)),
             syncing: Arc::new(AtomicBool::new(false)),
             resume_pending: Arc::new(AtomicBool::new(false)),
@@ -124,6 +130,8 @@ impl Library {
             artists: Arc::new(RwLock::new(Vec::new())),
             playlists: Arc::new(RwLock::new(Vec::new())),
             shows: Arc::new(RwLock::new(Vec::new())),
+            episodes: Arc::new(RwLock::new(Vec::new())),
+            episodes_enabled: spotify.api.internal_enabled(Area::Library),
             is_done: Arc::new(RwLock::new(false)),
             syncing: Arc::new(AtomicBool::new(false)),
             resume_pending: Arc::new(AtomicBool::new(false)),
@@ -362,6 +370,20 @@ impl Library {
                 })
             };
 
+            let t_episodes = {
+                let library = library.clone();
+                thread::spawn(move || {
+                    if !library.episodes_enabled {
+                        return true;
+                    }
+                    let valid = library.load_cache(
+                        &config::cache_path(CACHE_EPISODES),
+                        library.episodes.write().unwrap().as_mut(),
+                    );
+                    library.fetch_episodes(valid)
+                })
+            };
+
             let collection_complete = t_collection.join().unwrap();
             let (artists_fetched, artists_token) = t_artists.join().unwrap();
 
@@ -385,12 +407,16 @@ impl Library {
 
             let playlists_complete = t_playlists.join().unwrap();
             let shows_complete = t_shows.join().unwrap();
+            let episodes_complete = t_episodes.join().unwrap();
 
             *library.is_done.write().unwrap() = true;
             library.ev.trigger();
 
-            let complete =
-                collection_complete && artists_complete && playlists_complete && shows_complete;
+            let complete = collection_complete
+                && artists_complete
+                && playlists_complete
+                && shows_complete
+                && episodes_complete;
             library.schedule_resume(complete, sync_start);
         });
     }
@@ -855,6 +881,57 @@ impl Library {
             }
             SetOutcome::Incomplete => false,
             SetOutcome::Web => self.fetch_shows(),
+        }
+    }
+
+    /// Sync Your Episodes from the `listenlater` set, caching them in `episodes.db`. There is
+    /// no Web fetcher: with the area unusable or the session falling back to the Web API the
+    /// cache stays as it is. Returns whether the sync was complete.
+    fn fetch_episodes(&self, cache_valid: bool) -> bool {
+        let api = &self.spotify.api;
+        if !api.internal_usable(Area::Library) {
+            return true;
+        }
+        let token = self.sync_token(SET_LISTEN_LATER);
+        let (now, full_due) = self.full_fetch_check(SET_LISTEN_LATER, "episodes");
+        let mode = plan_sync(true, full_due, token.is_some(), cache_valid);
+        if mode == Mode::Web {
+            return true;
+        }
+        let result = (|| {
+            let fetched = fetch_membership(api, SET_LISTEN_LATER, mode, token.as_deref())?;
+            let members = fetched.membership.only("episode");
+            let episodes_now = self.episodes.read().unwrap().clone();
+            let mut episodes = rebuild(&episodes_now, &members, mode == Mode::Full, |u| {
+                api.library_episodes(u)
+            })?;
+            sort_newest_first(&mut episodes, |e| e.added_at);
+            info!(
+                "episodes: {}, {} episodes",
+                describe_sync(mode, &[&members]),
+                episodes.len()
+            );
+            *self.episodes.write().unwrap() = episodes;
+            Ok::<String, InternalError>(fetched.sync_token)
+        })();
+        match outcome(api, SET_LISTEN_LATER, result) {
+            SetOutcome::Synced(t) => {
+                let saved = self.save_cache(
+                    &config::cache_path(CACHE_EPISODES),
+                    &self.episodes.read().unwrap(),
+                );
+                if saved {
+                    self.set_sync_token(SET_LISTEN_LATER, t);
+                    if mode == Mode::Full {
+                        self.record_full_fetch(SET_LISTEN_LATER, now);
+                    }
+                } else {
+                    self.clear_sync_token(SET_LISTEN_LATER);
+                }
+                saved
+            }
+            SetOutcome::Incomplete => false,
+            SetOutcome::Web => true,
         }
     }
 

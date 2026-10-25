@@ -28,7 +28,7 @@ pub enum PlaybackState {
 }
 
 /// The focussed library tab when ncspot is started.
-#[derive(Clone, Serialize, Deserialize, Debug, Hash, strum_macros::EnumIter)]
+#[derive(Clone, Serialize, Deserialize, Debug, Hash, PartialEq, strum_macros::EnumIter)]
 #[serde(rename_all = "lowercase")]
 pub enum LibraryTab {
     Tracks,
@@ -36,6 +36,7 @@ pub enum LibraryTab {
     Artists,
     Playlists,
     Podcasts,
+    Episodes,
     Browse,
 }
 
@@ -688,6 +689,12 @@ mod test {
     use super::*;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn episodes_tab_parses_from_its_config_name() {
+        let tabs: Vec<LibraryTab> = serde_json::from_str(r#"["podcasts","episodes"]"#).unwrap();
+        assert_eq!(tabs, vec![LibraryTab::Podcasts, LibraryTab::Episodes]);
+    }
 
     #[test]
     fn old_user_state_loads_with_empty_sync_tokens() {

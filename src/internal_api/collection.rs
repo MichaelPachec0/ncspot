@@ -1,8 +1,6 @@
 //! Spotify's collection v2 service (liked songs, saved albums, followed artists, saved shows,
 //! Your Episodes) over the librespot session.
 
-#![expect(dead_code)]
-
 /// Messages generated from the vendored `collection2v2.proto` (librespot ships the file but
 /// does not compile it).
 #[allow(clippy::all, clippy::use_self, dead_code)]

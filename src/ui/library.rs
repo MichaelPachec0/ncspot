@@ -52,6 +52,14 @@ impl LibraryView {
                     "Podcasts",
                     ListView::new(library.shows.clone(), queue.clone(), library.clone()),
                 ),
+                LibraryTab::Episodes => {
+                    if library.episodes_enabled {
+                        tabview.add_tab(
+                            "Your Episodes",
+                            ListView::new(library.episodes.clone(), queue.clone(), library.clone()),
+                        )
+                    }
+                }
                 LibraryTab::Browse => {
                     tabview.add_tab("Browse", BrowseView::new(queue.clone(), library.clone()))
                 }
