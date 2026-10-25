@@ -35,6 +35,7 @@ mod probe_tests;
 mod queue;
 mod rate_limit;
 mod serialization;
+mod session_slot;
 mod sharing;
 mod spotify;
 mod spotify_api;

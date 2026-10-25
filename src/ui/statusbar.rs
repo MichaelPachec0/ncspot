@@ -197,7 +197,11 @@ impl View for StatusBar {
             + &playback_duration_status
             + &volume;
         let offset = HAlign::Right.get_offset(right.width(), printer.size.x);
-        let rate_limit = format_status_segment(&self.spotify.api.rate_limit_status());
+        let rate_limit = format!(
+            "{}{}",
+            reconnect_segment(self.spotify.is_reconnecting()),
+            format_status_segment(&self.spotify.api.rate_limit_status())
+        );
         let rate_limit_offset = offset.saturating_sub(rate_limit.width());
 
         printer.with_color(style, |printer| {
@@ -284,5 +288,21 @@ impl View for StatusBar {
         } else {
             EventResult::Ignored
         }
+    }
+}
+
+/// Shown while the session is reconnecting.
+pub fn reconnect_segment(reconnecting: bool) -> &'static str {
+    if reconnecting { "Reconnecting... " } else { "" }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::reconnect_segment;
+
+    #[test]
+    fn segment_only_while_reconnecting() {
+        assert_eq!(reconnect_segment(true), "Reconnecting... ");
+        assert_eq!(reconnect_segment(false), "");
     }
 }

@@ -27,6 +27,7 @@ use crate::events::{Event, EventManager};
 use crate::model::playable::Playable;
 #[cfg(feature = "mpris")]
 use crate::mpris::{MprisCommand, MprisManager};
+use crate::session_slot::SessionSlot;
 use crate::spotify_api::WebApi;
 use crate::spotify_worker::{Worker, WorkerCommand};
 use crate::traits::ListItem;
@@ -70,6 +71,8 @@ pub struct Spotify {
     /// The active librespot session, set once the worker has successfully connected and cleared
     /// when the worker exits. Callers may clone it cheaply (Session is Arc-backed).
     session: Arc<RwLock<Option<Session>>>,
+    /// Keeps `session` current across the worker's reconnects and tracks the reconnect state.
+    slot: SessionSlot<Session>,
 }
 
 /// The credentials a worker restart uses. A browser login's access token expires after about
@@ -92,6 +95,7 @@ impl Spotify {
         credentials: Credentials,
         cfg: Arc<config::Config>,
     ) -> Result<Self, Box<dyn Error>> {
+        let session = Arc::new(RwLock::new(None));
         let mut spotify = Self {
             events,
             #[cfg(feature = "mpris")]
@@ -103,7 +107,8 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
-            session: Arc::new(RwLock::new(None)),
+            slot: SessionSlot::new(session.clone()),
+            session,
         };
         spotify.api.set_session(spotify.session.clone());
 
@@ -148,6 +153,7 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
+            slot: SessionSlot::new(session.clone()),
             session,
         }
     }
@@ -162,6 +168,7 @@ impl Spotify {
         *self.channel.write().unwrap() = Some(tx);
         let worker_channel = self.channel.clone();
         let session_handle = self.session.clone();
+        let slot = self.slot.clone();
         let cfg = self.cfg.clone();
         let events = self.events.clone();
         let volume = self.volume();
@@ -178,6 +185,7 @@ impl Spotify {
             user_tx,
             volume,
             backend,
+            slot,
         ));
         Ok(())
     }
@@ -289,6 +297,7 @@ impl Spotify {
         user_tx: Option<oneshot::Sender<String>>,
         volume: u16,
         backend: SinkBuilder,
+        slot: SessionSlot<Session>,
     ) {
         let bitrate_str = cfg.values().bitrate.unwrap_or(320).to_string();
         let bitrate = Bitrate::from_str(&bitrate_str);
@@ -367,6 +376,7 @@ impl Spotify {
             mixer,
             cfg,
             credentials,
+            slot,
         );
         debug!("worker thread ready.");
         worker.run_loop().await;
@@ -581,6 +591,17 @@ impl Spotify {
     #[cfg(feature = "mpris")]
     pub fn set_mpris(&mut self, mpris: MprisManager) {
         *self.mpris.lock().unwrap() = Some(mpris);
+    }
+
+    /// Whether the worker is reconnecting its session.
+    pub fn is_reconnecting(&self) -> bool {
+        self.slot.is_reconnecting()
+    }
+
+    /// Reconnects since startup.
+    #[cfg(feature = "harness")]
+    pub fn reconnects(&self) -> u64 {
+        self.slot.reconnects()
     }
 
     /// Return a clone of the current librespot [Session], or `None` if the worker has not yet

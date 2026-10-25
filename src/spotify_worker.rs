@@ -3,6 +3,7 @@ use crate::events::{Event, EventManager};
 use crate::model::playable::Playable;
 use crate::pending_load::{Action, PLAY_STALL_WARN_AFTER, PendingTracker};
 use crate::queue::QueueEvent;
+use crate::session_slot::SessionSlot;
 use crate::spotify::{PlayerEvent, Spotify};
 use futures::future::BoxFuture;
 use librespot_core::SpotifyUri;
@@ -64,6 +65,8 @@ pub struct Worker {
     pending: PendingTracker<SpotifyUri>,
     cfg: Arc<config::Config>,
     credentials: Credentials,
+    /// The session handle the internal API reads; emptied while reconnecting.
+    slot: SessionSlot<Session>,
     /// Diagnostics: counts UI-refresh ticks for throttled heartbeat logging.
     heartbeat_ticks: u64,
 }
@@ -79,6 +82,7 @@ impl Worker {
         mixer: Arc<dyn Mixer>,
         cfg: Arc<config::Config>,
         credentials: Credentials,
+        slot: SessionSlot<Session>,
     ) -> Self {
         Self {
             events,
@@ -91,6 +95,7 @@ impl Worker {
             pending: PendingTracker::default(),
             cfg,
             credentials,
+            slot,
             heartbeat_ticks: 0,
         }
     }
@@ -103,6 +108,8 @@ impl Worker {
 
         loop {
             if self.session.is_invalid() && reconnect.is_none() {
+                self.slot.lost();
+                self.events.trigger();
                 reconnect = Some(self.start_reconnect(reconnect_delay(failed_attempts)));
             }
 
@@ -113,7 +120,9 @@ impl Worker {
                         Ok(session) => {
                             info!("Librespot session reconnected");
                             self.player.set_session(session.clone());
+                            self.slot.restored(session.clone());
                             self.session = session;
+                            self.events.trigger();
                             failed_attempts = 0;
                             let actions = self.pending.on_reconnected(SystemTime::now());
                             self.run_actions(actions);
