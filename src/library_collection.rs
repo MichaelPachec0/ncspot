@@ -133,18 +133,20 @@ pub fn with_artist(mut album: Album) -> Album {
     album
 }
 
-/// Mark exactly the `followed` artists as followed, adding the ones the store lacks.
+/// Mark exactly the `followed` artists as followed, adding the ones the store lacks. A
+/// placeholder (an artist only known from saved tracks) that is now followed takes the fetched
+/// artist's data.
 pub fn merge_followed(store: &mut Vec<Artist>, followed: Vec<Artist>) {
+    let was_followed: Vec<bool> = store.iter().map(|a| a.is_followed).collect();
     for a in store.iter_mut() {
         a.is_followed = false;
     }
     for mut f in followed {
-        match store.iter_mut().find(|a| a.id == f.id) {
-            Some(a) => a.is_followed = true,
-            None => {
-                f.is_followed = true;
-                store.push(f);
-            }
+        f.is_followed = true;
+        match store.iter().position(|a| a.id == f.id) {
+            Some(i) if was_followed.get(i).copied().unwrap_or(true) => store[i].is_followed = true,
+            Some(i) => store[i] = f,
+            None => store.push(f),
         }
     }
 }
@@ -521,5 +523,18 @@ mod tests {
             flags,
             vec![("a".into(), true), ("b".into(), false), ("c".into(), true)]
         );
+    }
+
+    #[test]
+    fn a_placeholder_that_becomes_followed_takes_the_fetched_artist() {
+        use crate::model::artist::Artist;
+        let mut store = vec![Artist::new("a".into(), "placeholder".into())];
+        let mut fetched = Artist::new("a".into(), "Fetched".into());
+        fetched.url = Some("u".into());
+        merge_followed(&mut store, vec![fetched]);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store[0].name, "Fetched");
+        assert_eq!(store[0].url.as_deref(), Some("u"));
+        assert!(store[0].is_followed);
     }
 }
