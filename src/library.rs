@@ -385,7 +385,7 @@ impl Library {
             };
 
             let collection_complete = t_collection.join().unwrap();
-            let (artists_fetched, artists_token) = t_artists.join().unwrap();
+            let artists = t_artists.join().unwrap();
 
             library.populate_artists();
             let artists_saved = library.save_cache(
@@ -393,17 +393,18 @@ impl Library {
                 &library.artists.read().unwrap(),
             );
             // The token is stored only once the cache it describes is on disk.
-            let artists_complete = match artists_token {
-                Some(token) if artists_saved => {
-                    library.set_sync_token(SET_ARTIST, token);
-                    artists_fetched
-                }
-                Some(_) => {
-                    library.clear_sync_token(SET_ARTIST);
-                    false
-                }
-                None => artists_fetched,
-            };
+            let synced = matches!(artists.outcome, SetOutcome::Synced(_));
+            let artists_complete = artists.fetched && (artists_saved || !synced);
+            library.apply_finish(
+                SET_ARTIST,
+                finish_set(
+                    artists.outcome,
+                    artists_saved,
+                    artists.mode,
+                    artists.cache_valid,
+                ),
+                artists.now,
+            );
 
             let playlists_complete = t_playlists.join().unwrap();
             let shows_complete = t_shows.join().unwrap();
@@ -495,6 +496,21 @@ impl Library {
         self.cfg.with_state_mut(|state| {
             state.library_full_fetch.insert(key.to_string(), now);
         });
+    }
+
+    /// Carry out a set's [Finish]: store or clear its token, and record a full fetch at `now`
+    /// under every key of [full_fetch_keys].
+    fn apply_finish(&self, set: &str, finish: Finish, now: i64) {
+        match finish.token {
+            TokenAction::Store(token) => self.set_sync_token(set, token),
+            TokenAction::Clear => self.clear_sync_token(set),
+            TokenAction::Keep => {}
+        }
+        if finish.record_full {
+            for key in full_fetch_keys(set) {
+                self.record_full_fetch(key, now);
+            }
+        }
     }
 
     /// Fetch the saved shows from the web API and save them to the local library, unless they
@@ -688,6 +704,11 @@ impl Library {
     /// Saves both caches; the token is stored only if both writes worked.
     fn fetch_collection(&self, cache_valid: bool) -> bool {
         let api = &self.spotify.api;
+        // A token describes its cache only: without a valid cache it must not survive a sync
+        // that ends without a new one.
+        if !cache_valid {
+            self.clear_sync_token(SET_COLLECTION);
+        }
         let token = self.sync_token(SET_COLLECTION);
         let usable = api.internal_usable(Area::Library);
         let (now, full_due) = if usable {
@@ -706,7 +727,7 @@ impl Library {
                 self.collection_internal(mode, token.as_deref()),
             )
         };
-        let complete = match outcome {
+        let fetched = match outcome {
             SetOutcome::Web => {
                 // Two Web fetchers, both always run, in parallel.
                 let (tracks, albums) = thread::scope(|scope| {
@@ -717,34 +738,22 @@ impl Library {
                 tracks && albums
             }
             SetOutcome::Incomplete => false,
-            SetOutcome::Synced(new_token) => {
-                let saved = self.save_cache(
-                    &config::cache_path(CACHE_TRACKS),
-                    &self.tracks.read().unwrap(),
-                ) & self.save_cache(
-                    &config::cache_path(CACHE_ALBUMS),
-                    &self.albums.read().unwrap(),
-                );
-                if saved {
-                    self.set_sync_token(SET_COLLECTION, new_token);
-                    if mode == Mode::Full {
-                        self.record_full_fetch(SET_COLLECTION, now);
-                    }
-                } else {
-                    self.clear_sync_token(SET_COLLECTION);
-                }
-                return saved;
-            }
+            SetOutcome::Synced(_) => true,
         };
-        self.save_cache(
+        let saved = self.save_cache(
             &config::cache_path(CACHE_TRACKS),
             &self.tracks.read().unwrap(),
-        );
-        self.save_cache(
+        ) & self.save_cache(
             &config::cache_path(CACHE_ALBUMS),
             &self.albums.read().unwrap(),
         );
-        complete
+        let synced = matches!(outcome, SetOutcome::Synced(_));
+        self.apply_finish(
+            SET_COLLECTION,
+            finish_set(outcome, saved, mode, cache_valid),
+            now,
+        );
+        fetched && (saved || !synced)
     }
 
     /// Sync the `collection` set over the internal API into the in-memory tracks and albums.
@@ -783,10 +792,13 @@ impl Library {
         Ok(fetched.sync_token)
     }
 
-    /// Sync the followed artists from the `artist` set. Returns whether the sync was complete
-    /// and the new sync token, which the caller stores once `artists.db` is saved.
-    fn fetch_artists_any(&self, cache_valid: bool) -> (bool, Option<String>) {
+    /// Sync the followed artists from the `artist` set into the store. The caller saves
+    /// `artists.db` and then finishes the set with the returned [ArtistsSync].
+    fn fetch_artists_any(&self, cache_valid: bool) -> ArtistsSync {
         let api = &self.spotify.api;
+        if !cache_valid {
+            self.clear_sync_token(SET_ARTIST);
+        }
         let token = self.sync_token(SET_ARTIST);
         let usable = api.internal_usable(Area::Library);
         let (now, full_due) = if usable {
@@ -795,40 +807,44 @@ impl Library {
             (0, false)
         };
         let mode = plan_sync(usable, full_due, token.is_some(), cache_valid);
-        if mode == Mode::Web {
-            return (self.fetch_artists(), None);
-        }
-        let result = (|| {
-            let fetched = fetch_membership(api, SET_ARTIST, mode, token.as_deref())?;
-            let members = fetched.membership.only("artist");
-            let followed_now: Vec<Artist> = self
-                .artists
-                .read()
-                .unwrap()
-                .iter()
-                .filter(|a| a.is_followed)
-                .cloned()
-                .collect();
-            let followed = rebuild(&followed_now, &members, mode == Mode::Full, |u| {
-                api.library_artists(u)
-            })?;
-            info!(
-                "artists: {}, {} followed",
-                describe_sync(mode, &[&members]),
-                followed.len()
-            );
-            merge_followed(&mut self.artists.write().unwrap(), followed);
-            Ok::<String, InternalError>(fetched.sync_token)
-        })();
-        match outcome(api, SET_ARTIST, result) {
-            SetOutcome::Synced(t) => {
-                if mode == Mode::Full {
-                    self.record_full_fetch(SET_ARTIST, now);
-                }
-                (true, Some(t))
-            }
-            SetOutcome::Incomplete => (false, None),
-            SetOutcome::Web => (self.fetch_artists(), None),
+        let outcome = if mode == Mode::Web {
+            SetOutcome::Web
+        } else {
+            let result = (|| {
+                let fetched = fetch_membership(api, SET_ARTIST, mode, token.as_deref())?;
+                let members = fetched.membership.only("artist");
+                let followed_now: Vec<Artist> = self
+                    .artists
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|a| a.is_followed)
+                    .cloned()
+                    .collect();
+                let followed = rebuild(&followed_now, &members, mode == Mode::Full, |u| {
+                    api.library_artists(u)
+                })?;
+                info!(
+                    "artists: {}, {} followed",
+                    describe_sync(mode, &[&members]),
+                    followed.len()
+                );
+                merge_followed(&mut self.artists.write().unwrap(), followed);
+                Ok::<String, InternalError>(fetched.sync_token)
+            })();
+            outcome(api, SET_ARTIST, result)
+        };
+        let fetched = match outcome {
+            SetOutcome::Synced(_) => true,
+            SetOutcome::Incomplete => false,
+            SetOutcome::Web => self.fetch_artists(),
+        };
+        ArtistsSync {
+            fetched,
+            outcome,
+            mode,
+            cache_valid,
+            now,
         }
     }
 
@@ -836,6 +852,9 @@ impl Library {
     /// the sync was complete.
     fn fetch_shows_any(&self, cache_valid: bool) -> bool {
         let api = &self.spotify.api;
+        if !cache_valid {
+            self.clear_sync_token(SET_SHOW);
+        }
         let token = self.sync_token(SET_SHOW);
         let usable = api.internal_usable(Area::Library);
         let (now, full_due) = if usable {
@@ -844,44 +863,40 @@ impl Library {
             (0, false)
         };
         let mode = plan_sync(usable, full_due, token.is_some(), cache_valid);
-        if mode == Mode::Web {
-            return self.fetch_shows();
-        }
-        let result = (|| {
-            let fetched = fetch_membership(api, SET_SHOW, mode, token.as_deref())?;
-            let members = fetched.membership.only("show");
-            let shows_now = self.shows.read().unwrap().clone();
-            let mut shows = rebuild(&shows_now, &members, mode == Mode::Full, |u| {
-                api.library_shows(u)
-            })?;
-            sort_newest_first(&mut shows, |s| s.added_at);
-            info!(
-                "shows: {}, {} shows",
-                describe_sync(mode, &[&members]),
-                shows.len()
-            );
-            *self.shows.write().unwrap() = shows;
-            Ok::<String, InternalError>(fetched.sync_token)
-        })();
-        match outcome(api, SET_SHOW, result) {
-            SetOutcome::Synced(t) => {
+        let outcome = if mode == Mode::Web {
+            SetOutcome::Web
+        } else {
+            let result = (|| {
+                let fetched = fetch_membership(api, SET_SHOW, mode, token.as_deref())?;
+                let members = fetched.membership.only("show");
+                let shows_now = self.shows.read().unwrap().clone();
+                let mut shows = rebuild(&shows_now, &members, mode == Mode::Full, |u| {
+                    api.library_shows(u)
+                })?;
+                sort_newest_first(&mut shows, |s| s.added_at);
+                info!(
+                    "shows: {}, {} shows",
+                    describe_sync(mode, &[&members]),
+                    shows.len()
+                );
+                *self.shows.write().unwrap() = shows;
+                Ok::<String, InternalError>(fetched.sync_token)
+            })();
+            outcome(api, SET_SHOW, result)
+        };
+        let (complete, saved) = match outcome {
+            SetOutcome::Synced(_) => {
                 let saved = self.save_cache(
                     &config::cache_path(CACHE_SHOWS),
                     &self.shows.read().unwrap(),
                 );
-                if saved {
-                    self.set_sync_token(SET_SHOW, t);
-                    if mode == Mode::Full {
-                        self.record_full_fetch(SET_SHOW, now);
-                    }
-                } else {
-                    self.clear_sync_token(SET_SHOW);
-                }
-                saved
+                (saved, saved)
             }
-            SetOutcome::Incomplete => false,
-            SetOutcome::Web => self.fetch_shows(),
-        }
+            SetOutcome::Incomplete => (false, false),
+            SetOutcome::Web => (self.fetch_shows(), false),
+        };
+        self.apply_finish(SET_SHOW, finish_set(outcome, saved, mode, cache_valid), now);
+        complete
     }
 
     /// Sync Your Episodes from the `listenlater` set, caching them in `episodes.db`. There is
@@ -892,12 +907,12 @@ impl Library {
         if !api.internal_usable(Area::Library) {
             return true;
         }
+        if !cache_valid {
+            self.clear_sync_token(SET_LISTEN_LATER);
+        }
         let token = self.sync_token(SET_LISTEN_LATER);
         let (now, full_due) = self.full_fetch_check(SET_LISTEN_LATER, "episodes");
         let mode = plan_sync(true, full_due, token.is_some(), cache_valid);
-        if mode == Mode::Web {
-            return true;
-        }
         let result = (|| {
             let fetched = fetch_membership(api, SET_LISTEN_LATER, mode, token.as_deref())?;
             let members = fetched.membership.only("episode");
@@ -914,25 +929,24 @@ impl Library {
             *self.episodes.write().unwrap() = episodes;
             Ok::<String, InternalError>(fetched.sync_token)
         })();
-        match outcome(api, SET_LISTEN_LATER, result) {
-            SetOutcome::Synced(t) => {
+        let outcome = outcome(api, SET_LISTEN_LATER, result);
+        let (complete, saved) = match outcome {
+            SetOutcome::Synced(_) => {
                 let saved = self.save_cache(
                     &config::cache_path(CACHE_EPISODES),
                     &self.episodes.read().unwrap(),
                 );
-                if saved {
-                    self.set_sync_token(SET_LISTEN_LATER, t);
-                    if mode == Mode::Full {
-                        self.record_full_fetch(SET_LISTEN_LATER, now);
-                    }
-                } else {
-                    self.clear_sync_token(SET_LISTEN_LATER);
-                }
-                saved
+                (saved, saved)
             }
-            SetOutcome::Incomplete => false,
-            SetOutcome::Web => true,
-        }
+            SetOutcome::Incomplete => (false, false),
+            SetOutcome::Web => (true, false),
+        };
+        self.apply_finish(
+            SET_LISTEN_LATER,
+            finish_set(outcome, saved, mode, cache_valid),
+            now,
+        );
+        complete
     }
 
     /// Fetch the saved albums from the web API and store them in the local library, unless they
@@ -1495,6 +1509,17 @@ fn resume_delay(longest_remaining: Duration, jitter: Duration) -> Duration {
     longest_remaining.max(RESUME_MIN_DELAY) + jitter
 }
 
+/// The followed artists' sync, finished by the coordinator once `artists.db` is saved.
+struct ArtistsSync {
+    /// The artists were fetched (internally or over the Web API).
+    fetched: bool,
+    outcome: SetOutcome,
+    mode: Mode,
+    cache_valid: bool,
+    /// When the sync started (Unix seconds), for the full-fetch record.
+    now: i64,
+}
+
 /// What a set's internal sync did.
 enum SetOutcome {
     /// Synced; the new token, to store once the cache file is written.
@@ -1503,6 +1528,53 @@ enum SetOutcome {
     Incomplete,
     /// Use the Web API fetcher for this set (the area may have been latched).
     Web,
+}
+
+/// What happens to a set's sync token after its sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenAction {
+    /// The set synced and its cache is on disk: this token describes that cache.
+    Store(String),
+    /// No token may describe the cache now on disk.
+    Clear,
+    /// The old token still describes the (valid) cache.
+    Keep,
+}
+
+/// The token action for a finished set sync, and whether to record its full fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Finish {
+    token: TokenAction,
+    /// An internal Full of the set synced and its cache was saved.
+    record_full: bool,
+}
+
+/// Decide a set's token after its sync: a token is only kept or stored when it describes the
+/// cache file. `saved` is whether the set's cache files were written after a `Synced` sync
+/// (ignored otherwise); `cache_valid` is whether the cache was valid at load. A set that did
+/// not sync over an invalid cache (the store started empty) must leave no token, or the next
+/// sync would apply a delta to that empty cache.
+fn finish_set(outcome: SetOutcome, saved: bool, mode: Mode, cache_valid: bool) -> Finish {
+    let (token, record_full) = match outcome {
+        SetOutcome::Synced(token) if saved => (TokenAction::Store(token), mode == Mode::Full),
+        SetOutcome::Synced(_) => (TokenAction::Clear, false),
+        SetOutcome::Incomplete | SetOutcome::Web if cache_valid => (TokenAction::Keep, false),
+        SetOutcome::Incomplete | SetOutcome::Web => (TokenAction::Clear, false),
+    };
+    Finish { token, record_full }
+}
+
+/// The `library_full_fetch` keys an internal Full of `set` refreshes: its own, and those of
+/// the Web fetchers for the same lists, so a later Web fallback takes their incremental route
+/// instead of a full re-download.
+fn full_fetch_keys(set: &str) -> &'static [&'static str] {
+    match set {
+        SET_COLLECTION => &[SET_COLLECTION, FULL_FETCH_TRACKS, FULL_FETCH_ALBUMS],
+        SET_SHOW => &[SET_SHOW, FULL_FETCH_SHOWS],
+        SET_ARTIST => &[SET_ARTIST],
+        SET_LISTEN_LATER => &[SET_LISTEN_LATER],
+        _ => &[],
+    }
 }
 
 /// How a set was synced, for the log: from what was actually fetched, not from the planned
@@ -1774,5 +1846,145 @@ mod test {
 
         assert!(*library.is_done.read().unwrap());
         assert!(library.syncing.load(Ordering::SeqCst));
+    }
+
+    fn synced(t: &str) -> SetOutcome {
+        SetOutcome::Synced(t.to_string())
+    }
+
+    #[test]
+    fn a_synced_and_saved_set_stores_its_token() {
+        for mode in [Mode::Delta, Mode::Repage, Mode::Full] {
+            for valid in [true, false] {
+                assert_eq!(
+                    finish_set(synced("t"), true, mode, valid),
+                    Finish {
+                        token: TokenAction::Store("t".into()),
+                        record_full: mode == Mode::Full,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_synced_set_whose_save_failed_clears_its_token() {
+        for mode in [Mode::Delta, Mode::Repage, Mode::Full] {
+            assert_eq!(
+                finish_set(synced("t"), false, mode, true),
+                Finish {
+                    token: TokenAction::Clear,
+                    record_full: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsynced_set_keeps_its_token_only_over_a_valid_cache() {
+        for mode in [Mode::Web, Mode::Delta, Mode::Repage, Mode::Full] {
+            for saved in [true, false] {
+                let outcomes: [fn() -> SetOutcome; 2] =
+                    [|| SetOutcome::Incomplete, || SetOutcome::Web];
+                for outcome in outcomes {
+                    assert_eq!(
+                        finish_set(outcome(), saved, mode, false),
+                        Finish {
+                            token: TokenAction::Clear,
+                            record_full: false,
+                        },
+                        "an invalid cache written without a new token must not keep the old one"
+                    );
+                    assert_eq!(
+                        finish_set(outcome(), saved, mode, true),
+                        Finish {
+                            token: TokenAction::Keep,
+                            record_full: false,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_internal_full_also_records_the_web_keys() {
+        assert_eq!(
+            full_fetch_keys(SET_COLLECTION),
+            &[SET_COLLECTION, FULL_FETCH_TRACKS, FULL_FETCH_ALBUMS]
+        );
+        assert_eq!(full_fetch_keys(SET_SHOW), &[SET_SHOW, FULL_FETCH_SHOWS]);
+        assert_eq!(full_fetch_keys(SET_ARTIST), &[SET_ARTIST]);
+        assert_eq!(full_fetch_keys(SET_LISTEN_LATER), &[SET_LISTEN_LATER]);
+    }
+
+    #[test]
+    fn error_classes_map_to_token_actions() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let cases = [
+            (Err(InternalError::RateLimited), TokenAction::Keep),
+            (Err(InternalError::Transient("x".into())), TokenAction::Keep),
+            (Err(InternalError::NoSession), TokenAction::Keep),
+            (Err(InternalError::NotFound), TokenAction::Keep),
+            (Err(InternalError::Denied), TokenAction::Keep),
+            (Ok("t".to_string()), TokenAction::Store("t".into())),
+        ];
+        for (result, valid_action) in cases {
+            let unsynced = result.is_err();
+            let o = outcome(&api, "artist", result.clone());
+            assert_eq!(finish_set(o, true, Mode::Repage, true).token, valid_action);
+            let o = outcome(&api, "artist", result);
+            let invalid_action = if unsynced {
+                TokenAction::Clear
+            } else {
+                TokenAction::Store("t".into())
+            };
+            assert_eq!(
+                finish_set(o, true, Mode::Repage, false).token,
+                invalid_action
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_fetch_is_recorded_under_every_key_of_the_set() {
+        let library = test_library();
+        library.apply_finish(
+            SET_COLLECTION,
+            Finish {
+                token: TokenAction::Store("t".into()),
+                record_full: true,
+            },
+            42,
+        );
+        assert_eq!(library.sync_token(SET_COLLECTION).as_deref(), Some("t"));
+        let state = library.cfg.state();
+        for key in [SET_COLLECTION, FULL_FETCH_TRACKS, FULL_FETCH_ALBUMS] {
+            assert_eq!(state.library_full_fetch.get(key), Some(&42), "{key}");
+        }
+        assert_eq!(state.library_full_fetch.get(FULL_FETCH_SHOWS), None);
+        drop(state);
+        library.apply_finish(
+            SET_COLLECTION,
+            Finish {
+                token: TokenAction::Keep,
+                record_full: false,
+            },
+            43,
+        );
+        assert_eq!(library.sync_token(SET_COLLECTION).as_deref(), Some("t"));
+        library.apply_finish(
+            SET_COLLECTION,
+            Finish {
+                token: TokenAction::Clear,
+                record_full: false,
+            },
+            44,
+        );
+        assert_eq!(library.sync_token(SET_COLLECTION), None);
+        assert_eq!(
+            library.cfg.state().library_full_fetch.get(SET_COLLECTION),
+            Some(&42)
+        );
     }
 }
