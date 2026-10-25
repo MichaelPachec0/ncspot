@@ -1,7 +1,9 @@
 use crate::config;
 use crate::events::{Event, EventManager};
 use crate::model::playable::Playable;
-use crate::pending_load::{Action, PLAY_STALL_WARN_AFTER, PendingTracker};
+use crate::pending_load::{
+    Action, PLAY_STALL_RECONNECT_AFTER, PLAY_STALL_WARN_AFTER, PendingTracker,
+};
 use crate::queue::QueueEvent;
 use crate::session_slot::SessionSlot;
 use crate::spotify::{PlayerEvent, Spotify};
@@ -108,8 +110,10 @@ impl Worker {
 
         loop {
             if self.session.is_invalid() && reconnect.is_none() {
-                self.slot.lost();
-                self.events.trigger();
+                if !self.slot.is_reconnecting() {
+                    self.slot.lost();
+                    self.events.trigger();
+                }
                 reconnect = Some(self.start_reconnect(reconnect_delay(failed_attempts)));
             }
 
@@ -334,6 +338,13 @@ impl Worker {
                     self.session.is_invalid(),
                     self.player_status,
                 ),
+                Action::ForceReconnect => {
+                    warn!(
+                        "playback still not started after {}s, forcing a reconnect",
+                        PLAY_STALL_RECONNECT_AFTER.as_secs()
+                    );
+                    self.session.shutdown();
+                }
             }
         }
     }

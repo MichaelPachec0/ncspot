@@ -8,6 +8,10 @@ use std::time::{Duration, SystemTime};
 /// that accepted the load but never produced `Playing`).
 pub const PLAY_STALL_WARN_AFTER: Duration = Duration::from_secs(5);
 
+/// How long after a play request to shut a still-valid session down once, so the worker
+/// reconnects and loads the track again.
+pub const PLAY_STALL_RECONNECT_AFTER: Duration = Duration::from_secs(20);
+
 /// What the worker should do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action<U> {
@@ -23,6 +27,8 @@ pub enum Action<U> {
     },
     /// Log the stall warning.
     WarnStall,
+    /// Shut the (still valid looking) session down so the worker reconnects.
+    ForceReconnect,
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +39,8 @@ struct PendingLoad<U> {
     /// When the load (or the play request that made it a playing load) was issued.
     since: SystemTime,
     warned: bool,
+    /// A reconnect was already forced for this load.
+    forced_reconnect: bool,
     /// A load of this uri already failed once.
     failed: bool,
 }
@@ -69,6 +77,7 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
             position_ms,
             since: now,
             warned: false,
+            forced_reconnect: false,
             failed: false,
         });
     }
@@ -137,6 +146,10 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
                     position_ms: load.position_ms,
                 }
             };
+            if matches!(action, Action::HoldPaused { .. }) {
+                // A held track counts as paused: no stall warning, no forced reconnect.
+                load.start_playing = false;
+            }
             load.failed = true;
             return Some(action);
         }
@@ -169,8 +182,9 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
     }
 
     /// The stall rules for a playing load that has not started: warn once after
-    /// [PLAY_STALL_WARN_AFTER].
-    pub fn stall_check(&mut self, now: SystemTime, _session_valid: bool) -> Vec<Action<U>> {
+    /// [PLAY_STALL_WARN_AFTER], and force one reconnect after [PLAY_STALL_RECONNECT_AFTER]
+    /// while the session still reports valid.
+    pub fn stall_check(&mut self, now: SystemTime, session_valid: bool) -> Vec<Action<U>> {
         let mut actions = Vec::new();
         let Some(load) = self.load.as_mut().filter(|load| load.start_playing) else {
             return actions;
@@ -179,6 +193,10 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
         if !load.warned && waited >= PLAY_STALL_WARN_AFTER {
             load.warned = true;
             actions.push(Action::WarnStall);
+        }
+        if session_valid && !load.forced_reconnect && waited >= PLAY_STALL_RECONNECT_AFTER {
+            load.forced_reconnect = true;
+            actions.push(Action::ForceReconnect);
         }
         actions
     }
@@ -331,6 +349,69 @@ mod tests {
         assert!(
             t.stall_check(t0() + Duration::from_secs(60), true)
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn stall_forces_one_reconnect_after_twenty_seconds() {
+        let mut t = PendingTracker::default();
+        t.on_load("a".to_string(), true, 0, t0());
+        t.stall_check(t0() + Duration::from_secs(5), true);
+        assert!(
+            t.stall_check(t0() + Duration::from_secs(19), true)
+                .is_empty()
+        );
+        assert_eq!(
+            t.stall_check(t0() + Duration::from_secs(20), true),
+            vec![Action::ForceReconnect]
+        );
+        t.on_reconnected(t0() + Duration::from_secs(21));
+        assert_eq!(
+            t.stall_check(t0() + Duration::from_secs(60), true),
+            vec![Action::WarnStall],
+            "one forced reconnect per load"
+        );
+    }
+
+    #[test]
+    fn no_forced_reconnect_while_the_session_is_already_invalid() {
+        let mut t = PendingTracker::default();
+        t.on_load("a".to_string(), true, 0, t0());
+        assert_eq!(
+            t.stall_check(t0() + Duration::from_secs(30), false),
+            vec![Action::WarnStall]
+        );
+    }
+
+    #[test]
+    fn a_new_load_may_force_its_own_reconnect() {
+        let mut t = PendingTracker::default();
+        t.on_load("a".to_string(), true, 0, t0());
+        t.stall_check(t0() + Duration::from_secs(25), true);
+        t.on_load("b".to_string(), true, 0, t0() + Duration::from_secs(30));
+        assert_eq!(
+            t.stall_check(t0() + Duration::from_secs(55), true),
+            vec![Action::WarnStall, Action::ForceReconnect]
+        );
+    }
+
+    #[test]
+    fn a_held_track_is_paused_and_never_stalls() {
+        let mut t = PendingTracker::default();
+        let a = "a".to_string();
+        t.on_load(a.clone(), true, 0, t0());
+        t.on_unavailable(&a, false);
+        assert_eq!(
+            t.on_unavailable(&a, false),
+            Some(Action::HoldPaused { position_ms: 0 })
+        );
+        assert!(
+            t.stall_check(t0() + Duration::from_secs(60), true)
+                .is_empty()
+        );
+        assert_eq!(
+            t.on_play(true, t0() + Duration::from_secs(61)),
+            Some(load("a", true, 0))
         );
     }
 }

@@ -31,6 +31,12 @@ impl<T> SessionSlot<T> {
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Clear the reconnecting flag only (the slot and counter are left alone), for when the
+    /// worker exits mid-reconnect.
+    pub fn reset(&self) {
+        self.reconnecting.store(false, Ordering::Relaxed);
+    }
+
     pub fn is_reconnecting(&self) -> bool {
         self.reconnecting.load(Ordering::Relaxed)
     }
@@ -66,6 +72,15 @@ mod tests {
         slot.lost();
         assert_eq!(*slot.slot.read().unwrap(), None);
         assert_eq!(slot.reconnects(), 0);
+    }
+
+    #[test]
+    fn reset_clears_only_the_reconnecting_flag() {
+        let slot = SessionSlot::new(Arc::new(RwLock::new(Some(1u32))));
+        slot.lost();
+        slot.reset();
+        assert!(!slot.is_reconnecting());
+        assert_eq!(*slot.slot.read().unwrap(), None);
     }
 
     #[test]

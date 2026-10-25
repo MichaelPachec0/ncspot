@@ -376,7 +376,7 @@ impl Spotify {
             mixer,
             cfg,
             credentials,
-            slot,
+            slot.clone(),
         );
         debug!("worker thread ready.");
         worker.run_loop().await;
@@ -384,6 +384,7 @@ impl Spotify {
         error!("worker thread died, requesting restart");
         *worker_channel.write().unwrap() = None;
         *session_handle.write().unwrap() = None;
+        slot.reset();
         events.send(Event::SessionDied)
     }
 
