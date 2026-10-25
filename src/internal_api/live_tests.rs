@@ -129,3 +129,40 @@ fn removed_episode_is_not_found_and_does_not_latch() {
         assert_eq!(decide_after(&err), Action::WebOnce);
     });
 }
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn collection_sets_page_completely_and_accept_a_delta() {
+    use super::collection::{
+        self, Delta, Listing, SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW,
+    };
+    with_session(|rt, session| {
+        for set in [SET_COLLECTION, SET_ARTIST, SET_SHOW, SET_LISTEN_LATER] {
+            let mut listing = Listing::default();
+            let mut token = String::new();
+            loop {
+                let page = rt
+                    .block_on(collection::page(session.clone(), set, token.clone()))
+                    .expect("page");
+                match collection::absorb(&mut listing, page) {
+                    Some(next) => token = next,
+                    None => break,
+                }
+            }
+            assert!(listing.complete(), "{set}: complete listing");
+            println!(
+                "{set}: {} items, {} pages",
+                listing.items.len(),
+                listing.pages
+            );
+            let sync = listing.sync_token.unwrap();
+            let delta = rt
+                .block_on(collection::delta(session.clone(), set, sync))
+                .expect("delta");
+            assert!(
+                matches!(delta, Delta::Changes { .. }),
+                "{set}: delta accepted"
+            );
+        }
+    });
+}

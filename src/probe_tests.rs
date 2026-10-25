@@ -167,3 +167,44 @@ fn probe_current_user() {
         assert_internal_only(api);
     });
 }
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn probe_library_liked_songs_resolve_through_the_library_area() {
+    use crate::internal_api::collection::SET_COLLECTION;
+    use crate::library_collection::Membership;
+
+    with_api(|api| {
+        let listing = api.collection_page_all(SET_COLLECTION).expect("collection");
+        let Membership::Listing(tracks) = Membership::Listing(listing.items).only("track") else {
+            unreachable!("only keeps the variant");
+        };
+        println!("liked songs in the collection: {}", tracks.len());
+        let uris: Vec<String> = tracks.iter().take(100).map(|i| i.uri.clone()).collect();
+        let resolved = api.library_tracks(&uris).expect("library tracks");
+        println!("resolved {} of {} URIs", resolved.len(), uris.len());
+        assert!(!resolved.is_empty(), "some tracks resolved");
+
+        let counts = api.area_counts(Area::Library);
+        assert!(
+            counts.internal_ok > 0,
+            "library went through the internal API"
+        );
+        assert_eq!(counts.fallback, 0, "no Web API fallback");
+
+        let path = crate::config::cache_path("tracks.db");
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let cached: Vec<serde_json::Value> =
+                    serde_json::from_slice(&bytes).expect("tracks.db parses");
+                println!("cached liked songs: {}", cached.len());
+                let (a, b) = (tracks.len(), cached.len());
+                assert!(
+                    a.abs_diff(b) * 100 <= a.max(b),
+                    "listing and cache agree within 1%"
+                );
+            }
+            Err(_) => println!("tracks.db missing: cache comparison skipped"),
+        }
+    });
+}
