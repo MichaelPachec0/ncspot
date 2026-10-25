@@ -26,6 +26,7 @@ use crate::events::{Event, EventManager};
 use crate::internal_api::AreaCounts;
 use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
+use crate::internal_api::metadata::Missing;
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -341,7 +342,7 @@ impl WebApi {
         }
         let uris = parse_uris(uris);
         self.run_internal(Area::Library, |session| {
-            metadata::albums_by_uri(session, uris.clone())
+            metadata::albums_by_uri(session, uris.clone(), Missing::Skip)
         })
         .map(|items| items.iter().map(Album::from).collect())
     }
@@ -377,7 +378,7 @@ impl WebApi {
         }
         let uris = parse_uris(uris);
         self.run_internal(Area::Library, |session| {
-            metadata::episodes_by_uri(session, uris.clone())
+            metadata::episodes_by_uri(session, uris.clone(), Missing::Skip)
         })
         .map(|items| items.iter().map(Episode::from).collect())
     }
@@ -1122,7 +1123,8 @@ impl WebApi {
                             };
                             let page_ids =
                                 metadata::window(&all, offset as usize, MAX_SIZE as usize);
-                            let items = metadata::albums_by_uri(session, page_ids).await?;
+                            let items =
+                                metadata::albums_by_uri(session, page_ids, Missing::Fail).await?;
                             Ok((items, all.len() as u32))
                         }
                     },
@@ -1180,7 +1182,8 @@ impl WebApi {
                             };
                             let page_ids =
                                 metadata::window(&all, offset as usize, MAX_SIZE as usize);
-                            let items = metadata::episodes_by_uri(session, page_ids).await?;
+                            let items =
+                                metadata::episodes_by_uri(session, page_ids, Missing::Fail).await?;
                             Ok((items, all.len() as u32))
                         }
                     },

@@ -1535,11 +1535,13 @@ fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> Se
         Ok(token) => SetOutcome::Synced(token),
         Err(err) => match decide_after(&err) {
             Action::LatchThenWeb => {
+                info!("{set}: internal sync failed ({err}), latching to the Web API");
                 api.latch_area(Area::Library, &err);
                 api.count_fallback(Area::Library);
                 SetOutcome::Web
             }
             Action::WebOnce => {
+                info!("{set}: internal sync failed ({err}), using the Web API this time");
                 api.count_fallback(Area::Library);
                 SetOutcome::Web
             }

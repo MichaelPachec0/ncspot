@@ -105,6 +105,7 @@ fn show_episode_order_is_newest_first() {
             .block_on(metadata::episodes_by_uri(
                 s,
                 ids[..5.min(ids.len())].to_vec(),
+                metadata::Missing::Fail,
             ))
             .unwrap();
         assert!(eps.len() >= 2, "fewer than two episodes loaded");
