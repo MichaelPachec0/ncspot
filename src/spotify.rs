@@ -72,6 +72,20 @@ pub struct Spotify {
     session: Arc<RwLock<Option<Session>>>,
 }
 
+/// The credentials a worker restart uses. A browser login's access token expires after about
+/// an hour, the reusable credentials librespot caches after connecting do not, so those win
+/// when they are for the same user.
+fn restart_credentials(
+    saved: Option<Credentials>,
+    user: Option<&str>,
+    current: Credentials,
+) -> Credentials {
+    match (saved, user) {
+        (Some(saved), Some(user)) if saved.username.as_deref() == Some(user) => saved,
+        _ => current,
+    }
+}
+
 impl Spotify {
     pub fn new(
         events: EventManager,
@@ -96,6 +110,11 @@ impl Spotify {
         let (user_tx, user_rx) = oneshot::channel();
         spotify.start_worker(Some(user_tx))?;
         let user = ASYNC_RUNTIME.get().unwrap().block_on(user_rx).ok();
+        let saved = Cache::new(Some(config::cache_path("librespot")), None, None, None)
+            .ok()
+            .and_then(|cache| cache.credentials());
+        spotify.credentials =
+            restart_credentials(saved, user.as_deref(), spotify.credentials.clone());
         let volume = cfg.state().volume;
         spotify.set_volume(volume, false);
 
@@ -633,5 +652,35 @@ mod tests {
     fn parse_playlist_uri() {
         let uri_type = "spotify:playlist:37i9dQZF1DX36Xw4IJIVKA".parse();
         assert!(matches!(uri_type, Ok(UriType::Playlist)));
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::restart_credentials;
+    use librespot_core::authentication::Credentials;
+
+    fn creds(user: &str, secret: &str) -> Credentials {
+        Credentials::with_password(user, secret)
+    }
+
+    #[test]
+    fn saved_credentials_of_the_same_user_win() {
+        let got = restart_credentials(Some(creds("u1", "saved")), Some("u1"), creds("u1", "token"));
+        assert_eq!(got.auth_data, b"saved".to_vec());
+    }
+
+    #[test]
+    fn saved_credentials_of_another_user_are_ignored() {
+        let got = restart_credentials(Some(creds("u2", "saved")), Some("u1"), creds("u1", "token"));
+        assert_eq!(got.auth_data, b"token".to_vec());
+    }
+
+    #[test]
+    fn no_saved_credentials_or_no_user_keep_the_current_ones() {
+        let got = restart_credentials(None, Some("u1"), creds("u1", "token"));
+        assert_eq!(got.auth_data, b"token".to_vec());
+        let got = restart_credentials(Some(creds("u1", "saved")), None, creds("u1", "token"));
+        assert_eq!(got.auth_data, b"token".to_vec());
     }
 }
