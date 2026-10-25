@@ -605,6 +605,24 @@ impl Spotify {
         self.slot.reconnects()
     }
 
+    /// Shut the current session down, so the worker sees it invalid and reconnects.
+    #[cfg(feature = "harness")]
+    pub fn drop_session(&self) {
+        if let Some(session) = self.session.read().unwrap().clone() {
+            session.shutdown();
+        }
+    }
+
+    /// Whether the slot holds a session that is not invalid.
+    #[cfg(feature = "harness")]
+    pub fn session_valid(&self) -> bool {
+        self.session
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| !s.is_invalid())
+    }
+
     /// Return a clone of the current librespot [Session], or `None` if the worker has not yet
     /// connected (or has exited). [Session] is cheaply cloneable (Arc-backed).
     pub fn session(&self) -> Option<Session> {

@@ -243,6 +243,10 @@ impl fmt::Display for InsertSource {
 pub enum HarnessCommand {
     /// Push the view for a Spotify URI or URL; validated when run.
     Open(String),
+    /// Show the library screen, optionally on one tab (a `LibraryTab` config name).
+    OpenLibrary(Option<String>),
+    /// Shut the playback session down so the worker has to reconnect.
+    DropSession,
     /// Write a JSON snapshot of the current view to a file.
     Dump(String),
 }
@@ -333,6 +337,14 @@ impl fmt::Display for Command {
             Self::Harness(HarnessCommand::Open(target)) => vec!["open".into(), target.clone()],
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::Dump(path)) => vec!["dump".into(), path.clone()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::OpenLibrary(tab)) => {
+                let mut args = vec!["open".to_string(), "library".to_string()];
+                args.extend(tab.clone());
+                args
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::DropSession) => vec!["drop-session".into()],
             Self::Goto(mode) => vec![mode.to_string()],
             Self::Move(mode, amount) => match (mode, amount) {
                 (MoveMode::Playing, _) => vec!["playing".to_string()],
@@ -1029,6 +1041,10 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 JUKEBOX_SONG_SETTINGS_CMD => Command::JukeboxSongSettings,
                 #[cfg(feature = "harness")]
                 HARNESS_CMD => match (args.first().copied(), args.get(1..).unwrap_or_default()) {
+                    (Some("open"), ["library", rest @ ..]) => Ok(Command::Harness(
+                        HarnessCommand::OpenLibrary(rest.first().map(|s| (*s).to_string())),
+                    )),
+                    (Some("drop-session"), []) => Ok(Command::Harness(HarnessCommand::DropSession)),
                     (Some("open"), [target, ..]) => Ok(Command::Harness(HarnessCommand::Open(
                         (*target).to_string(),
                     ))),
@@ -1048,12 +1064,12 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }),
                     (Some(sub), _) => Err(E::BadEnumArg {
                         arg: sub.into(),
-                        accept: vec!["open".into(), "dump".into()],
+                        accept: vec!["open".into(), "dump".into(), "drop-session".into()],
                         optional: false,
                     }),
                     (None, _) => Err(E::InsufficientArgs {
                         cmd: command.into(),
-                        hint: Some("open|dump".into()),
+                        hint: Some("open|dump|drop-session".into()),
                     }),
                 }?,
                 _ => {
@@ -1086,6 +1102,18 @@ mod tests {
             [Command::Harness(HarnessCommand::Dump(p))] if p == "/tmp/x/dump.json"
         ));
         assert_eq!(dump[0].to_string(), "harness dump /tmp/x/dump.json");
+        for (line, expect) in [
+            ("harness open library", HarnessCommand::OpenLibrary(None)),
+            (
+                "harness open library episodes",
+                HarnessCommand::OpenLibrary(Some("episodes".into())),
+            ),
+            ("harness drop-session", HarnessCommand::DropSession),
+        ] {
+            let cmds = parse(line).unwrap();
+            assert!(matches!(cmds.as_slice(), [Command::Harness(c)] if *c == expect));
+            assert_eq!(cmds[0].to_string(), line);
+        }
         assert!(parse("harness").is_err());
         assert!(parse("harness open").is_err());
         assert!(parse("harness fly away").is_err());
