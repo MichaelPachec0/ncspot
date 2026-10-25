@@ -43,6 +43,9 @@ struct PendingLoad<U> {
     forced_reconnect: bool,
     /// A load of this uri already failed once.
     failed: bool,
+    /// Given up on for now (shown paused) until a reconnect or a play request; a held load
+    /// keeps its `start_playing` but is exempt from the stall rules.
+    held: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +82,7 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
             warned: false,
             forced_reconnect: false,
             failed: false,
+            held: false,
         });
     }
 
@@ -86,8 +90,9 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
     /// session is usable.
     pub fn on_play(&mut self, session_valid: bool, now: SystemTime) -> Option<Action<U>> {
         let load = self.load.as_mut()?;
-        if !load.start_playing {
+        if !load.start_playing || load.held {
             load.start_playing = true;
+            load.held = false;
             load.since = now;
         }
         (load.failed && session_valid).then(|| Action::Load {
@@ -147,8 +152,9 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
                 }
             };
             if matches!(action, Action::HoldPaused { .. }) {
-                // A held track counts as paused: no stall warning, no forced reconnect.
-                load.start_playing = false;
+                // Held: no stall warning, no forced reconnect, but `start_playing` is kept so
+                // a reconnect re-issues the load as it was asked for.
+                load.held = true;
             }
             load.failed = true;
             return Some(action);
@@ -166,6 +172,7 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
         let mut actions = Vec::new();
         if let Some(load) = self.load.as_mut() {
             load.failed = false;
+            load.held = false;
             load.warned = false;
             load.since = now;
             actions.push(Action::Load {
@@ -181,12 +188,16 @@ impl<U: Clone + PartialEq> PendingTracker<U> {
         actions
     }
 
-    /// The stall rules for a playing load that has not started: warn once after
+    /// The stall rules for a playing load that has not started and is not held: warn once after
     /// [PLAY_STALL_WARN_AFTER], and force one reconnect after [PLAY_STALL_RECONNECT_AFTER]
     /// while the session still reports valid.
     pub fn stall_check(&mut self, now: SystemTime, session_valid: bool) -> Vec<Action<U>> {
         let mut actions = Vec::new();
-        let Some(load) = self.load.as_mut().filter(|load| load.start_playing) else {
+        let Some(load) = self
+            .load
+            .as_mut()
+            .filter(|load| load.start_playing && !load.held)
+        else {
             return actions;
         };
         let waited = now.duration_since(load.since).unwrap_or_default();
@@ -396,7 +407,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_track_is_paused_and_never_stalls() {
+    fn a_held_track_never_stalls_and_play_reloads_it() {
         let mut t = PendingTracker::default();
         let a = "a".to_string();
         t.on_load(a.clone(), true, 0, t0());
@@ -412,6 +423,39 @@ mod tests {
         assert_eq!(
             t.on_play(true, t0() + Duration::from_secs(61)),
             Some(load("a", true, 0))
+        );
+        assert!(
+            t.stall_check(t0() + Duration::from_secs(62), true)
+                .is_empty(),
+            "play restarts the stall clock"
+        );
+        assert_eq!(
+            t.stall_check(t0() + Duration::from_secs(66), true),
+            vec![Action::WarnStall]
+        );
+    }
+
+    #[test]
+    fn a_playing_load_held_during_a_reconnect_comes_back_playing() {
+        let mut t = PendingTracker::default();
+        let a = "a".to_string();
+        t.on_load(a.clone(), true, 4, t0());
+        assert_eq!(
+            t.on_unavailable(&a, true),
+            Some(Action::HoldPaused { position_ms: 4 })
+        );
+        assert!(
+            t.stall_check(t0() + Duration::from_secs(30), false)
+                .is_empty()
+        );
+        assert_eq!(
+            t.on_reconnected(t0() + Duration::from_secs(31)),
+            vec![load("a", true, 4)]
+        );
+        assert_eq!(
+            t.stall_check(t0() + Duration::from_secs(36), true),
+            vec![Action::WarnStall],
+            "a re-issued load is watched again"
         );
     }
 }
