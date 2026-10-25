@@ -2589,6 +2589,7 @@ dependencies = [
  "pinyin",
  "platform-dirs",
  "protobuf",
+ "protobuf-codegen",
  "rand 0.10.3",
  "regex",
  "reqwest 0.13.5",

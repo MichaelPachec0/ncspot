@@ -83,6 +83,9 @@ unicode-width = "0.2.2"
 url = "2.5"
 viuer = {version = "0.11", default-features = false, features = ["icy_sixel"], optional = true}
 
+[build-dependencies]
+protobuf-codegen = "3.7"
+
 [target.'cfg(unix)'.dependencies]
 signal-hook = "0.4.4"
 

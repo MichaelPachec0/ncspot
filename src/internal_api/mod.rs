@@ -3,6 +3,7 @@
 //! the Web API stays as the fallback for every call.
 
 pub mod bridge;
+pub mod collection;
 pub mod convert;
 pub mod error;
 pub mod fallback;
