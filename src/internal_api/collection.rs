@@ -1,13 +1,173 @@
 //! Spotify's collection v2 service (liked songs, saved albums, followed artists, saved shows,
 //! Your Episodes) over the librespot session.
 
+#![expect(dead_code)]
+
 /// Messages generated from the vendored `collection2v2.proto` (librespot ships the file but
 /// does not compile it).
 #[allow(clippy::all, clippy::use_self, dead_code)]
 pub mod proto {
     include!(concat!(env!("OUT_DIR"), "/collection_proto/mod.rs"));
-    #[cfg_attr(not(test), expect(unused_imports))]
     pub use collection2v2::*;
+}
+
+use http::{HeaderMap, HeaderValue, Method, header};
+use librespot_core::Session;
+use log::debug;
+use protobuf::Message;
+
+use super::error::{InternalError, classify};
+use proto::{DeltaRequest, DeltaResponse, PageRequest, PageResponse};
+
+pub const SET_COLLECTION: &str = "collection";
+pub const SET_ARTIST: &str = "artist";
+pub const SET_SHOW: &str = "show";
+pub const SET_LISTEN_LATER: &str = "listenlater";
+
+/// Items per page request.
+pub const PAGE_LIMIT: i32 = 300;
+/// Most pages read for one set; past it the listing is incomplete.
+pub const MAX_PAGES: usize = 200;
+
+/// The collection service rejects `application/x-protobuf` with HTTP 400.
+const CONTENT_TYPE: &str = "application/vnd.collection-v2.spotify.proto";
+
+/// One saved item: its URI and the time it was added (Unix seconds).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub uri: String,
+    pub added_at: i64,
+}
+
+/// A whole set read page by page.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Listing {
+    pub items: Vec<Item>,
+    pub sync_token: Option<String>,
+    pub pages: usize,
+}
+
+/// The changes to a set since a sync token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Delta {
+    Changes {
+        added: Vec<Item>,
+        removed: Vec<String>,
+        sync_token: String,
+    },
+    /// The service cannot compute a delta from that token; read the whole set again.
+    Refused,
+}
+
+impl Listing {
+    /// Only a listing whose last page carried a sync token is the whole set.
+    pub fn complete(&self) -> bool {
+        self.sync_token.is_some()
+    }
+}
+
+pub fn absorb(listing: &mut Listing, page: PageResponse) -> Option<String> {
+    listing.pages += 1;
+    listing.items.extend(page.items.into_iter().map(|i| Item {
+        uri: i.uri,
+        added_at: i64::from(i.added_at),
+    }));
+    if page.next_page_token.is_empty() {
+        listing.sync_token = (!page.sync_token.is_empty()).then_some(page.sync_token);
+        return None;
+    }
+    if listing.pages >= MAX_PAGES {
+        return None;
+    }
+    Some(page.next_page_token)
+}
+
+pub fn delta_from(resp: DeltaResponse) -> Delta {
+    if !resp.delta_update_possible {
+        return Delta::Refused;
+    }
+    let (removed, added): (Vec<_>, Vec<_>) = resp.items.into_iter().partition(|i| i.is_removed);
+    Delta::Changes {
+        added: added
+            .into_iter()
+            .map(|i| Item {
+                uri: i.uri,
+                added_at: i64::from(i.added_at),
+            })
+            .collect(),
+        removed: removed.into_iter().map(|i| i.uri).collect(),
+        sync_token: resp.sync_token,
+    }
+}
+
+/// A 400 from the collection service means our request no longer matches what it expects.
+pub fn classify_collection(err: &librespot_core::Error) -> InternalError {
+    match err.kind {
+        librespot_core::error::ErrorKind::InvalidArgument => {
+            InternalError::ProtocolChanged(format!("collection request rejected: {err}"))
+        }
+        _ => classify(err),
+    }
+}
+
+async fn post<M: Message>(
+    session: &Session,
+    endpoint: &str,
+    message: &M,
+) -> Result<Vec<u8>, InternalError> {
+    let body = message
+        .write_to_bytes()
+        .map_err(|e| InternalError::ProtocolChanged(format!("encode: {e}")))?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
+    headers.insert(header::ACCEPT, HeaderValue::from_static(CONTENT_TYPE));
+    session
+        .spclient()
+        .request(
+            &Method::POST,
+            endpoint,
+            Some(headers),
+            Some(body.as_slice()),
+        )
+        .await
+        .map(|bytes| bytes.to_vec())
+        .map_err(|e| classify_collection(&e))
+}
+
+pub async fn page(
+    session: Session,
+    set: &'static str,
+    token: String,
+) -> Result<PageResponse, InternalError> {
+    debug!("collection page: {set}");
+    let request = PageRequest {
+        username: session.username(),
+        set: set.to_string(),
+        pagination_token: token,
+        limit: PAGE_LIMIT,
+        ..Default::default()
+    };
+    let bytes = post(&session, "/collection/v2/paging", &request).await?;
+    PageResponse::parse_from_bytes(&bytes)
+        .map_err(|e| InternalError::ProtocolChanged(format!("collection page parse: {e}")))
+}
+
+pub async fn delta(
+    session: Session,
+    set: &'static str,
+    token: String,
+) -> Result<Delta, InternalError> {
+    debug!("collection delta: {set}");
+    let request = DeltaRequest {
+        username: session.username(),
+        set: set.to_string(),
+        last_sync_token: token,
+        ..Default::default()
+    };
+    let bytes = post(&session, "/collection/v2/delta", &request).await?;
+    DeltaResponse::parse_from_bytes(&bytes)
+        .map(delta_from)
+        .map_err(|e| InternalError::ProtocolChanged(format!("collection delta parse: {e}")))
 }
 
 #[cfg(test)]
@@ -71,5 +231,119 @@ mod tests {
             Some(("spotify:artist:b", true))
         );
         assert_eq!(resp.sync_token, "s");
+    }
+
+    use super::*;
+
+    fn page_of(uris: &[(&str, i32)], next: &str, sync: &str) -> PageResponse {
+        PageResponse {
+            items: uris
+                .iter()
+                .map(|(u, t)| CollectionItem {
+                    uri: (*u).into(),
+                    added_at: *t,
+                    ..Default::default()
+                })
+                .collect(),
+            next_page_token: next.into(),
+            sync_token: sync.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn absorb_pages_until_the_last_one_and_keeps_its_token() {
+        let mut listing = Listing::default();
+        assert_eq!(
+            absorb(&mut listing, page_of(&[("a", 1)], "p2", "")),
+            Some("p2".into())
+        );
+        assert!(!listing.complete());
+        assert_eq!(absorb(&mut listing, page_of(&[("b", 2)], "", "sync")), None);
+        assert!(listing.complete());
+        assert_eq!(listing.sync_token.as_deref(), Some("sync"));
+        assert_eq!(
+            listing.items,
+            vec![
+                Item {
+                    uri: "a".into(),
+                    added_at: 1
+                },
+                Item {
+                    uri: "b".into(),
+                    added_at: 2
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_last_page_without_a_token_is_incomplete() {
+        let mut listing = Listing::default();
+        assert_eq!(absorb(&mut listing, page_of(&[("a", 1)], "", "")), None);
+        assert!(!listing.complete());
+    }
+
+    #[test]
+    fn the_page_cap_stops_paging_incomplete() {
+        let mut listing = Listing::default();
+        for _ in 0..MAX_PAGES - 1 {
+            assert!(absorb(&mut listing, page_of(&[], "more", "")).is_some());
+        }
+        assert_eq!(absorb(&mut listing, page_of(&[], "more", "")), None);
+        assert!(!listing.complete());
+        assert_eq!(listing.pages, MAX_PAGES);
+    }
+
+    #[test]
+    fn delta_splits_added_and_removed() {
+        let resp = DeltaResponse {
+            delta_update_possible: true,
+            items: vec![
+                CollectionItem {
+                    uri: "a".into(),
+                    added_at: 3,
+                    ..Default::default()
+                },
+                CollectionItem {
+                    uri: "b".into(),
+                    is_removed: true,
+                    ..Default::default()
+                },
+            ],
+            sync_token: "s2".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delta_from(resp),
+            Delta::Changes {
+                added: vec![Item {
+                    uri: "a".into(),
+                    added_at: 3
+                }],
+                removed: vec!["b".into()],
+                sync_token: "s2".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_impossible_delta_is_refused() {
+        let resp = DeltaResponse {
+            delta_update_possible: false,
+            ..Default::default()
+        };
+        assert_eq!(delta_from(resp), Delta::Refused);
+    }
+
+    #[test]
+    fn a_rejected_request_is_a_protocol_change() {
+        let err = librespot_core::Error::invalid_argument("bad request");
+        assert!(matches!(
+            classify_collection(&err),
+            InternalError::ProtocolChanged(_)
+        ));
+        let err = librespot_core::Error::resource_exhausted("429");
+        assert_eq!(classify_collection(&err), InternalError::RateLimited);
     }
 }
