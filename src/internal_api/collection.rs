@@ -80,8 +80,9 @@ pub fn absorb(listing: &mut Listing, page: PageResponse) -> Option<String> {
     Some(page.next_page_token)
 }
 
+/// An empty token could not be sent back for the next delta, so that answer is no delta.
 pub fn delta_from(resp: DeltaResponse) -> Delta {
-    if !resp.delta_update_possible {
+    if !resp.delta_update_possible || resp.sync_token.is_empty() {
         return Delta::Refused;
     }
     let (removed, added): (Vec<_>, Vec<_>) = resp.items.into_iter().partition(|i| i.is_removed);
@@ -108,14 +109,30 @@ pub fn classify_collection(err: &librespot_core::Error) -> InternalError {
     }
 }
 
-async fn post<M: Message>(
+/// The answer to a delta request. A 400 there means the service rejected the token (stale or
+/// unknown), so the set is read again instead of the area being latched; a 400 on paging is
+/// still a protocol change.
+fn delta_answer(answer: Result<Vec<u8>, librespot_core::Error>) -> Result<Delta, InternalError> {
+    match answer {
+        Err(e) if e.kind == librespot_core::error::ErrorKind::InvalidArgument => Ok(Delta::Refused),
+        Err(e) => Err(classify_collection(&e)),
+        Ok(bytes) => DeltaResponse::parse_from_bytes(&bytes)
+            .map(delta_from)
+            .map_err(|e| InternalError::ProtocolChanged(format!("collection delta parse: {e}"))),
+    }
+}
+
+fn encode<M: Message>(message: &M) -> Result<Vec<u8>, InternalError> {
+    message
+        .write_to_bytes()
+        .map_err(|e| InternalError::ProtocolChanged(format!("encode: {e}")))
+}
+
+async fn post(
     session: &Session,
     endpoint: &str,
-    message: &M,
-) -> Result<Vec<u8>, InternalError> {
-    let body = message
-        .write_to_bytes()
-        .map_err(|e| InternalError::ProtocolChanged(format!("encode: {e}")))?;
+    body: Vec<u8>,
+) -> Result<Vec<u8>, librespot_core::Error> {
     let mut headers = HeaderMap::new();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(CONTENT_TYPE));
     headers.insert(header::ACCEPT, HeaderValue::from_static(CONTENT_TYPE));
@@ -129,7 +146,6 @@ async fn post<M: Message>(
         )
         .await
         .map(|bytes| bytes.to_vec())
-        .map_err(|e| classify_collection(&e))
 }
 
 pub async fn page(
@@ -145,7 +161,9 @@ pub async fn page(
         limit: PAGE_LIMIT,
         ..Default::default()
     };
-    let bytes = post(&session, "/collection/v2/paging", &request).await?;
+    let bytes = post(&session, "/collection/v2/paging", encode(&request)?)
+        .await
+        .map_err(|e| classify_collection(&e))?;
     PageResponse::parse_from_bytes(&bytes)
         .map_err(|e| InternalError::ProtocolChanged(format!("collection page parse: {e}")))
 }
@@ -162,10 +180,7 @@ pub async fn delta(
         last_sync_token: token,
         ..Default::default()
     };
-    let bytes = post(&session, "/collection/v2/delta", &request).await?;
-    DeltaResponse::parse_from_bytes(&bytes)
-        .map(delta_from)
-        .map_err(|e| InternalError::ProtocolChanged(format!("collection delta parse: {e}")))
+    delta_answer(post(&session, "/collection/v2/delta", encode(&request)?).await)
 }
 
 #[cfg(test)]
@@ -343,5 +358,52 @@ mod tests {
         ));
         let err = librespot_core::Error::resource_exhausted("429");
         assert_eq!(classify_collection(&err), InternalError::RateLimited);
+    }
+
+    #[test]
+    fn a_delta_with_an_empty_token_is_refused() {
+        let resp = DeltaResponse {
+            delta_update_possible: true,
+            items: vec![CollectionItem {
+                uri: "a".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(delta_from(resp), Delta::Refused);
+    }
+
+    #[test]
+    fn a_rejected_delta_token_is_refused_not_a_protocol_change() {
+        let err = librespot_core::Error::invalid_argument("bad request");
+        assert_eq!(delta_answer(Err(err)), Ok(Delta::Refused));
+        let err = librespot_core::Error::resource_exhausted("429");
+        assert_eq!(delta_answer(Err(err)), Err(InternalError::RateLimited));
+        let err = librespot_core::Error::failed_precondition("412");
+        assert!(matches!(
+            delta_answer(Err(err)),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+    }
+
+    #[test]
+    fn a_delta_answer_decodes_its_bytes() {
+        let resp = DeltaResponse {
+            delta_update_possible: true,
+            sync_token: "s".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            delta_answer(Ok(resp.write_to_bytes().unwrap())),
+            Ok(Delta::Changes {
+                added: vec![],
+                removed: vec![],
+                sync_token: "s".into(),
+            })
+        );
+        assert!(matches!(
+            delta_answer(Ok(vec![0xff, 0xff])),
+            Err(InternalError::ProtocolChanged(_))
+        ));
     }
 }
