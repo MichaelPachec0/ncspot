@@ -25,6 +25,7 @@ mod harness;
 mod internal_api;
 mod jukebox;
 mod library;
+mod library_collection;
 mod library_sync;
 mod lyrics;
 mod model;

@@ -16,6 +16,7 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::config::{self, CACHE_VERSION};
 use crate::events::EventManager;
+use crate::library_collection::{sort_albums, with_artist};
 use crate::library_sync::{SavedItem, SavedPage, Synced, full_fetch_due, sync_liked, sync_saved};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -682,7 +683,7 @@ impl Library {
                     .map(|saved| SavedItem {
                         id: Some(saved.album.id.id().to_string()),
                         added_at: Some(saved.added_at),
-                        value: Album::from(saved),
+                        value: with_artist(Album::from(saved)),
                     })
                     .collect(),
             })
@@ -700,18 +701,7 @@ impl Library {
             }
         };
 
-        albums.sort_unstable_by_key(|album| {
-            let album_artist = album.artists[0]
-                .strip_prefix("The ")
-                .unwrap_or(&album.artists[0]);
-            let album_title = album.title.strip_prefix("The ").unwrap_or(&album.title);
-            format!(
-                "{}{}{}",
-                album_artist.to_lowercase(),
-                album.year,
-                album_title.to_lowercase()
-            )
-        });
+        sort_albums(&mut albums);
 
         *self.albums.write().unwrap() = albums;
         self.record_full_fetch(FULL_FETCH_ALBUMS, now);
@@ -974,7 +964,7 @@ impl Library {
                 store.insert(0, album.clone());
 
                 // resort list of albums
-                store.sort_unstable_by_key(|a| format!("{}{}{}", a.artists[0], a.year, a.title));
+                sort_albums(&mut store);
             }
         }
 
