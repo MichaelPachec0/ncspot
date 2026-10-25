@@ -202,7 +202,14 @@ class Instance:
             self.tokens.append((token, temp, copy_token(token, temp)))
         # Library caches and user state keep the startup sync incremental instead of
         # a full sync per scenario against the account. Contents are never printed.
-        for name in ("albums.db", "artists.db", "playlists.db", "tracks.db", "shows.db", "episodes.db"):
+        for name in (
+            "albums.db",
+            "artists.db",
+            "playlists.db",
+            "tracks.db",
+            "shows.db",
+            "episodes.db",
+        ):
             src = os.path.join(REAL_CACHE, name)
             if os.path.exists(src):
                 shutil.copy2(src, cache)
@@ -324,13 +331,14 @@ class Instance:
             time.sleep(0.25)
 
     def wait_idle(self, timeout):
-        """Bounded wait for the startup sync to go idle and its rate limit to lapse; never fails. The dump it
-        ends on is the baseline scenarios take counter deltas from."""
+        """Bounded wait for the startup sync to finish and go idle and its rate limit to lapse;
+        never fails. The dump it ends on is the baseline scenarios take counter deltas from."""
         deadline = time.monotonic() + timeout
         while True:
             d = self.dump()
             if (
-                d["in_flight"] == 0
+                d.get("library_done")
+                and d["in_flight"] == 0
                 and (d.get("quiet_ms") or 0) >= QUIET_MS
                 and not any(d["throttled"].values())
             ) or (
@@ -566,7 +574,11 @@ def sc_library_delta(inst, args):
     d = inst.wait_library(args.settle_timeout)
     blocked_if_throttled(d, ["internal"])
     m = area_delta(inst, d, "library")
-    expect(m["internal_ok"] <= 6, "a delta sync of at most 6 requests", m)
+    expect(
+        1 <= m["internal_ok"] <= 6 and m["fallback"] == 0,
+        "a delta sync of 1 to 6 internal requests, no fallback",
+        m,
+    )
 
 
 def sc_library_area_off(inst, args):

@@ -120,10 +120,6 @@ class TokenFileTest(unittest.TestCase):
         self.assertFalse(os.path.exists(real + ".tmp"))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class AreaDeltaTest(unittest.TestCase):
     def test_area_delta_subtracts_the_baseline_and_sums_web_calls(self):
         def d(lib_ok, lib_fb, meta_ok, shared, personal):
@@ -143,3 +139,40 @@ class AreaDeltaTest(unittest.TestCase):
             drive.area_delta(Inst, now, "library"), {"internal_ok": 4, "fallback": 1, "web": 5}
         )
         self.assertEqual(drive.delta(Inst, now), {"internal_ok": 4, "fallback": 0, "web": 5})
+
+
+class LibraryDeltaTest(unittest.TestCase):
+    @staticmethod
+    def run_with(ok, fallback):
+        def d(lib_ok, lib_fb):
+            return {
+                "areas": {"library": {"internal_ok": lib_ok, "fallback": lib_fb}},
+                "web": {"shared": 0, "personal": 0},
+                "throttled": {},
+            }
+
+        class Inst:
+            base_dump = d(10, 0)
+
+            def send(self, cmd):
+                pass
+
+            def wait_library(self, timeout):
+                return d(10 + ok, fallback)
+
+        class Args:
+            settle_timeout = 1
+
+        drive.sc_library_delta(Inst(), Args())
+
+    def test_a_small_internal_delta_passes(self):
+        self.run_with(4, 0)
+
+    def test_a_fallback_no_request_or_a_repage_fails(self):
+        for ok, fallback in [(0, 1), (2, 1), (0, 0), (7, 0)]:
+            with self.assertRaises(drive.Fail, msg=(ok, fallback)):
+                self.run_with(ok, fallback)
+
+
+if __name__ == "__main__":
+    unittest.main()

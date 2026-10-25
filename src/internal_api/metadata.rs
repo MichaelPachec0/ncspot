@@ -196,6 +196,7 @@ fn convert_each<T, U>(
             Err(InternalError::NotFound) if nameless == Missing::Skip => {
                 debug!("internal metadata: skipping a {kind} without usable metadata");
             }
+            // Anything else (e.g. ProtocolChanged) signals a schema change: fail the batch.
             Err(e) => return Err(e),
         }
     }
