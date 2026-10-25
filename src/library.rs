@@ -43,6 +43,14 @@ const CACHE_ARTISTS: &str = "artists.db";
 /// Cached playlists database filename.
 const CACHE_PLAYLISTS: &str = "playlists.db";
 
+/// Cached saved shows database filename.
+#[expect(dead_code)]
+const CACHE_SHOWS: &str = "shows.db";
+
+/// Cached Your Episodes database filename.
+#[expect(dead_code)]
+const CACHE_EPISODES: &str = "episodes.db";
+
 /// The user library with all their saved tracks, albums, playlists... High level interface to the
 /// Spotify API used to manage items in the user library.
 #[derive(Clone)]
@@ -123,14 +131,15 @@ impl Library {
         library
     }
 
-    /// Load cached items from the file at `cache_path` into the given `store`.
-    fn load_cache<T: DeserializeOwned>(&self, cache_path: &Path, store: &mut Vec<T>) {
+    /// Load cached items from the file at `cache_path` into the given `store`. True when a file
+    /// was read and parsed; false when it is missing, unparseable or ignored for its version.
+    fn load_cache<T: DeserializeOwned>(&self, cache_path: &Path, store: &mut Vec<T>) -> bool {
         let saved_cache_version = self.cfg.state().cache_version;
         if saved_cache_version < CACHE_VERSION {
             debug!(
                 "Cache version for {cache_path:?} has changed from {saved_cache_version} to {CACHE_VERSION}, ignoring cache"
             );
-            return;
+            return false;
         }
 
         if let Ok(contents) = std::fs::read_to_string(cache_path) {
@@ -149,21 +158,50 @@ impl Library {
 
                     // force refresh of UI (if visible)
                     self.trigger_redraw();
+                    return true;
                 }
                 Err(e) => {
                     error!("can't parse cache: {e}");
                 }
             }
         }
+        false
     }
 
-    /// Save the items from `store` in the file at `cache_path`.
-    fn save_cache<T: Serialize>(&self, cache_path: &Path, store: &[T]) {
-        let cache_file = File::create(cache_path).unwrap();
-        let serialize_result = serde_json::to_writer(cache_file, store);
-        if let Err(message) = serialize_result {
-            error!("could not write cache: {message:?}");
+    /// Save the items from `store` in the file at `cache_path`. False (logged) on failure.
+    fn save_cache<T: Serialize>(&self, cache_path: &Path, store: &[T]) -> bool {
+        let written = File::create(cache_path)
+            .map_err(|e| e.to_string())
+            .and_then(|file| serde_json::to_writer(file, store).map_err(|e| e.to_string()));
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                error!("could not write cache {}: {e}", cache_path.display());
+                false
+            }
         }
+    }
+
+    /// The stored collection v2 sync token of `set`, if any.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn sync_token(&self, set: &str) -> Option<String> {
+        self.cfg.state().collection_sync.get(set).cloned()
+    }
+
+    /// Remember the collection v2 sync token of `set`.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn set_sync_token(&self, set: &str, token: String) {
+        self.cfg.with_state_mut(|state| {
+            state.collection_sync.insert(set.to_string(), token.clone());
+        });
+    }
+
+    /// Forget the collection v2 sync token of `set`.
+    #[cfg_attr(not(test), expect(dead_code))]
+    fn clear_sync_token(&self, set: &str) {
+        self.cfg.with_state_mut(|state| {
+            state.collection_sync.remove(set);
+        });
     }
 
     /// Check whether the `remote` [Playlist] is newer than its locally saved version. Returns
@@ -1309,12 +1347,44 @@ mod test {
         assert!(!flag.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn a_second_sync_is_skipped_while_one_runs() {
+    fn test_library() -> Arc<Library> {
         let cfg = Config::new_for_test();
+        cfg.with_state_mut(|s| s.cache_version = CACHE_VERSION);
         let ev = EventManager::new_for_test();
         let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
-        let library = Library::new_for_test(ev, spotify, cfg);
+        Library::new_for_test(ev, spotify, cfg)
+    }
+
+    #[test]
+    fn sync_tokens_are_stored_and_cleared_per_set() {
+        let library = test_library();
+        assert_eq!(library.sync_token("artist"), None);
+        library.set_sync_token("artist", "t1".into());
+        library.set_sync_token("show", "t2".into());
+        assert_eq!(library.sync_token("artist").as_deref(), Some("t1"));
+        library.clear_sync_token("artist");
+        assert_eq!(library.sync_token("artist"), None);
+        assert_eq!(library.sync_token("show").as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn cache_results_report_success() {
+        let library = test_library();
+        let dir = std::env::temp_dir().join(format!("ncspot-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.db");
+        assert!(library.save_cache(&path, &[1u32, 2]));
+        let mut store: Vec<u32> = Vec::new();
+        assert!(library.load_cache(&path, &mut store));
+        assert_eq!(store, vec![1, 2]);
+        assert!(!library.load_cache(&dir.join("missing.db"), &mut store));
+        assert!(!library.save_cache(&dir.join("no-such-dir").join("x.db"), &[1u32]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_second_sync_is_skipped_while_one_runs() {
+        let library = test_library();
         library.syncing.store(true, Ordering::SeqCst);
         *library.is_done.write().unwrap() = true;
 
