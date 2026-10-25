@@ -217,14 +217,7 @@ impl MprisPlayer {
     }
 
     fn open_uri(&self, uri: &str) {
-        let spotify_url = if uri.contains("open.spotify.com") {
-            SpotifyUrl::from_url(uri)
-        } else if let Ok(uri_type) = uri.parse() {
-            let id = &uri[uri.rfind(':').unwrap_or(0) + 1..uri.len()];
-            Some(SpotifyUrl::new(id, uri_type))
-        } else {
-            None
-        };
+        let spotify_url = SpotifyUrl::parse_any(uri);
 
         let id = spotify_url
             .as_ref()

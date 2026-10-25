@@ -1,13 +1,14 @@
 //! Rate-limit (HTTP 429) state of the Web API clients, and how it is shown to the user.
 
 use std::fmt;
+use std::ops::{Add, AddAssign};
 use std::sync::{OnceLock, RwLock};
 use std::thread::{self, ThreadId};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use log::{debug, warn};
 
-/// Longest rate-limit window ever recorded, so an absurd `Retry-After` cannot overflow `Instant`.
+/// Longest rate-limit window ever recorded, so an absurd `Retry-After` cannot overflow a [Stamp].
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Longest rate-limit window a background call waits through before retrying. Longer windows
@@ -31,6 +32,12 @@ pub const MAX_SYNC_RESUMES: u32 = 5;
 /// Shortest wait before a resumed library sync. Spotify counts requests over a rolling 30s
 /// window.
 pub const RESUME_MIN_DELAY: Duration = Duration::from_secs(30);
+
+/// Time between two probe requests through a long rate-limit window. Spotify can send a
+/// `Retry-After` of many hours and lift the limit long before it ends, so a background call
+/// may send one request through the window this often: a success closes the window, a 429
+/// replaces it with the new `Retry-After`. Windows up to this long are never probed.
+pub const PROBE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// Shortest time between two rate-limit events (log line and desktop notification) for one
 /// client.
@@ -91,6 +98,18 @@ pub fn is_ui_thread() -> bool {
 pub enum ClientLabel {
     Shared,
     Personal,
+    /// Spotify's internal API over the librespot session (per account, no app quota).
+    Internal,
+}
+
+impl ClientLabel {
+    /// Name for log lines and notifications: `internal API`, or `<label> client ID`.
+    pub fn describe(self) -> String {
+        match self {
+            Self::Internal => self.to_string(),
+            _ => format!("{self} client ID"),
+        }
+    }
 }
 
 impl fmt::Display for ClientLabel {
@@ -98,6 +117,7 @@ impl fmt::Display for ClientLabel {
         match self {
             Self::Shared => write!(f, "shared"),
             Self::Personal => write!(f, "personal"),
+            Self::Internal => write!(f, "internal API"),
         }
     }
 }
@@ -110,59 +130,163 @@ pub fn parse_retry_after(value: Option<&str>) -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
-/// Rate-limit state of one client: when its current window ends, when it last got a 429, and
-/// when it last announced a rate limit to the user.
+/// A point in time for rate-limit windows, on a clock that keeps running while the machine is
+/// suspended. `std::time::Instant` is `CLOCK_MONOTONIC` on Linux, which stops during suspend,
+/// so a window open when the lid closes would last the whole suspend longer in real time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Stamp(Duration);
+
+impl Stamp {
+    /// The current time on the suspend-aware clock.
+    pub fn now() -> Self {
+        Self(clock_now())
+    }
+
+    /// The current time, or `None` if the clock can't be read. For code that must not panic,
+    /// such as a `Drop` that may run during unwinding.
+    pub fn try_now() -> Option<Self> {
+        try_clock_now().map(Self)
+    }
+
+    /// Milliseconds since the clock's origin, for storing a stamp in an atomic.
+    pub fn as_millis(self) -> u64 {
+        u64::try_from(self.0.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The stamp `ms` milliseconds after the clock's origin (inverse of [Self::as_millis]).
+    #[cfg(any(test, feature = "harness"))]
+    pub fn from_millis(ms: u64) -> Self {
+        Self(Duration::from_millis(ms))
+    }
+
+    /// `self + duration`, or `None` on overflow.
+    pub fn checked_add(self, duration: Duration) -> Option<Self> {
+        self.0.checked_add(duration).map(Self)
+    }
+
+    /// Time from `earlier` to `self`, or zero if `earlier` is later.
+    pub fn saturating_duration_since(self, earlier: Self) -> Duration {
+        self.0.saturating_sub(earlier.0)
+    }
+}
+
+impl Add<Duration> for Stamp {
+    type Output = Self;
+
+    fn add(self, duration: Duration) -> Self {
+        Self(self.0 + duration)
+    }
+}
+
+impl AddAssign<Duration> for Stamp {
+    fn add_assign(&mut self, duration: Duration) {
+        self.0 += duration;
+    }
+}
+
+fn clock_now() -> Duration {
+    try_clock_now().expect("clock_gettime(CLOCK_BOOTTIME) failed")
+}
+
+/// Time since boot, including time spent suspended.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn try_clock_now() -> Option<Duration> {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec. CLOCK_BOOTTIME exists since Linux 2.6.39.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    (rc == 0).then(|| Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+/// Time since the first call. Elsewhere, `Instant` is the best portable clock.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn try_clock_now() -> Option<Duration> {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    Some(START.get_or_init(std::time::Instant::now).elapsed())
+}
+
+/// Rate-limit state of one client: when its current window ends, when it last got a 429, when
+/// it last announced a rate limit to the user, and when a request may next probe the window.
 #[derive(Debug, Default)]
 pub struct ThrottleState {
-    until: Option<Instant>,
-    last_429: Option<Instant>,
-    last_event: Option<Instant>,
+    until: Option<Stamp>,
+    last_429: Option<Stamp>,
+    last_event: Option<Stamp>,
+    next_probe: Option<Stamp>,
+    probing: bool,
 }
 
 impl ThrottleState {
     /// Record a 429 response received at `now`. The window ends `window` (at most
-    /// [MAX_RETRY_AFTER]) from `now`, unless an earlier 429 already set a later end. Returns
-    /// true if this starts a new throttle episode, that is the client was not throttled before.
-    pub fn record_429(&mut self, now: Instant, window: Duration) -> bool {
+    /// [MAX_RETRY_AFTER]) from `now`, unless an earlier 429 already set a later end; the 429 of
+    /// a probe replaces the end instead. Returns true if this starts a new throttle episode,
+    /// that is the client was not throttled before.
+    pub fn record_429(&mut self, now: Stamp, window: Duration) -> bool {
         let new_episode = !self.is_active(now);
         let window = window.min(MAX_RETRY_AFTER);
         let deadline = now.checked_add(window).unwrap_or(now + MAX_RETRY_AFTER);
         self.until = Some(match self.until {
-            Some(until) if until > deadline => until,
+            Some(until) if until > deadline && !self.probing => until,
             _ => deadline,
         });
+        if new_episode || self.probing || self.next_probe.is_none() {
+            self.next_probe = Some(now + PROBE_INTERVAL);
+        }
+        self.probing = false;
         self.last_429 = Some(now);
         new_episode
     }
 
-    /// Record a successful call at `now`. The state is cleared once the window has passed; a
-    /// success inside the window (another endpoint, for example) leaves it open.
-    pub fn record_success(&mut self, now: Instant) {
-        if !self.is_active(now) {
+    /// Record a successful call at `now`. The state is cleared once the window has passed or
+    /// when the call was a probe; any other success inside the window (a request sent before
+    /// the 429 arrived, for example) leaves it open.
+    pub fn record_success(&mut self, now: Stamp) {
+        if self.probing || !self.is_active(now) {
             self.until = None;
+            self.next_probe = None;
+            self.probing = false;
         }
     }
 
+    /// Claim the probe of the window at `now`: true if the window is open and a probe is due,
+    /// and then no other probe is due for [PROBE_INTERVAL]. The caller sends one request and
+    /// reports it through [Self::record_success], [Self::record_429] or [Self::abandon_probe].
+    pub fn claim_probe(&mut self, now: Stamp) -> bool {
+        if self.probing || !self.is_active(now) || self.next_probe.is_none_or(|due| due > now) {
+            return false;
+        }
+        self.probing = true;
+        self.next_probe = Some(now + PROBE_INTERVAL);
+        true
+    }
+
+    /// Forget a claimed probe whose request failed for a reason other than a rate limit.
+    pub fn abandon_probe(&mut self) {
+        self.probing = false;
+    }
+
     /// Whether the window is still open at `now`.
-    pub fn is_active(&self, now: Instant) -> bool {
+    pub fn is_active(&self, now: Stamp) -> bool {
         self.until.is_some_and(|until| until > now)
     }
 
     /// Time left in the window at `now`, or `None` if not throttled.
-    pub fn remaining(&self, now: Instant) -> Option<Duration> {
+    pub fn remaining(&self, now: Stamp) -> Option<Duration> {
         self.until
             .map(|until| until.saturating_duration_since(now))
             .filter(|remaining| !remaining.is_zero())
     }
 
     /// Whether a 429 was recorded at or after `since`, even if its window has closed since.
-    pub fn rate_limited_since(&self, since: Instant) -> bool {
+    pub fn rate_limited_since(&self, since: Stamp) -> bool {
         self.last_429.is_some_and(|at| at >= since)
     }
 
     /// Whether a rate limit should be announced to the user at `now`: true, and remembered, if
     /// nothing was announced in the last [NOTIFY_COOLDOWN].
-    pub fn should_announce(&mut self, now: Instant) -> bool {
+    pub fn should_announce(&mut self, now: Stamp) -> bool {
         if self
             .last_event
             .is_some_and(|at| now.saturating_duration_since(at) < NOTIFY_COOLDOWN)
@@ -196,7 +320,8 @@ pub fn format_status_segment(status: &[(ClientLabel, Duration)]) -> String {
 #[cfg_attr(not(feature = "notify"), allow(dead_code))]
 pub fn notification_body(client: ClientLabel, retry_after: Duration) -> String {
     format!(
-        "{client} client ID, retrying in {}s",
+        "{}, retrying in {}s",
+        client.describe(),
         ceil_secs(retry_after)
     )
 }
@@ -260,7 +385,8 @@ pub enum Attempt<R> {
 /// rate-limit handling:
 ///
 /// - before every request, [gate] decides: send, wait (background threads, short windows
-///   only), or fail without sending;
+///   only), or fail without sending; a background call that would fail sends instead when it
+///   can claim the window's probe ([ThrottleState::claim_probe]);
 /// - a 429 calls `on_429` with the window to record (`Retry-After`, or [backoff] if missing),
 ///   then the gate decides again; after [MAX_RATE_LIMIT_RETRIES] retries the call fails.
 ///
@@ -275,20 +401,25 @@ pub fn run_rate_limited<R>(
 ) -> Result<R, Option<u16>> {
     let mut retries = 0;
     loop {
-        loop {
-            let remaining = throttle.read().unwrap().remaining(Instant::now());
+        let probing = loop {
+            let now = Stamp::now();
+            let remaining = throttle.read().unwrap().remaining(now);
             match gate(remaining, on_ui_thread, jitter()) {
-                Gate::Send => break,
+                Gate::Send => break false,
                 Gate::Wait(delay) => thread::sleep(delay),
+                Gate::FailFast if !on_ui_thread && throttle.write().unwrap().claim_probe(now) => {
+                    debug!("probing the rate-limit window of the {}", label.describe());
+                    break true;
+                }
                 Gate::FailFast => {
-                    debug!("rate limited on the {label} client ID, request not sent");
+                    debug!("rate limited on the {}, request not sent", label.describe());
                     return Err(Some(429));
                 }
             }
-        }
+        };
         match send() {
             Attempt::Done(value) => {
-                throttle.write().unwrap().record_success(Instant::now());
+                throttle.write().unwrap().record_success(Stamp::now());
                 return Ok(value);
             }
             Attempt::RateLimited(retry_after) => {
@@ -299,19 +430,28 @@ pub fn run_rate_limited<R>(
                         .unwrap_or_else(|| backoff(retries)),
                 );
                 if on_ui_thread {
-                    debug!("rate limited on the {label} client ID, UI thread call not retried");
+                    debug!(
+                        "rate limited on the {}, UI thread call not retried",
+                        label.describe()
+                    );
                     return Err(Some(429));
                 }
                 if retries == MAX_RATE_LIMIT_RETRIES {
                     warn!(
-                        "giving up on a call to the {label} client ID after \
-                         {MAX_RATE_LIMIT_RETRIES} rate-limited retries"
+                        "giving up on a call to the {} after \
+                         {MAX_RATE_LIMIT_RETRIES} rate-limited retries",
+                        label.describe()
                     );
                     return Err(Some(429));
                 }
                 retries += 1;
             }
-            Attempt::Failed(status) => return Err(status),
+            Attempt::Failed(status) => {
+                if probing {
+                    throttle.write().unwrap().abandon_probe();
+                }
+                return Err(status);
+            }
         }
     }
 }
@@ -324,8 +464,28 @@ mod test {
     const MS: fn(u64) -> Duration = Duration::from_millis;
 
     #[test]
+    fn describe_adds_client_id_except_for_internal() {
+        assert_eq!(ClientLabel::Shared.describe(), "shared client ID");
+        assert_eq!(ClientLabel::Personal.describe(), "personal client ID");
+        assert_eq!(ClientLabel::Internal.describe(), "internal API");
+    }
+
+    #[test]
+    fn internal_label_is_named_without_client_id() {
+        assert_eq!(ClientLabel::Internal.to_string(), "internal API");
+        assert_eq!(
+            notification_body(ClientLabel::Internal, SECS(5)),
+            "internal API, retrying in 5s"
+        );
+        assert_eq!(
+            format_status_segment(&[(ClientLabel::Internal, SECS(5))]),
+            "[rate limited: internal API 5s] "
+        );
+    }
+
+    #[test]
     fn a_huge_retry_after_is_capped_and_does_not_panic() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(now, Duration::from_secs(u64::MAX));
         assert_eq!(state.remaining(now), Some(MAX_RETRY_AFTER));
@@ -347,7 +507,7 @@ mod test {
 
     #[test]
     fn a_429_opens_a_window_of_retry_after() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(now, SECS(30));
         assert_eq!(state.remaining(now), Some(SECS(30)));
@@ -357,7 +517,7 @@ mod test {
 
     #[test]
     fn a_shorter_retry_after_keeps_the_later_deadline() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(now, SECS(30));
         state.record_429(now + SECS(1), SECS(5));
@@ -366,7 +526,7 @@ mod test {
 
     #[test]
     fn a_longer_retry_after_extends_the_deadline() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(now, SECS(5));
         state.record_429(now + SECS(1), SECS(30));
@@ -375,7 +535,7 @@ mod test {
 
     #[test]
     fn success_inside_the_window_keeps_it() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(now, SECS(30));
         state.record_success(now + SECS(10));
@@ -384,7 +544,7 @@ mod test {
 
     #[test]
     fn success_after_the_window_clears_it() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(now, SECS(30));
         state.record_success(now + SECS(31));
@@ -395,13 +555,13 @@ mod test {
     #[test]
     fn not_throttled_by_default() {
         let state = ThrottleState::default();
-        assert!(!state.is_active(Instant::now()));
-        assert_eq!(state.remaining(Instant::now()), None);
+        assert!(!state.is_active(Stamp::now()));
+        assert_eq!(state.remaining(Stamp::now()), None);
     }
 
     #[test]
     fn episode_starts_on_first_429_only() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         assert!(state.record_429(now, SECS(30)));
         assert!(!state.record_429(now + SECS(10), SECS(30)));
@@ -409,7 +569,7 @@ mod test {
 
     #[test]
     fn a_429_after_the_window_starts_a_new_episode() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         assert!(state.record_429(now, SECS(30)));
         assert!(state.record_429(now + SECS(31), SECS(30)));
@@ -519,7 +679,7 @@ mod test {
 
     #[test]
     fn rate_limited_since_tracks_the_last_429() {
-        let start = Instant::now();
+        let start = Stamp::now();
         let mut state = ThrottleState::default();
         assert!(!state.rate_limited_since(start));
         state.record_429(start + SECS(1), SECS(5));
@@ -530,7 +690,7 @@ mod test {
 
     #[test]
     fn rate_limited_since_survives_the_window_closing() {
-        let start = Instant::now();
+        let start = Stamp::now();
         let mut state = ThrottleState::default();
         state.record_429(start, SECS(1));
         state.record_success(start + SECS(5));
@@ -540,17 +700,17 @@ mod test {
 
     #[test]
     fn should_announce_once_per_cooldown() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         assert!(state.should_announce(now));
         assert!(!state.should_announce(now + SECS(1)));
-        assert!(!state.should_announce(now + NOTIFY_COOLDOWN - MS(1)));
+        assert!(!state.should_announce(now + (NOTIFY_COOLDOWN - MS(1))));
         assert!(state.should_announce(now + NOTIFY_COOLDOWN));
     }
 
     #[test]
     fn back_to_back_backoff_episodes_announce_once() {
-        let now = Instant::now();
+        let now = Stamp::now();
         let mut state = ThrottleState::default();
         let mut announced = 0;
         let mut t = now;
@@ -593,10 +753,7 @@ mod test {
     #[test]
     fn run_sends_nothing_inside_a_long_window() {
         let throttle = RwLock::new(ThrottleState::default());
-        throttle
-            .write()
-            .unwrap()
-            .record_429(Instant::now(), SECS(60));
+        throttle.write().unwrap().record_429(Stamp::now(), SECS(60));
         let calls = Cell::new(0);
         let result: Result<(), _> = run_rate_limited(
             ClientLabel::Personal,
@@ -616,10 +773,7 @@ mod test {
     #[test]
     fn run_on_the_ui_thread_sends_nothing_inside_a_short_window() {
         let throttle = RwLock::new(ThrottleState::default());
-        throttle
-            .write()
-            .unwrap()
-            .record_429(Instant::now(), SECS(1));
+        throttle.write().unwrap().record_429(Stamp::now(), SECS(1));
         let calls = Cell::new(0);
         let result: Result<(), _> = run_rate_limited(
             ClientLabel::Shared,
@@ -639,8 +793,8 @@ mod test {
     #[test]
     fn run_waits_out_a_short_window_in_the_background() {
         let throttle = RwLock::new(ThrottleState::default());
-        let start = Instant::now();
-        throttle.write().unwrap().record_429(start, MS(50));
+        let start = std::time::Instant::now();
+        throttle.write().unwrap().record_429(Stamp::now(), MS(50));
         let result = run_rate_limited(
             ClientLabel::Shared,
             &throttle,
@@ -713,7 +867,7 @@ mod test {
                 Attempt::RateLimited(Some(SECS(2)))
             },
             |window| {
-                throttle.write().unwrap().record_429(Instant::now(), window);
+                throttle.write().unwrap().record_429(Stamp::now(), window);
             },
         );
         assert_eq!(result, Err(Some(429)));
@@ -734,7 +888,7 @@ mod test {
                 Attempt::RateLimited(Some(Duration::ZERO))
             },
             |window| {
-                throttle.write().unwrap().record_429(Instant::now(), window);
+                throttle.write().unwrap().record_429(Stamp::now(), window);
             },
         );
         assert_eq!(result, Err(Some(429)));
@@ -778,7 +932,7 @@ mod test {
         );
         assert_eq!(result, Ok("ok"));
         assert_eq!(calls.get(), 2);
-        assert_eq!(throttle.read().unwrap().remaining(Instant::now()), None);
+        assert_eq!(throttle.read().unwrap().remaining(Stamp::now()), None);
     }
 
     #[test]
@@ -798,5 +952,177 @@ mod test {
         );
         assert_eq!(result, Err(Some(500)));
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn stamps_move_forward_and_add_durations() {
+        let a = Stamp::now();
+        let b = Stamp::now();
+        assert!(b >= a);
+        assert_eq!((a + SECS(5)).saturating_duration_since(a), SECS(5));
+        assert_eq!(a.saturating_duration_since(a + SECS(5)), Duration::ZERO);
+    }
+
+    #[test]
+    fn stamps_round_trip_through_milliseconds() {
+        let stamp = Stamp::from_millis(1_234);
+        assert_eq!(stamp.as_millis(), 1_234);
+        assert_eq!(
+            Stamp::from_millis(1_500).saturating_duration_since(stamp),
+            Duration::from_millis(266)
+        );
+    }
+
+    #[test]
+    fn try_now_reads_the_same_clock_as_now() {
+        let before = Stamp::now();
+        let read = Stamp::try_now().expect("the clock is readable");
+        assert!(read >= before);
+        assert!(Stamp::now() >= read);
+    }
+
+    #[test]
+    fn a_long_window_allows_one_probe_per_interval() {
+        let now = Stamp::now();
+        let mut state = ThrottleState::default();
+        state.record_429(now, SECS(3600));
+        assert!(!state.claim_probe(now));
+        assert!(!state.claim_probe(now + (PROBE_INTERVAL - MS(1))));
+        assert!(state.claim_probe(now + PROBE_INTERVAL));
+        assert!(!state.claim_probe(now + PROBE_INTERVAL));
+        state.abandon_probe();
+        assert!(state.claim_probe(now + PROBE_INTERVAL * 2));
+    }
+
+    #[test]
+    fn a_window_shorter_than_the_probe_interval_is_never_probed() {
+        let now = Stamp::now();
+        let mut state = ThrottleState::default();
+        state.record_429(now, PROBE_INTERVAL);
+        assert!(!state.claim_probe(now + PROBE_INTERVAL));
+    }
+
+    #[test]
+    fn a_successful_probe_clears_the_window() {
+        let now = Stamp::now();
+        let mut state = ThrottleState::default();
+        state.record_429(now, SECS(3600));
+        assert!(state.claim_probe(now + PROBE_INTERVAL));
+        state.record_success(now + PROBE_INTERVAL);
+        assert!(!state.is_active(now + PROBE_INTERVAL));
+    }
+
+    #[test]
+    fn a_rate_limited_probe_replaces_the_deadline() {
+        let now = Stamp::now();
+        let mut state = ThrottleState::default();
+        state.record_429(now, SECS(3600));
+        assert!(state.claim_probe(now + PROBE_INTERVAL));
+        assert!(!state.record_429(now + PROBE_INTERVAL, SECS(60)));
+        assert_eq!(state.remaining(now + PROBE_INTERVAL), Some(SECS(60)));
+    }
+
+    #[test]
+    fn an_abandoned_probe_does_not_clear_the_window_on_a_later_success() {
+        let now = Stamp::now();
+        let mut state = ThrottleState::default();
+        state.record_429(now, SECS(3600));
+        assert!(state.claim_probe(now + PROBE_INTERVAL));
+        state.abandon_probe();
+        state.record_success(now + PROBE_INTERVAL);
+        assert!(state.is_active(now + PROBE_INTERVAL));
+    }
+
+    /// A throttle whose window of `window` opened now, with its probe already due. Not opened
+    /// one probe interval in the past: the clock counts from boot, so on a machine up for less
+    /// than that (a fresh CI runner) the stamp would clamp to zero and no probe would be due.
+    fn throttle_with_probe_due(window: Duration) -> RwLock<ThrottleState> {
+        let throttle = RwLock::new(ThrottleState::default());
+        let now = Stamp::now();
+        let mut state = throttle.write().unwrap();
+        state.record_429(now, window);
+        state.next_probe = Some(now);
+        drop(state);
+        throttle
+    }
+
+    #[test]
+    fn run_probes_a_long_window_from_the_background_and_clears_it() {
+        let throttle = throttle_with_probe_due(SECS(3600));
+        let calls = Cell::new(0);
+        let result = run_rate_limited(
+            ClientLabel::Personal,
+            &throttle,
+            false,
+            no_jitter,
+            || {
+                calls.set(calls.get() + 1);
+                Attempt::Done("ok")
+            },
+            |_| {},
+        );
+        assert_eq!(result, Ok("ok"));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(throttle.read().unwrap().remaining(Stamp::now()), None);
+    }
+
+    #[test]
+    fn run_never_probes_from_the_ui_thread() {
+        let throttle = throttle_with_probe_due(SECS(3600));
+        let calls = Cell::new(0);
+        let result: Result<(), _> = run_rate_limited(
+            ClientLabel::Personal,
+            &throttle,
+            true,
+            no_jitter,
+            || {
+                calls.set(calls.get() + 1);
+                Attempt::Done(())
+            },
+            |_| {},
+        );
+        assert_eq!(result, Err(Some(429)));
+        assert_eq!(calls.get(), 0);
+        assert!(throttle.read().unwrap().is_active(Stamp::now()));
+    }
+
+    #[test]
+    fn run_sends_one_probe_and_records_its_new_window() {
+        let throttle = throttle_with_probe_due(SECS(3600));
+        let calls = Cell::new(0);
+        let result: Result<(), _> = run_rate_limited(
+            ClientLabel::Personal,
+            &throttle,
+            false,
+            no_jitter,
+            || {
+                calls.set(calls.get() + 1);
+                Attempt::RateLimited(Some(SECS(120)))
+            },
+            |window| {
+                throttle.write().unwrap().record_429(Stamp::now(), window);
+            },
+        );
+        assert_eq!(result, Err(Some(429)));
+        assert_eq!(calls.get(), 1);
+        let remaining = throttle.read().unwrap().remaining(Stamp::now()).unwrap();
+        assert!(remaining <= SECS(120) && remaining > SECS(110));
+    }
+
+    #[test]
+    fn run_abandons_a_probe_that_fails_otherwise() {
+        let throttle = throttle_with_probe_due(SECS(3600));
+        let result: Result<(), _> = run_rate_limited(
+            ClientLabel::Personal,
+            &throttle,
+            false,
+            no_jitter,
+            || Attempt::Failed(Some(500)),
+            |_| {},
+        );
+        assert_eq!(result, Err(Some(500)));
+        let mut state = throttle.write().unwrap();
+        state.record_success(Stamp::now());
+        assert!(state.is_active(Stamp::now()));
     }
 }

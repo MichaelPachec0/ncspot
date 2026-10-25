@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use http::Method;
-use librespot_core::SpotifyId;
+use librespot_core::error::ErrorKind;
+use librespot_core::{Session, SpotifyId, SpotifyUri};
+use librespot_metadata::Metadata;
 
 use crate::application::ASYNC_RUNTIME;
 use crate::jukebox::model::AudioAnalysis;
@@ -78,29 +80,82 @@ impl AnalysisSource for SpclientSource {
         };
         // Validate the id; the endpoint takes the base62 track id directly.
         SpotifyId::from_base62(track_id).map_err(|e| anyhow!("invalid track id: {e:?}"))?;
-        let endpoint = format!("/audio-attributes/v1/audio-analysis/{track_id}?format=json");
 
-        let bytes = ASYNC_RUNTIME
-            .get()
-            .unwrap()
-            .block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(10),
-                    session
-                        .spclient()
-                        .request_as_json(&Method::GET, &endpoint, None, None),
-                )
-                .await
-            })
-            .map_err(|_| anyhow!("spclient audio-analysis timed out"))?
-            .map_err(|e| anyhow!("spclient audio-analysis failed: {e}"))?;
-
+        let Some(bytes) = fetch_relinked(
+            track_id,
+            |id| request_analysis(&session, id),
+            || alternatives(&session, track_id),
+        )?
+        else {
+            return Ok(None);
+        };
         let analysis: AudioAnalysis = serde_json::from_slice(&bytes)?;
         if analysis.beats.is_empty() {
             return Ok(None);
         }
         Ok(Some(analysis))
     }
+}
+
+/// Run `fut` on the async runtime, failing after 10 seconds.
+fn block_on_timeout<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, librespot_core::Error>>,
+) -> anyhow::Result<Result<T, librespot_core::Error>> {
+    ASYNC_RUNTIME
+        .get()
+        .unwrap()
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), fut).await })
+        .map_err(|_| anyhow!("spclient {what} timed out"))
+}
+
+/// The analysis of the track with base62 id `id`, or `None` if Spotify has none under it.
+fn request_analysis(session: &Session, id: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let endpoint = format!("/audio-attributes/v1/audio-analysis/{id}?format=json");
+    match block_on_timeout(
+        "audio-analysis",
+        session
+            .spclient()
+            .request_as_json(&Method::GET, &endpoint, None, None),
+    )? {
+        Ok(bytes) => Ok(Some(bytes.to_vec())),
+        Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow!("spclient audio-analysis failed: {e}")),
+    }
+}
+
+/// Base62 ids of the alternatives of track `track_id`, the tracks playback is relinked to when
+/// the track itself is not available in the user's market.
+fn alternatives(session: &Session, track_id: &str) -> anyhow::Result<Vec<String>> {
+    let uri = SpotifyUri::from_uri(&format!("spotify:track:{track_id}"))
+        .map_err(|e| anyhow!("invalid track id: {e:?}"))?;
+    let track = block_on_timeout(
+        "track metadata",
+        librespot_metadata::Track::get(session, &uri),
+    )?
+    .map_err(|e| anyhow!("track metadata failed: {e}"))?;
+    Ok(track.alternatives.iter().map(SpotifyUri::to_id).collect())
+}
+
+/// Fetch the analysis of `track_id` with `request`, and when there is none under that id, of
+/// each of its `alternatives` in order. A track relinked in the user's market (no audio files
+/// of its own, played through an alternative) has its analysis only under the alternative's
+/// id. An error stops the lookup.
+fn fetch_relinked(
+    track_id: &str,
+    request: impl Fn(&str) -> anyhow::Result<Option<Vec<u8>>>,
+    alternatives: impl FnOnce() -> anyhow::Result<Vec<String>>,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    if let Some(body) = request(track_id)? {
+        return Ok(Some(body));
+    }
+    for alt in alternatives()? {
+        if let Some(body) = request(&alt)? {
+            log::debug!("audio analysis of {track_id} found under its alternative {alt}");
+            return Ok(Some(body));
+        }
+    }
+    Ok(None)
 }
 
 /// Eternalbox wraps the Spotify analysis under an `analysis` key. The inner object's field
@@ -110,10 +165,28 @@ struct EternalboxResponse {
     analysis: AudioAnalysis,
 }
 
+/// How long an eternalbox instance that could not be reached is skipped.
+const ETERNALBOX_COOLDOWN: Duration = Duration::from_secs(10 * 60);
+
+/// Longest wait for a connection to the eternalbox instance.
+const ETERNALBOX_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Fallback source: a public eternalbox instance (configurable). Serves only already-cached
-/// analyses (non-200 for un-analyzed tracks -> treated as "no analysis").
+/// analyses (non-200 for un-analyzed tracks -> treated as "no analysis"). When the instance
+/// cannot be reached it is skipped for [ETERNALBOX_COOLDOWN], so a dead instance does not
+/// cost a timeout on every track.
 pub struct EternalboxSource {
-    pub base_url: String,
+    base_url: String,
+    down_until: Mutex<Option<Instant>>,
+}
+
+impl EternalboxSource {
+    pub fn new(base_url: String) -> Self {
+        Self {
+            base_url,
+            down_until: Mutex::new(None),
+        }
+    }
 }
 
 impl AnalysisSource for EternalboxSource {
@@ -122,7 +195,10 @@ impl AnalysisSource for EternalboxSource {
     }
 
     fn enabled(&self) -> bool {
-        true
+        self.down_until
+            .lock()
+            .unwrap()
+            .is_none_or(|until| until <= Instant::now())
     }
 
     fn fetch(&self, track_id: &str) -> anyhow::Result<Option<AudioAnalysis>> {
@@ -130,10 +206,23 @@ impl AnalysisSource for EternalboxSource {
             "{}/api/analysis/analyse/{track_id}",
             self.base_url.trim_end_matches('/')
         );
-        let resp = reqwest::blocking::Client::new()
-            .get(&url)
+        let sent = reqwest::blocking::Client::builder()
+            .connect_timeout(ETERNALBOX_CONNECT_TIMEOUT)
             .timeout(Duration::from_secs(10))
-            .send()?;
+            .build()?
+            .get(&url)
+            .send();
+        let resp = match sent {
+            Ok(resp) => resp,
+            Err(e) => {
+                *self.down_until.lock().unwrap() = Some(Instant::now() + ETERNALBOX_COOLDOWN);
+                return Err(anyhow!(
+                    "{} unreachable, skipped for {}s: {e}",
+                    self.base_url,
+                    ETERNALBOX_COOLDOWN.as_secs()
+                ));
+            }
+        };
         if !resp.status().is_success() {
             return Ok(None);
         }
@@ -143,6 +232,17 @@ impl AnalysisSource for EternalboxSource {
         }
         Ok(Some(parsed.analysis))
     }
+}
+
+/// Outcome of looking up the analysis of a track across the sources.
+#[derive(Debug)]
+pub enum Lookup {
+    Found(AudioAnalysis),
+    /// Every source answered and none has an analysis of the track.
+    Missing,
+    /// No analysis found and at least one source failed (timeout, network), so a later
+    /// lookup may succeed.
+    Failed,
 }
 
 pub struct AnalysisManager {
@@ -160,11 +260,12 @@ impl AnalysisManager {
     }
 
     /// Returns the first analysis produced by an enabled source in `order`, caching it.
-    pub fn fetch(&self, order: &[String], track_id: &str) -> Option<AudioAnalysis> {
+    pub fn fetch(&self, order: &[String], track_id: &str) -> Lookup {
         let key = Self::cache_key(track_id);
         if let Some(hit) = self.cache.get(&key) {
-            return Some(hit);
+            return Lookup::Found(hit);
         }
+        let mut failed = false;
         for id in order {
             let Some(src) = self.sources.iter().find(|s| s.id() == id) else {
                 continue;
@@ -175,13 +276,20 @@ impl AnalysisManager {
             match src.fetch(track_id) {
                 Ok(Some(a)) => {
                     self.cache.put(&key, &a);
-                    return Some(a);
+                    return Lookup::Found(a);
                 }
                 Ok(None) => {}
-                Err(e) => log::warn!("analysis source {id} failed: {e}"),
+                Err(e) => {
+                    log::warn!("analysis source {id} failed: {e}");
+                    failed = true;
+                }
             }
         }
-        None
+        if failed {
+            Lookup::Failed
+        } else {
+            Lookup::Missing
+        }
     }
 }
 
@@ -270,7 +378,139 @@ mod tests {
             AnalysisCache::new(dir.clone()),
         );
         let order = vec!["spclient".to_string(), "eternalbox".to_string()];
-        assert!(mgr.fetch(&order, "trackid1").is_some());
+        assert!(matches!(mgr.fetch(&order, "trackid1"), Lookup::Found(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct Failing;
+    impl AnalysisSource for Failing {
+        fn id(&self) -> &str {
+            "failing"
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn fetch(&self, _t: &str) -> anyhow::Result<Option<AudioAnalysis>> {
+            Err(anyhow!("timed out"))
+        }
+    }
+
+    fn manager(name: &str, sources: Vec<Box<dyn AnalysisSource>>) -> (AnalysisManager, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("ncspot-jb-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (
+            AnalysisManager::new(sources, AnalysisCache::new(dir.clone())),
+            dir,
+        )
+    }
+
+    #[test]
+    fn manager_reports_missing_when_every_source_has_none() {
+        let (mgr, dir) = manager(
+            "missing",
+            vec![Box::new(Mock {
+                id: "spclient",
+                result: None,
+            })],
+        );
+        assert!(matches!(
+            mgr.fetch(&["spclient".to_string()], "t"),
+            Lookup::Missing
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manager_reports_failed_when_a_source_errored_and_none_found() {
+        let (mgr, dir) = manager(
+            "failed",
+            vec![
+                Box::new(Failing),
+                Box::new(Mock {
+                    id: "spclient",
+                    result: None,
+                }),
+            ],
+        );
+        let order = vec!["failing".to_string(), "spclient".to_string()];
+        assert!(matches!(mgr.fetch(&order, "t"), Lookup::Failed));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn manager_prefers_a_found_analysis_over_an_earlier_error() {
+        let (mgr, dir) = manager(
+            "found-after-error",
+            vec![
+                Box::new(Failing),
+                Box::new(Mock {
+                    id: "spclient",
+                    result: Some(sample()),
+                }),
+            ],
+        );
+        let order = vec!["failing".to_string(), "spclient".to_string()];
+        assert!(matches!(mgr.fetch(&order, "t"), Lookup::Found(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreachable_eternalbox_is_skipped_for_a_cooldown() {
+        // Port 9 (discard) on localhost refuses the connection at once.
+        let src = EternalboxSource::new("http://127.0.0.1:9".to_string());
+        assert!(src.enabled());
+        assert!(src.fetch("4cOdK2wGLETKBW3PvgPWqT").is_err());
+        assert!(!src.enabled());
+    }
+
+    use std::cell::RefCell;
+
+    #[test]
+    fn relinked_lookup_uses_the_track_itself_when_it_has_an_analysis() {
+        let body = fetch_relinked(
+            "main",
+            |id| Ok((id == "main").then(|| b"main".to_vec())),
+            || panic!("alternatives must not be looked up"),
+        )
+        .unwrap();
+        assert_eq!(body, Some(b"main".to_vec()));
+    }
+
+    #[test]
+    fn relinked_lookup_tries_alternatives_in_order() {
+        let asked = RefCell::new(Vec::new());
+        let body = fetch_relinked(
+            "main",
+            |id| {
+                asked.borrow_mut().push(id.to_string());
+                Ok((id == "alt2").then(|| b"alt2".to_vec()))
+            },
+            || {
+                Ok(vec![
+                    "alt1".to_string(),
+                    "alt2".to_string(),
+                    "alt3".to_string(),
+                ])
+            },
+        )
+        .unwrap();
+        assert_eq!(body, Some(b"alt2".to_vec()));
+        assert_eq!(*asked.borrow(), vec!["main", "alt1", "alt2"]);
+    }
+
+    #[test]
+    fn relinked_lookup_without_alternatives_is_missing() {
+        let body = fetch_relinked("main", |_| Ok(None), || Ok(vec![])).unwrap();
+        assert_eq!(body, None);
+    }
+
+    #[test]
+    fn relinked_lookup_does_not_try_alternatives_after_an_error() {
+        let result = fetch_relinked(
+            "main",
+            |_| Err(anyhow!("timed out")),
+            || panic!("alternatives must not be looked up"),
+        );
+        assert!(result.is_err());
     }
 }

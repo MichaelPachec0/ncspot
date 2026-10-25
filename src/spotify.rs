@@ -91,6 +91,7 @@ impl Spotify {
             channel: Arc::new(RwLock::new(None)),
             session: Arc::new(RwLock::new(None)),
         };
+        spotify.api.set_session(spotify.session.clone());
 
         let (user_tx, user_rx) = oneshot::channel();
         spotify.start_worker(Some(user_tx))?;
@@ -114,7 +115,9 @@ impl Spotify {
     /// no network connections are made.
     #[cfg(test)]
     pub fn new_for_test(cfg: Arc<config::Config>, events: EventManager) -> Self {
-        let api = WebApi::new(&cfg);
+        let mut api = WebApi::new(&cfg);
+        let session = Arc::new(RwLock::new(None));
+        api.set_session(Arc::clone(&session));
         Self {
             events,
             #[cfg(feature = "mpris")]
@@ -126,7 +129,7 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
-            session: Arc::new(RwLock::new(None)),
+            session,
         }
     }
 
@@ -315,8 +318,10 @@ impl Spotify {
                 return;
             }
         };
-        user_tx.map(|tx| tx.send(session.username()));
+        // Set the handle before unblocking startup: the library's first current_user call runs
+        // right after Spotify::new returns and must find the session.
         *session_handle.write().unwrap() = Some(session.clone());
+        user_tx.map(|tx| tx.send(session.username()));
 
         let mixer_factory_opt = librespot_playback::mixer::find(Some(SoftMixer::NAME));
         let factory = mixer_factory_opt.expect("could not find softvol mixer factory");

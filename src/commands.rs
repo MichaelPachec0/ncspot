@@ -389,6 +389,26 @@ impl CommandManager {
                 "The command \"{}\" is unsupported in this view",
                 cmd.basename()
             )),
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::Dump(path)) => {
+                // Read before this command's own result replaces the last error.
+                let (title, state, error) = s
+                    .call_on_name("main", |v: &mut Layout| v.harness_view())
+                    .unwrap_or_default();
+                let dump = crate::harness::build_dump(title, state, error, &self.spotify.api);
+                crate::harness::write_dump(std::path::Path::new(path), &dump).map_err(|e| {
+                    error!("harness dump to {path} failed: {e}");
+                    format!("harness dump failed: {e}")
+                })?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::Open(target)) => {
+                let view =
+                    crate::harness::open_view(self.queue.clone(), self.library.clone(), target)?;
+                s.call_on_name("main", move |v: &mut Layout| v.push_view(view));
+                Ok(None)
+            }
         }
     }
 

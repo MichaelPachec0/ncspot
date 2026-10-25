@@ -44,6 +44,7 @@ codegen-units = 16
 
 [dependencies]
 anyhow = "1"
+protobuf = "3.7"
 chrono = "0.4"
 clap = "4.6.1"
 arboard = {version = "3.6", optional = true}
@@ -110,6 +111,7 @@ mpris = ["zbus"] # Allow ncspot to be controlled via MPRIS API
 ncurses_backend = ["cursive/ncurses-backend"]
 notify = ["notify-rust"] # Show what's playing via a notification
 crossterm_backend = ["cursive/crossterm-backend"]
+harness = [] # Drive harness IPC commands (developer tool, see doc/developers.md)
 pancurses_backend = ["cursive/pancurses-backend", "pancurses/win32"]
 portaudio_backend = ["librespot-playback/portaudio-backend"]
 pulseaudio_backend = ["librespot-playback/pulseaudio-backend"]

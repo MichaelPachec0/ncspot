@@ -107,6 +107,11 @@ pub struct ConfigValues {
     /// Personal Spotify Web API client ID. Overridden by the `NCSPOT_CLIENT_ID` environment
     /// variable and the `--client-id` flag.
     pub client_id: Option<String>,
+    /// Use Spotify's internal API (over the librespot session) for bulk requests, with the Web
+    /// API as fallback. Missing: on (see `internal_api::INTERNAL_API_DEFAULT`).
+    pub internal_api: Option<bool>,
+    /// Per-area switches for the internal API, only read when `internal_api` is on.
+    pub internal_api_areas: Option<InternalApiAreas>,
     /// Proxy used for all of ncspot's network traffic: the Spotify access
     /// point, the Spotify APIs, OAuth and cover art downloads. Supported
     /// schemes: `http://` (CONNECT proxy) and `socks5h://` (SOCKS5 proxy with
@@ -114,6 +119,13 @@ pub struct ConfigValues {
     pub proxy: Option<String>,
     pub lyrics: Option<LyricsConfig>,
     pub jukebox: Option<JukeboxConfig>,
+}
+
+/// Per-area switches of the internal API. A missing key means on.
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct InternalApiAreas {
+    /// Tracks, albums, artists, shows, episodes and the current user.
+    pub metadata: Option<bool>,
 }
 
 /// Configuration for the lyrics feature.
@@ -322,6 +334,14 @@ impl Config {
             id: id.to_string(),
             source: ClientIdSource::Config,
         });
+        cfg
+    }
+
+    /// Like [Config::new_for_test], with the given configuration values.
+    #[cfg(test)]
+    pub fn new_for_test_with_values(values: ConfigValues) -> std::sync::Arc<Self> {
+        let cfg = Self::new_for_test();
+        *cfg.values.write().unwrap() = values;
         cfg
     }
 

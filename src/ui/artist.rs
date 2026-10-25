@@ -113,6 +113,13 @@ impl ViewWrapper for ArtistView {
 }
 
 impl ViewExt for ArtistView {
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let mut state = self.tabs.harness_state()?;
+        state.view = "artist".into();
+        Some(state)
+    }
+
     fn title(&self) -> String {
         self.artist.name.clone()
     }

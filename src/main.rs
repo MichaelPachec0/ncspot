@@ -10,6 +10,7 @@ use config::set_configuration_base_path;
 use log::error;
 use ncspot::program_arguments;
 
+mod activity;
 mod application;
 mod authentication;
 mod cli;
@@ -19,12 +20,17 @@ mod commands;
 mod config;
 mod events;
 mod ext_traits;
+#[cfg(feature = "harness")]
+mod harness;
+mod internal_api;
 mod jukebox;
 mod library;
 mod library_sync;
 mod lyrics;
 mod model;
 mod panic;
+#[cfg(test)]
+mod probe_tests;
 mod queue;
 mod rate_limit;
 mod serialization;

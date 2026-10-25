@@ -65,6 +65,8 @@ const JUKEBOX_SEEK_CMD: &str = "jukeboxseek";
 const JUKEBOX_SETTINGS_CMD: &str = "jukeboxsettings";
 const JUKEBOX_GRAPHICS_CMD: &str = "jukeboxgraphics";
 const JUKEBOX_SONG_SETTINGS_CMD: &str = "jukeboxsongsettings";
+#[cfg(feature = "harness")]
+const HARNESS_CMD: &str = "harness";
 
 pub const ALL_COMMANDS: &[&str] = &[
     QUIT_CMD,
@@ -235,6 +237,16 @@ impl fmt::Display for InsertSource {
     }
 }
 
+/// Drive harness subcommands (feature `harness`).
+#[cfg(feature = "harness")]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
+pub enum HarnessCommand {
+    /// Push the view for a Spotify URI or URL; validated when run.
+    Open(String),
+    /// Write a JSON snapshot of the current view to a file.
+    Dump(String),
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub enum Command {
     Quit,
@@ -294,6 +306,8 @@ pub enum Command {
     JukeboxSettings,
     JukeboxGraphics,
     JukeboxSongSettings,
+    #[cfg(feature = "harness")]
+    Harness(HarnessCommand),
 }
 
 impl fmt::Display for Command {
@@ -315,6 +329,10 @@ impl fmt::Display for Command {
             #[cfg(feature = "share_clipboard")]
             Self::Share(mode) => vec![mode.to_string()],
             Self::Open(mode) => vec![mode.to_string()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::Open(target)) => vec!["open".into(), target.clone()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::Dump(path)) => vec!["dump".into(), path.clone()],
             Self::Goto(mode) => vec![mode.to_string()],
             Self::Move(mode, amount) => match (mode, amount) {
                 (MoveMode::Playing, _) => vec!["playing".to_string()],
@@ -442,6 +460,8 @@ impl Command {
             Self::JukeboxSettings => JUKEBOX_SETTINGS_CMD,
             Self::JukeboxGraphics => JUKEBOX_GRAPHICS_CMD,
             Self::JukeboxSongSettings => JUKEBOX_SONG_SETTINGS_CMD,
+            #[cfg(feature = "harness")]
+            Self::Harness(_) => HARNESS_CMD,
         }
     }
 
@@ -1007,6 +1027,35 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 JUKEBOX_SETTINGS_CMD => Command::JukeboxSettings,
                 JUKEBOX_GRAPHICS_CMD => Command::JukeboxGraphics,
                 JUKEBOX_SONG_SETTINGS_CMD => Command::JukeboxSongSettings,
+                #[cfg(feature = "harness")]
+                HARNESS_CMD => match (args.first().copied(), args.get(1..).unwrap_or_default()) {
+                    (Some("open"), [target, ..]) => Ok(Command::Harness(HarnessCommand::Open(
+                        (*target).to_string(),
+                    ))),
+                    (Some("dump"), rest) if !rest.is_empty() => {
+                        Ok(Command::Harness(HarnessCommand::Dump(rest.join(" "))))
+                    }
+                    (Some(sub @ ("open" | "dump")), _) => Err(E::InsufficientArgs {
+                        cmd: format!("{command} {sub}"),
+                        hint: Some(
+                            if sub == "open" {
+                                "a Spotify URI or URL"
+                            } else {
+                                "a file path"
+                            }
+                            .into(),
+                        ),
+                    }),
+                    (Some(sub), _) => Err(E::BadEnumArg {
+                        arg: sub.into(),
+                        accept: vec!["open".into(), "dump".into()],
+                        optional: false,
+                    }),
+                    (None, _) => Err(E::InsufficientArgs {
+                        cmd: command.into(),
+                        hint: Some("open|dump".into()),
+                    }),
+                }?,
                 _ => {
                     return Err(E::NoSuchCommand {
                         cmd: command.into(),
@@ -1022,6 +1071,25 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "harness")]
+    #[test]
+    fn parses_harness_commands() {
+        let open = parse("harness open spotify:album:abc").unwrap();
+        assert!(matches!(
+            open.as_slice(),
+            [Command::Harness(HarnessCommand::Open(t))] if t == "spotify:album:abc"
+        ));
+        let dump = parse("harness dump /tmp/x/dump.json").unwrap();
+        assert!(matches!(
+            dump.as_slice(),
+            [Command::Harness(HarnessCommand::Dump(p))] if p == "/tmp/x/dump.json"
+        ));
+        assert_eq!(dump[0].to_string(), "harness dump /tmp/x/dump.json");
+        assert!(parse("harness").is_err());
+        assert!(parse("harness open").is_err());
+        assert!(parse("harness fly away").is_err());
+    }
 
     #[test]
     fn parses_jukebox_song_settings() {

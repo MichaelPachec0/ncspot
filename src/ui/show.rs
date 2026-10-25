@@ -39,6 +39,13 @@ impl ViewWrapper for ShowView {
 }
 
 impl ViewExt for ShowView {
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let mut state = self.list.harness_state()?;
+        state.view = "show".into();
+        Some(state)
+    }
+
     fn title(&self) -> String {
         self.show.name.clone()
     }

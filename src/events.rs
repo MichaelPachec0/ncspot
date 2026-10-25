@@ -14,7 +14,7 @@ pub enum Event {
     Queue(QueueEvent),
     SessionDied,
     IpcInput(String),
-    /// A Web API client started being rate limited by Spotify (HTTP 429).
+    /// A Web API client or the internal API started being rate limited by Spotify (HTTP 429).
     RateLimited {
         client: ClientLabel,
         retry_after: Duration,
@@ -22,6 +22,12 @@ pub enum Event {
     /// The personal Web API client's token can't be refreshed without a new login, so it was
     /// disabled for the rest of the session.
     PersonalClientDisabled {
+        reason: String,
+    },
+    /// An internal API area hit a protocol change and uses the Web API for the rest of the
+    /// session.
+    InternalApiFallback {
+        area: &'static str,
         reason: String,
     },
 }

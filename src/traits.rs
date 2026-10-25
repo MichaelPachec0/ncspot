@@ -73,6 +73,12 @@ pub trait ViewExt: View {
 
     fn on_leave(&self) {}
 
+    /// State reported to the drive harness; `None` for views it does not inspect.
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        None
+    }
+
     fn on_command(&mut self, _s: &mut Cursive, _cmd: &Command) -> Result<CommandResult, String> {
         Ok(CommandResult::Ignored)
     }
@@ -89,6 +95,11 @@ impl<V: ViewExt> ViewExt for NamedView<V> {
 
     fn on_leave(&self) {
         self.with_view(|v| v.on_leave());
+    }
+
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        self.with_view(|v| v.harness_state()).flatten()
     }
 
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
@@ -175,6 +186,11 @@ impl ViewExt for BoxedViewExt {
 
     fn on_leave(&self) {
         self.boxed_view.on_leave();
+    }
+
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        self.boxed_view.harness_state()
     }
 
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {

@@ -213,15 +213,15 @@ impl Application {
                 Box::new(crate::jukebox::analysis::SpclientSource {
                     spotify: Arc::new(spotify.clone()),
                 }),
-                Box::new(crate::jukebox::analysis::EternalboxSource {
-                    base_url: configuration
+                Box::new(crate::jukebox::analysis::EternalboxSource::new(
+                    configuration
                         .values()
                         .jukebox
                         .clone()
                         .unwrap_or_default()
                         .eternalbox_url
                         .unwrap_or_else(|| "https://eternalbox.dev".to_string()),
-                }),
+                )),
             ],
             crate::jukebox::analysis::AnalysisCache::new(crate::config::cache_path("jukebox")),
         ));
@@ -410,7 +410,8 @@ impl Application {
                         retry_after,
                     } => {
                         info!(
-                            "{client} client ID is rate limited for {}s",
+                            "{} is rate limited for {}s",
+                            client.describe(),
                             retry_after.as_secs()
                         );
                         #[cfg(feature = "notify")]
@@ -424,6 +425,14 @@ impl Application {
                                 crate::rate_limit::send_rate_limit_notification(client, retry_after)
                             });
                         }
+                    }
+                    Event::InternalApiFallback { area, reason } => {
+                        let message = format!(
+                            "Spotify internal API changed, using the Web API for {area}: {reason}"
+                        );
+                        warn!("{message}");
+                        self.cursive
+                            .on_layout(|_, mut layout| layout.set_result(Err(message)));
                     }
                     Event::PersonalClientDisabled { reason } => {
                         let message = format!(

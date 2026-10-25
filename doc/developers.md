@@ -39,6 +39,44 @@ any process to inspect the memory of another process. It is automatically re-ena
 If ncspot has crashed you can find the latest backtrace at `$NCSPOT_CACHE_DIRECTORY/backtrace.log`.
 The cache directory can be shown by running `ncspot info`.
 
+## Drive harness
+For checking the real TUI end to end, ncspot can be driven over its IPC socket. Build with the
+`harness` feature (off by default, never in release builds):
+
+```sh
+cargo build --features harness
+python3 tools/drive.py            # all scenarios except playback
+python3 tools/drive.py --play     # also play a track and stop
+python3 tools/drive.py show --keep
+```
+
+The feature adds one command, also usable from the ncspot command line:
+
+- `harness open <spotify URI or open.spotify.com URL>` pushes the album, artist, show or
+  playlist view (a track opens its album, an episode its show).
+- `harness dump <path>` writes a JSON snapshot of the current view: rows, playable rows, paging
+  total and busy flag per tab, calls in flight, milliseconds since the last call, the last
+  command error, internal API and Web API counters, and rate-limit state.
+
+Each scenario runs ncspot in its own tmux server (`nix shell nixpkgs#tmux` is used when tmux is
+not installed). `-b` points at a fresh base path holding the cache and config, and
+`XDG_RUNTIME_DIR` at a fresh socket directory. The cached login, the library caches and the
+user state are copied in, so the startup sync stays incremental. Your own instance, cache and
+config are not touched, and the temp directory is deleted unless `--keep`. Each run still costs
+some Web API quota for that startup sync. The driver waits for idle before checking, and reports
+BLOCKED when a client a scenario needs is rate limited. The driver never prints credentials,
+tokens or your username. A Web API token refreshed by a run is written back to the cache when
+the cache file was not changed meanwhile. The test instance registers its own MPRIS player and
+may show a desktop notification with `--play`.
+
+A view counts as loaded when no tab is busy, no call is in flight and no call has ended for
+500 ms. Exit codes: 0 all passed, 1 a scenario failed, 2 setup error, 3 only rate limited.
+
+To add a scenario, write a function in `tools/drive.py` that sends commands and checks the dump,
+and register it in `SCENARIOS` with the config keys it needs. Headless probes of the same model
+paths run with `cargo test probe -- --ignored`. Unit tests of the driver:
+`python3 -m unittest tools/drive_test.py`.
+
 ## Compiling
 Compile and install the latest release with `cargo-install`:
 

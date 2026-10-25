@@ -187,6 +187,28 @@ impl View for TabbedView {
 }
 
 impl ViewExt for TabbedView {
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let tabs = self
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let state = tab.harness_state()?;
+                let mut first = state.tabs.into_iter().next()?;
+                first.name = tab.name().to_string();
+                Some(first)
+            })
+            .collect();
+        Some(crate::harness::HarnessState {
+            view: "tabs".into(),
+            tab: self
+                .tabs
+                .get(self.selected)
+                .map(|tab| tab.name().to_string()),
+            tabs,
+        })
+    }
+
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         match cmd {
             Command::Move(mode, amount) if matches!(mode, MoveMode::Left | MoveMode::Right) => {

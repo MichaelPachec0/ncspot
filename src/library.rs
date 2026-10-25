@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
@@ -23,7 +23,7 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
-use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, random_jitter};
+use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
 
 /// Keys of `UserState::library_full_fetch`.
@@ -261,7 +261,7 @@ impl Library {
         let library = self.clone();
         thread::spawn(move || {
             let _guard = SyncGuard(library.syncing.clone());
-            let sync_start = Instant::now();
+            let sync_start = Stamp::now();
 
             let t_tracks = {
                 let library = library.clone();
@@ -356,7 +356,7 @@ impl Library {
 
     /// After a sync that started at `sync_start`: reset the resume count if it was complete,
     /// or schedule one resume if it was left incomplete by a rate limit.
-    fn schedule_resume(&self, complete: bool, sync_start: Instant) {
+    fn schedule_resume(&self, complete: bool, sync_start: Stamp) {
         if complete {
             self.resume_count.store(0, Ordering::SeqCst);
             return;

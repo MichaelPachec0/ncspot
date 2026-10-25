@@ -1,17 +1,20 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::activity::ACTIVITY;
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use librespot_core::{Session, SpotifyUri};
 use log::{debug, error, info, warn};
 use rspotify::http::HttpError;
 use rspotify::model::{
     AlbumId, AlbumType, ArtistId, CursorBasedPage, EpisodeId, FullAlbum, FullArtist, FullEpisode,
     FullPlaylist, FullShow, FullTrack, ItemPositions, LibraryId, Market, Page, PlayableId,
     PlaylistId, PlaylistResult, PrivateUser, Recommendations, SavedAlbum, SavedTrack, SearchResult,
-    SearchType, Show, ShowId, SimplifiedTrack, TrackId, UserId,
+    SearchType, Show, ShowId, SimplifiedAlbum, SimplifiedEpisode, SimplifiedTrack, TrackId, UserId,
 };
 use rspotify::{AuthCodeSpotify, ClientError, ClientResult, Config, prelude::*};
 use tokio::sync::mpsc;
@@ -19,6 +22,10 @@ use tokio::task::JoinHandle;
 
 use crate::authentication::DEFAULT_WEB_API_CLIENT_ID;
 use crate::events::{Event, EventManager};
+#[cfg(any(test, feature = "harness"))]
+use crate::internal_api::AreaCounts;
+use crate::internal_api::error::InternalError;
+use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
 use crate::model::category::Category;
@@ -27,7 +34,7 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::track::Track;
 use crate::rate_limit::{
-    Attempt, ClientLabel, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
+    Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
 };
 use crate::spotify_worker::WorkerCommand;
@@ -73,6 +80,8 @@ struct ApiClient {
     refreshing: Arc<AtomicBool>,
     /// Set after a transient personal refresh failure: no new refresh starts before this instant.
     refresh_backoff_until: Arc<RwLock<Option<Instant>>>,
+    /// Calls made on this client since startup, shared by all clones.
+    calls: Arc<AtomicU64>,
 }
 
 impl ApiClient {
@@ -95,12 +104,21 @@ impl ApiClient {
             disabled: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
             refresh_backoff_until: Arc::new(RwLock::new(None)),
+            calls: Arc::new(AtomicU64::new(0)),
         }
     }
 
     fn is_disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
     }
+}
+
+/// Web API calls per client since startup.
+#[cfg(any(test, feature = "harness"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+pub struct WebCalls {
+    pub shared: u64,
+    pub personal: u64,
 }
 
 /// Convenient wrapper around the rspotify web API functionality.
@@ -116,6 +134,8 @@ pub struct WebApi {
     worker_channel: Arc<RwLock<Option<mpsc::UnboundedSender<WorkerCommand>>>>,
     /// Event manager used to report rate limits to the UI. Unset in tests.
     events: Option<EventManager>,
+    /// Spotify's internal API client, shared by all clones.
+    internal: InternalApi,
 }
 
 impl WebApi {
@@ -125,12 +145,15 @@ impl WebApi {
         let personal = cfg
             .personal_client_id()
             .map(|personal| ApiClient::new(&personal.id, ClientLabel::Personal));
+        let settings = Settings::from_values(&cfg.values());
+        info!("{}", settings.describe());
         Self {
             shared: ApiClient::new(DEFAULT_WEB_API_CLIENT_ID, ClientLabel::Shared),
             personal,
             user: None,
             worker_channel: Arc::new(RwLock::new(None)),
             events: None,
+            internal: InternalApi::new(settings),
         }
     }
 
@@ -151,6 +174,87 @@ impl WebApi {
     /// Set the event manager used to report rate limits to the UI.
     pub(crate) fn set_events(&mut self, events: EventManager) {
         self.events = Some(events);
+    }
+
+    /// Web API calls per client since startup.
+    #[cfg(any(test, feature = "harness"))]
+    pub fn web_calls(&self) -> WebCalls {
+        WebCalls {
+            shared: self.shared.calls.load(Ordering::Relaxed),
+            personal: self
+                .personal
+                .as_ref()
+                .map_or(0, |client| client.calls.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Internal API counters of `area` since startup.
+    #[cfg(any(test, feature = "harness"))]
+    pub fn area_counts(&self, area: Area) -> AreaCounts {
+        self.internal.area_counts(area)
+    }
+
+    /// Use `session` (filled by the Spotify worker when it connects) for internal API calls.
+    pub(crate) fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
+        self.internal.set_session(session);
+    }
+
+    /// Run one call through the internal API for `area`, falling back to `web` per the rules in
+    /// [fallback::run_with_fallback]. `internal` builds the future from a connected session.
+    fn with_fallback<T, F, Fut>(
+        &self,
+        area: Area,
+        internal: F,
+        web: impl FnOnce() -> Option<T>,
+    ) -> Option<T>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        let skip = self.internal.skip(area);
+        fallback::run_with_fallback(
+            skip,
+            || {
+                let session = self.internal.session().ok_or(InternalError::NoSession)?;
+                // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
+                // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
+                let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
+                // Held across retries so backoff sleeps and throttle waits count as loading.
+                let _call = ACTIVITY.begin();
+                let result = run_attempts(
+                    no_waits,
+                    &self.internal.throttle,
+                    || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
+                    |window| {
+                        self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window)
+                    },
+                    thread::sleep,
+                );
+                if result.is_ok() {
+                    self.internal.count_ok(area);
+                }
+                result
+            },
+            || {
+                if !skip {
+                    self.internal.count_fallback(area);
+                }
+                web()
+            },
+            |err| {
+                if self.internal.latch(area) {
+                    // The InternalApiFallback handler logs the warning with the user-facing text.
+                    debug!("internal API {} latched to the Web API: {err}", area.name());
+                    if let Some(events) = &self.events {
+                        events.try_send(Event::InternalApiFallback {
+                            area: area.name(),
+                            reason: err.to_string(),
+                        });
+                    }
+                }
+            },
+        )
     }
 
     /// The personal client, if configured and not disabled.
@@ -225,6 +329,9 @@ impl WebApi {
                 ClientLabel::Personal => {
                     crate::authentication::refresh_rspotify_token(&client_id, force)
                 }
+                ClientLabel::Internal => {
+                    unreachable!("the internal API has no Web API token")
+                }
             };
             match result {
                 Ok(token) => {
@@ -283,29 +390,38 @@ impl WebApi {
 
     /// Remaining rate-limit window of each throttled client, personal first.
     pub fn rate_limit_status(&self) -> Vec<(ClientLabel, Duration)> {
-        let now = Instant::now();
+        let now = Stamp::now();
         self.personal
             .iter()
             .chain(std::iter::once(&self.shared))
-            .filter_map(|client| {
-                client
-                    .throttle
+            .map(|client| (client.label, &client.throttle))
+            .chain(std::iter::once((
+                ClientLabel::Internal,
+                &self.internal.throttle,
+            )))
+            .filter_map(|(label, throttle)| {
+                throttle
                     .read()
                     .unwrap()
                     .remaining(now)
-                    .map(|remaining| (client.label, remaining))
+                    .map(|remaining| (label, remaining))
             })
             .collect()
     }
 
-    /// Record a 429 on `client` with a window of `window`. At the start of a throttle episode,
-    /// keep the status bar countdown redrawing until the window has passed; tell the UI (log
-    /// line and notification) at most once per `NOTIFY_COOLDOWN`, so short backoff windows do
-    /// not repeat the notification.
-    fn on_rate_limited(&self, client: &ApiClient, window: Duration) {
-        let now = Instant::now();
+    /// Record a 429 on the client `label` (rate-limit state `throttle`) with a window of
+    /// `window`. At the start of a throttle episode, keep the status bar countdown redrawing
+    /// until the window has passed; tell the UI (log line and notification) at most once per
+    /// `NOTIFY_COOLDOWN`, so short backoff windows do not repeat the notification.
+    fn on_rate_limited(
+        &self,
+        label: ClientLabel,
+        throttle: &Arc<RwLock<ThrottleState>>,
+        window: Duration,
+    ) {
+        let now = Stamp::now();
         let (new_episode, announce) = {
-            let mut throttle = client.throttle.write().unwrap();
+            let mut throttle = throttle.write().unwrap();
             let new_episode = throttle.record_429(now, window);
             (new_episode, new_episode && throttle.should_announce(now))
         };
@@ -314,7 +430,7 @@ impl WebApi {
         };
         if announce {
             events.try_send(Event::RateLimited {
-                client: client.label,
+                client: label,
                 retry_after: window,
             });
         }
@@ -324,9 +440,9 @@ impl WebApi {
 
         // The UI refresh tick doesn't run while playback is stopped, so redraw the countdown
         // from here until the window has passed, then once more to clear it.
-        let throttle = client.throttle.clone();
+        let throttle = throttle.clone();
         thread::spawn(move || {
-            while throttle.read().unwrap().is_active(Instant::now()) {
+            while throttle.read().unwrap().is_active(Stamp::now()) {
                 if !events.try_trigger() {
                     return;
                 }
@@ -337,11 +453,17 @@ impl WebApi {
     }
 
     /// Whether any client got a 429 at or after `since`, even if its window has closed since.
-    pub fn rate_limited_since(&self, since: Instant) -> bool {
+    pub fn rate_limited_since(&self, since: Stamp) -> bool {
         self.personal
             .iter()
             .chain(std::iter::once(&self.shared))
             .any(|client| client.throttle.read().unwrap().rate_limited_since(since))
+            || self
+                .internal
+                .throttle
+                .read()
+                .unwrap()
+                .rate_limited_since(since)
     }
 
     /// Send `api_call` once on `client` and classify the result for [run_rate_limited].
@@ -384,6 +506,10 @@ impl WebApi {
     where
         F: Fn(&AuthCodeSpotify) -> ClientResult<R>,
     {
+        // One guard for the whole call: rate-limit waits, the 401 refresh loop and the retry
+        // all count as loading.
+        let _call = ACTIVITY.begin();
+        client.calls.fetch_add(1, Ordering::Relaxed);
         let mut refreshed = false;
         loop {
             let result = run_rate_limited(
@@ -392,7 +518,7 @@ impl WebApi {
                 is_ui_thread(),
                 random_jitter,
                 || Self::attempt(client, api_call),
-                |window| self.on_rate_limited(client, window),
+                |window| self.on_rate_limited(client.label, &client.throttle, window),
             );
             match result {
                 Err(Some(401)) if client.label == ClientLabel::Personal => {
@@ -590,17 +716,29 @@ impl WebApi {
     pub fn album(&self, album_id: &str) -> Result<FullAlbum, ()> {
         debug!("fetching album {album_id}");
         let aid = AlbumId::from_id(album_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.album(aid.clone(), Some(Market::FromToken))
-        })
+        let id = album_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::album(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.album(aid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
     /// Fetch the artist with the given `artist_id`.
     pub fn artist(&self, artist_id: &str) -> Result<FullArtist, ()> {
         let aid = ArtistId::from_id(artist_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| api.artist(aid.clone()))
-            .ok_or(())
+        let id = artist_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::artist(session, id.clone()),
+            || self.api_with_retry(Route::Bulk, |api| api.artist(aid.clone())),
+        )
+        .ok_or(())
     }
 
     /// Fetch the playlist with the given `playlist_id`.
@@ -615,27 +753,48 @@ impl WebApi {
     /// Fetch the track with the given `track_id`.
     pub fn track(&self, track_id: &str) -> Result<FullTrack, ()> {
         let tid = TrackId::from_id(track_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.track(tid.clone(), Some(Market::FromToken))
-        })
+        let id = track_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::track(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.track(tid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
     /// Fetch the show with the given `show_id`.
     pub fn show(&self, show_id: &str) -> Result<FullShow, ()> {
         let sid = ShowId::from_id(show_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.get_a_show(sid.clone(), Some(Market::FromToken))
-        })
+        let id = show_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::show(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.get_a_show(sid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
     /// Fetch the episode with the given `episode_id`.
     pub fn episode(&self, episode_id: &str) -> Result<FullEpisode, ()> {
         let eid = EpisodeId::from_id(episode_id).map_err(|_| ())?;
-        self.api_with_retry(Route::Bulk, |api| {
-            api.get_an_episode(eid.clone(), Some(Market::FromToken))
-        })
+        let id = episode_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::episode(session, id.clone()),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.get_an_episode(eid.clone(), Some(Market::FromToken))
+                })
+            },
+        )
         .ok_or(())
     }
 
@@ -773,14 +932,21 @@ impl WebApi {
         offset: u32,
     ) -> Result<Page<SimplifiedTrack>, ()> {
         debug!("fetching album tracks {album_id}");
-        self.api_with_retry(Route::Bulk, |api| {
-            api.album_track_manual(
-                AlbumId::from_id(album_id).unwrap(),
-                Some(Market::FromToken),
-                Some(limit),
-                Some(offset),
-            )
-        })
+        let id = album_id.to_string();
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::album_tracks(session, id.clone(), limit, offset),
+            || {
+                self.api_with_retry(Route::Bulk, |api| {
+                    api.album_track_manual(
+                        AlbumId::from_id(album_id).unwrap(),
+                        Some(Market::FromToken),
+                        Some(limit),
+                        Some(offset),
+                    )
+                })
+            },
+        )
         .ok_or(())
     }
 
@@ -794,29 +960,62 @@ impl WebApi {
         const MAX_SIZE: u32 = 50;
         let spotify = self.clone();
         let artist_id = artist_id.to_string();
+        // Album ids of the artist, fetched once from the internal API and paged locally.
+        let ids: Arc<Mutex<Option<Vec<SpotifyUri>>>> = Default::default();
         let fetch_page = move |offset: u32| {
             debug!("fetching artist {artist_id} albums, offset: {offset}");
-            spotify.api_with_retry(Route::Bulk, |api| {
-                match api.artist_albums_manual(
-                    ArtistId::from_id(&artist_id).unwrap(),
-                    album_type.as_ref().copied(),
-                    Some(Market::FromToken),
-                    Some(MAX_SIZE),
-                    Some(offset),
-                ) {
-                    Ok(page) => {
-                        let mut albums: Vec<Album> =
-                            page.items.iter().map(|sa| sa.into()).collect();
-                        albums.sort_by(|a, b| b.year.cmp(&a.year));
-                        Ok(ApiPage {
-                            offset: page.offset,
-                            total: page.total,
-                            items: albums,
-                        })
-                    }
-                    Err(e) => Err(e),
+            let to_page = |items: Vec<SimplifiedAlbum>, total: u32| {
+                let mut albums: Vec<Album> = items.iter().map(|sa| sa.into()).collect();
+                albums.sort_by(|a, b| b.year.cmp(&a.year));
+                ApiPage {
+                    offset,
+                    total,
+                    items: albums,
                 }
-            })
+            };
+            let (artist, ids_cache) = (artist_id.clone(), ids.clone());
+            spotify
+                .with_fallback(
+                    Area::Metadata,
+                    move |session| {
+                        let (artist, ids_cache) = (artist.clone(), ids_cache.clone());
+                        async move {
+                            // Clone out of the lock so no guard is held across an await.
+                            let cached = ids_cache.lock().unwrap().clone();
+                            let all = match cached {
+                                Some(all) => all,
+                                None => {
+                                    let all = metadata::artist_album_ids(
+                                        session.clone(),
+                                        artist,
+                                        album_type,
+                                    )
+                                    .await?;
+                                    *ids_cache.lock().unwrap() = Some(all.clone());
+                                    all
+                                }
+                            };
+                            let page_ids =
+                                metadata::window(&all, offset as usize, MAX_SIZE as usize);
+                            let items = metadata::albums_by_uri(session, page_ids).await?;
+                            Ok((items, all.len() as u32))
+                        }
+                    },
+                    || {
+                        spotify
+                            .api_with_retry(Route::Bulk, |api| {
+                                api.artist_albums_manual(
+                                    ArtistId::from_id(&artist_id).unwrap(),
+                                    album_type.as_ref().copied(),
+                                    Some(Market::FromToken),
+                                    Some(MAX_SIZE),
+                                    Some(offset),
+                                )
+                            })
+                            .map(|page| (page.items, page.total))
+                    },
+                )
+                .map(|(items, total)| to_page(items, total))
         };
 
         ApiResult::new(MAX_SIZE, Arc::new(fetch_page))
@@ -827,23 +1026,53 @@ impl WebApi {
         const MAX_SIZE: u32 = 50;
         let spotify = self.clone();
         let show_id = show_id.to_string();
+        // Episode ids of the show, fetched once from the internal API and paged locally.
+        let ids: Arc<Mutex<Option<Vec<SpotifyUri>>>> = Default::default();
         let fetch_page = move |offset: u32| {
             debug!("fetching show {} episodes, offset: {}", show_id, offset);
-            spotify.api_with_retry(Route::Bulk, |api| {
-                match api.get_shows_episodes_manual(
-                    ShowId::from_id(&show_id).unwrap(),
-                    Some(Market::FromToken),
-                    Some(50),
-                    Some(offset),
-                ) {
-                    Ok(page) => Ok(ApiPage {
-                        offset: page.offset,
-                        total: page.total,
-                        items: page.items.iter().map(|se| se.into()).collect(),
-                    }),
-                    Err(e) => Err(e),
-                }
-            })
+            let to_page = |items: Vec<SimplifiedEpisode>, total: u32| ApiPage {
+                offset,
+                total,
+                items: items.iter().map(|se| se.into()).collect(),
+            };
+            let (show, ids_cache) = (show_id.clone(), ids.clone());
+            spotify
+                .with_fallback(
+                    Area::Metadata,
+                    move |session| {
+                        let (show, ids_cache) = (show.clone(), ids_cache.clone());
+                        async move {
+                            // Clone out of the lock so no guard is held across an await.
+                            let cached = ids_cache.lock().unwrap().clone();
+                            let all = match cached {
+                                Some(all) => all,
+                                None => {
+                                    let all =
+                                        metadata::show_episode_ids(session.clone(), show).await?;
+                                    *ids_cache.lock().unwrap() = Some(all.clone());
+                                    all
+                                }
+                            };
+                            let page_ids =
+                                metadata::window(&all, offset as usize, MAX_SIZE as usize);
+                            let items = metadata::episodes_by_uri(session, page_ids).await?;
+                            Ok((items, all.len() as u32))
+                        }
+                    },
+                    || {
+                        spotify
+                            .api_with_retry(Route::Bulk, |api| {
+                                api.get_shows_episodes_manual(
+                                    ShowId::from_id(&show_id).unwrap(),
+                                    Some(Market::FromToken),
+                                    Some(50),
+                                    Some(offset),
+                                )
+                            })
+                            .map(|page| (page.items, page.total))
+                    },
+                )
+                .map(|(items, total)| to_page(items, total))
         };
 
         ApiResult::new(MAX_SIZE, Arc::new(fetch_page))
@@ -991,10 +1220,17 @@ impl WebApi {
 
     /// Get the top tracks of the artist with the given `id`.
     pub fn artist_top_tracks(&self, id: &str) -> Result<Vec<Track>, ()> {
+        let artist = id.to_string();
         #[allow(deprecated)]
-        self.api_with_retry(Route::Restricted, |api| {
-            api.artist_top_tracks(ArtistId::from_id(id).unwrap(), Some(Market::FromToken))
-        })
+        self.with_fallback(
+            Area::Metadata,
+            move |session| metadata::artist_top_tracks(session, artist.clone()),
+            || {
+                self.api_with_retry(Route::Restricted, |api| {
+                    api.artist_top_tracks(ArtistId::from_id(id).unwrap(), Some(Market::FromToken))
+                })
+            },
+        )
         .map(|ft| ft.iter().map(|t| t.into()).collect())
         .ok_or(())
     }
@@ -1064,8 +1300,10 @@ impl WebApi {
 
     /// Get details about the logged in user.
     pub fn current_user(&self) -> Result<PrivateUser, ()> {
-        self.api_with_retry(Route::Bulk, |api| api.current_user())
-            .ok_or(())
+        self.with_fallback(Area::Metadata, metadata::current_user, || {
+            self.api_with_retry(Route::Bulk, |api| api.current_user())
+        })
+        .ok_or(())
     }
 }
 
@@ -1075,6 +1313,17 @@ mod test {
     use crate::config::Config;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn call_on_counts_the_call_as_in_flight() {
+        let api = WebApi::new(&Config::new_for_test());
+        let seen = api
+            .call_on(&api.shared, &|_api| {
+                Ok(crate::activity::ACTIVITY.in_flight())
+            })
+            .unwrap();
+        assert!(seen >= 1, "the Web API call itself is in flight");
+    }
 
     #[test]
     fn refresh_client_waits_out_the_backoff() {
@@ -1161,7 +1410,7 @@ mod test {
     #[test]
     fn rate_limit_status_lists_throttled_clients_personal_first() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
-        let now = Instant::now();
+        let now = Stamp::now();
         api.shared
             .throttle
             .write()
@@ -1185,7 +1434,8 @@ mod test {
     #[test]
     fn on_rate_limited_opens_the_window_of_that_client_only() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
-        api.on_rate_limited(api.client(Route::Bulk), Duration::from_secs(30));
+        let client = api.client(Route::Bulk);
+        api.on_rate_limited(client.label, &client.throttle, Duration::from_secs(30));
         let status = api.rate_limit_status();
         assert_eq!(status.len(), 1);
         assert_eq!(status[0].0, ClientLabel::Personal);
@@ -1194,10 +1444,151 @@ mod test {
     #[test]
     fn rate_limited_since_sees_a_429_on_any_client() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
-        let start = Instant::now();
+        let start = Stamp::now();
         assert!(!api.rate_limited_since(start));
-        api.on_rate_limited(&api.shared, Duration::from_millis(1));
+        api.on_rate_limited(
+            api.shared.label,
+            &api.shared.throttle,
+            Duration::from_millis(1),
+        );
         assert!(api.rate_limited_since(start));
-        assert!(!api.rate_limited_since(Instant::now() + Duration::from_secs(1)));
+        assert!(!api.rate_limited_since(Stamp::now() + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn with_fallback_without_a_session_uses_the_web_api_once() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let out = api.with_fallback(
+            Area::Metadata,
+            |_session| async { Ok::<u8, InternalError>(1) },
+            || Some(2),
+        );
+        assert_eq!(out, Some(2));
+        assert!(
+            !api.internal.skip(Area::Metadata),
+            "no session must not latch"
+        );
+        assert_eq!(
+            api.area_counts(Area::Metadata),
+            AreaCounts {
+                internal_ok: 0,
+                fallback: 1,
+                latched: false
+            }
+        );
+    }
+
+    #[test]
+    fn with_fallback_latches_once_on_a_protocol_change() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let rt = ASYNC_RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        // An unconnected session is enough: the internal closure below never uses it.
+        let session = {
+            let _guard = rt.enter();
+            Session::new(librespot_core::SessionConfig::default(), None)
+        };
+        let mut api = WebApi::new(&crate::config::Config::new_for_test());
+        api.set_session(Arc::new(RwLock::new(Some(session))));
+        let internal_calls = Arc::new(AtomicUsize::new(0));
+        let call = || {
+            let calls = internal_calls.clone();
+            api.with_fallback(
+                Area::Metadata,
+                move |_session| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async { Err::<u8, _>(InternalError::ProtocolChanged("412".into())) }
+                },
+                || Some(2),
+            )
+        };
+        assert_eq!(call(), Some(2));
+        assert_eq!(internal_calls.load(Ordering::SeqCst), 1);
+        assert!(api.internal.skip(Area::Metadata), "protocol change latches");
+        assert_eq!(call(), Some(2));
+        assert_eq!(
+            internal_calls.load(Ordering::SeqCst),
+            1,
+            "a latched area skips the internal API"
+        );
+        assert!(!api.internal.latch(Area::Metadata), "latched exactly once");
+        assert_eq!(
+            api.area_counts(Area::Metadata),
+            AreaCounts {
+                internal_ok: 0,
+                fallback: 1,
+                latched: true
+            },
+            "the skipped second call is not a fallback"
+        );
+    }
+
+    #[test]
+    fn with_fallback_with_internal_api_off_never_tries_internal() {
+        let values = crate::config::ConfigValues {
+            internal_api: Some(false),
+            ..Default::default()
+        };
+        let api = WebApi::new(&crate::config::Config::new_for_test_with_values(values));
+        assert!(api.internal.skip(Area::Metadata));
+        assert_eq!(
+            api.with_fallback(
+                Area::Metadata,
+                |_s| async { Ok::<u8, InternalError>(1) },
+                || Some(2)
+            ),
+            Some(2)
+        );
+        assert_eq!(api.area_counts(Area::Metadata), AreaCounts::default());
+    }
+
+    #[test]
+    fn with_fallback_counts_an_internal_success() {
+        let rt = ASYNC_RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        });
+        let session = {
+            let _guard = rt.enter();
+            Session::new(librespot_core::SessionConfig::default(), None)
+        };
+        let mut api = WebApi::new(&crate::config::Config::new_for_test());
+        api.set_session(Arc::new(RwLock::new(Some(session))));
+        let out = api.with_fallback(
+            Area::Metadata,
+            |_session| async { Ok::<u8, InternalError>(1) },
+            || Some(2),
+        );
+        assert_eq!(out, Some(1));
+        assert_eq!(
+            api.area_counts(Area::Metadata),
+            AreaCounts {
+                internal_ok: 1,
+                fallback: 0,
+                latched: false
+            }
+        );
+    }
+
+    #[test]
+    fn call_on_counts_calls_per_client() {
+        let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
+        api.call_on(&api.shared, &|_api| Ok(())).unwrap();
+        let personal = api.personal.as_ref().unwrap();
+        api.call_on(personal, &|_api| Ok(())).unwrap();
+        api.call_on(personal, &|_api| Ok(())).unwrap();
+        assert_eq!(
+            api.web_calls(),
+            WebCalls {
+                shared: 1,
+                personal: 2
+            }
+        );
     }
 }

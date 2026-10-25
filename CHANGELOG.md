@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows when they are unchanged, instead of downloading them again on every
   update. Each list is still downloaded in full once a day so cached details
   stay current
+- Load metadata (tracks, albums, artists, shows, episodes, top tracks and the
+  user profile) through Spotify's internal API, with the Web API as fallback;
+  `internal_api` and `[internal_api_areas]` switch it off
 
 ### Fixed
 
@@ -40,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   calls wait through short limits and fail fast on long ones, and a library
   update left incomplete by a rate limit resumes on its own after the limit
   ends. A library update requested while one is running is skipped
+- A long rate limit (Spotify can send a `Retry-After` of many hours) no longer
+  blocks a client ID until it ends: a background request checks every 5
+  minutes whether the limit was lifted. Rate-limit windows also count time
+  the machine spends suspended
+- The jukebox finds the analysis of tracks relinked in the user's market
+  (played through an alternative track), which reported no analysis before
+- A jukebox analysis lookup that failed (timeout, network) is retried up to 3
+  times while the track plays, and an unreachable eternalbox instance is
+  skipped for 10 minutes instead of costing a timeout on every track
 
 ## [1.4.0]
 

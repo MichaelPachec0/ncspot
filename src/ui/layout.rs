@@ -246,6 +246,17 @@ impl Layout {
             .unwrap_or(false)
     }
 
+    /// Title and harness state of the top view, and the last command error.
+    #[cfg(feature = "harness")]
+    pub fn harness_view(&self) -> (String, Option<crate::harness::HarnessState>, Option<String>) {
+        let top = self.get_top_view();
+        (
+            top.map(|v| v.title()).unwrap_or_default(),
+            top.and_then(|v| v.harness_state()),
+            self.result.as_ref().err().cloned(),
+        )
+    }
+
     #[allow(clippy::borrowed_box)]
     fn get_top_view(&self) -> Option<&Box<dyn ViewExt>> {
         let focussed_stack = self.get_focussed_stack();

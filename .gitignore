@@ -21,3 +21,5 @@ tags
 /misc/ncspot.elv
 /misc/_ncspot.ps1
 result
+
+__pycache__/
