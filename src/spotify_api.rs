@@ -139,6 +139,19 @@ pub struct WebApi {
     internal: InternalApi,
 }
 
+/// The Spotify URIs among `uris`; the others are dropped with a debug log.
+fn parse_uris(uris: &[String]) -> Vec<SpotifyUri> {
+    uris.iter()
+        .filter_map(|u| match SpotifyUri::from_uri(u) {
+            Ok(uri) => Some(uri),
+            Err(_) => {
+                debug!("library: skipping an unparseable uri");
+                None
+            }
+        })
+        .collect()
+}
+
 impl WebApi {
     /// Create the Web API wrapper. A personal client is set up only if `cfg` has a personal
     /// client ID.
@@ -307,6 +320,66 @@ impl WebApi {
         self.run_internal(Area::Library, |session| {
             collection::delta(session, set, token.clone())
         })
+    }
+
+    /// Metadata for library items by Spotify URI, through the internal API. URIs that do not
+    /// parse are dropped, and so are items the service no longer has.
+    pub fn library_tracks(&self, uris: &[String]) -> Result<Vec<Track>, InternalError> {
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uris = parse_uris(uris);
+        self.run_internal(Area::Library, |session| {
+            metadata::tracks_by_uri(session, uris.clone())
+        })
+        .map(|items| items.iter().map(Track::from).collect())
+    }
+
+    pub fn library_albums(&self, uris: &[String]) -> Result<Vec<Album>, InternalError> {
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uris = parse_uris(uris);
+        self.run_internal(Area::Library, |session| {
+            metadata::albums_by_uri(session, uris.clone())
+        })
+        .map(|items| items.iter().map(Album::from).collect())
+    }
+
+    pub fn library_artists(&self, uris: &[String]) -> Result<Vec<Artist>, InternalError> {
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uris = parse_uris(uris);
+        self.run_internal(Area::Library, |session| {
+            metadata::artists_by_uri(session, uris.clone())
+        })
+        .map(|items| items.iter().map(Artist::from).collect())
+    }
+
+    pub fn library_shows(
+        &self,
+        uris: &[String],
+    ) -> Result<Vec<crate::model::show::Show>, InternalError> {
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uris = parse_uris(uris);
+        self.run_internal(Area::Library, |session| {
+            metadata::shows_by_uri(session, uris.clone())
+        })
+        .map(|items| items.iter().map(crate::model::show::Show::from).collect())
+    }
+
+    pub fn library_episodes(&self, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uris = parse_uris(uris);
+        self.run_internal(Area::Library, |session| {
+            metadata::episodes_by_uri(session, uris.clone())
+        })
+        .map(|items| items.iter().map(Episode::from).collect())
     }
 
     /// The personal client, if configured and not disabled.
@@ -1371,6 +1444,17 @@ mod test {
         let api = WebApi::new(&crate::config::Config::new_for_test());
         let result: Result<u8, _> = api.run_internal(Area::Library, |_session| async { Ok(1u8) });
         assert_eq!(result, Err(InternalError::NoSession));
+    }
+
+    #[test]
+    fn library_metadata_without_a_session_is_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert!(matches!(
+            api.library_tracks(&uris),
+            Err(InternalError::NoSession)
+        ));
+        assert_eq!(api.library_episodes(&[]).map(|v| v.len()), Ok(0));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use log::debug;
 use protobuf::{EnumOrUnknown, Message};
 use rspotify::model::{
     AlbumType, FullAlbum, FullArtist, FullEpisode, FullShow, FullTrack, Page, PrivateUser,
-    SimplifiedAlbum, SimplifiedEpisode, SimplifiedTrack, SubscriptionLevel, UserId,
+    SimplifiedAlbum, SimplifiedEpisode, SimplifiedShow, SimplifiedTrack, SubscriptionLevel, UserId,
 };
 
 use super::convert;
@@ -323,6 +323,42 @@ pub async fn episodes_by_uri(
         .await?
         .iter()
         .map(convert::simplified_episode)
+        .collect()
+}
+
+pub async fn tracks_by_uri(
+    session: Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<FullTrack>, InternalError> {
+    let country = session.country();
+    let catalogue = catalogue(&session);
+    // Skip: a library item without metadata keeps its cached copy (library_collection).
+    get_many::<Track>(&session, &uris, Missing::Skip)
+        .await?
+        .iter()
+        .map(|t| convert::full_track(t, &country, &catalogue))
+        .collect()
+}
+
+pub async fn artists_by_uri(
+    session: Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<FullArtist>, InternalError> {
+    get_many::<Artist>(&session, &uris, Missing::Skip)
+        .await?
+        .iter()
+        .map(convert::full_artist)
+        .collect()
+}
+
+pub async fn shows_by_uri(
+    session: Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<SimplifiedShow>, InternalError> {
+    get_many::<Show>(&session, &uris, Missing::Skip)
+        .await?
+        .iter()
+        .map(convert::simplified_show)
         .collect()
 }
 
