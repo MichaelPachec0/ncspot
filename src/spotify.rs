@@ -78,7 +78,7 @@ pub struct Spotify {
 /// The credentials a worker restart uses. A browser login's access token expires after about
 /// an hour, the reusable credentials librespot caches after connecting do not, so those win
 /// when they are for the same user.
-fn restart_credentials(
+pub(crate) fn restart_credentials(
     saved: Option<Credentials>,
     user: Option<&str>,
     current: Credentials,

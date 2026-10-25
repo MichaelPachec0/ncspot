@@ -6,7 +6,7 @@ use crate::pending_load::{
 };
 use crate::queue::QueueEvent;
 use crate::session_slot::SessionSlot;
-use crate::spotify::{PlayerEvent, Spotify};
+use crate::spotify::{PlayerEvent, Spotify, restart_credentials};
 use futures::future::BoxFuture;
 use librespot_core::SpotifyUri;
 use librespot_core::authentication::Credentials;
@@ -294,10 +294,13 @@ impl Worker {
     ) -> BoxFuture<'static, Result<Session, librespot_core::Error>> {
         warn!("Librespot session invalidated, reconnecting in {delay:?}");
         let cache = self.session.cache();
-        // A login's access token expires, the stored credentials don't.
-        let credentials = cache
-            .and_then(|cache| cache.credentials())
-            .unwrap_or_else(|| self.credentials.clone());
+        // A login's access token expires, the stored credentials don't; use them only when
+        // they belong to the user of the session being replaced.
+        let credentials = restart_credentials(
+            cache.and_then(|cache| cache.credentials()),
+            Some(&self.session.username()),
+            self.credentials.clone(),
+        );
         let session = Session::new(
             Spotify::session_config(&self.cfg),
             cache.map(|cache| cache.as_ref().clone()),
