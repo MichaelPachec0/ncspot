@@ -1033,11 +1033,16 @@ mod test {
         assert!(state.is_active(now + PROBE_INTERVAL));
     }
 
-    /// A throttle whose window of `window` opened one probe interval ago, so a probe is due.
+    /// A throttle whose window of `window` opened now, with its probe already due. Not opened
+    /// one probe interval in the past: the clock counts from boot, so on a machine up for less
+    /// than that (a fresh CI runner) the stamp would clamp to zero and no probe would be due.
     fn throttle_with_probe_due(window: Duration) -> RwLock<ThrottleState> {
         let throttle = RwLock::new(ThrottleState::default());
-        let opened = Stamp(Stamp::now().0.saturating_sub(PROBE_INTERVAL));
-        throttle.write().unwrap().record_429(opened, window);
+        let now = Stamp::now();
+        let mut state = throttle.write().unwrap();
+        state.record_429(now, window);
+        state.next_probe = Some(now);
+        drop(state);
         throttle
     }
 
