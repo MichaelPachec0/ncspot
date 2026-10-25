@@ -1,8 +1,6 @@
 //! Pure parts of the collection v2 library sync: which mode a set syncs in, how a listing or a
 //! delta turns the cached list into the new one, and the sort orders.
 
-#![cfg_attr(not(test), expect(dead_code))]
-
 use std::collections::{HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
