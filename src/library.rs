@@ -16,7 +16,14 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::config::{self, CACHE_VERSION};
 use crate::events::EventManager;
-use crate::library_collection::{sort_albums, with_artist};
+use crate::internal_api::Area;
+use crate::internal_api::collection::SET_COLLECTION;
+use crate::internal_api::error::InternalError;
+use crate::internal_api::fallback::{Action, decide_after};
+use crate::library_collection::{
+    Membership, Mode, fetch_membership, plan_sync, rebuild, sort_albums, sort_newest_first,
+    with_artist,
+};
 use crate::library_sync::{SavedItem, SavedPage, Synced, full_fetch_due, sync_liked, sync_saved};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -26,6 +33,7 @@ use crate::model::show::Show;
 use crate::model::track::Track;
 use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
+use crate::spotify_api::WebApi;
 
 /// Keys of `UserState::library_full_fetch`.
 const FULL_FETCH_TRACKS: &str = "tracks";
@@ -184,13 +192,11 @@ impl Library {
     }
 
     /// The stored collection v2 sync token of `set`, if any.
-    #[cfg_attr(not(test), expect(dead_code))]
     fn sync_token(&self, set: &str) -> Option<String> {
         self.cfg.state().collection_sync.get(set).cloned()
     }
 
     /// Remember the collection v2 sync token of `set`.
-    #[cfg_attr(not(test), expect(dead_code))]
     fn set_sync_token(&self, set: &str, token: String) {
         self.cfg.with_state_mut(|state| {
             state.collection_sync.insert(set.to_string(), token.clone());
@@ -198,7 +204,6 @@ impl Library {
     }
 
     /// Forget the collection v2 sync token of `set`.
-    #[cfg_attr(not(test), expect(dead_code))]
     fn clear_sync_token(&self, set: &str) {
         self.cfg.with_state_mut(|state| {
             state.collection_sync.remove(set);
@@ -302,35 +307,17 @@ impl Library {
             let _guard = SyncGuard(library.syncing.clone());
             let sync_start = Stamp::now();
 
-            let t_tracks = {
+            let t_collection = {
                 let library = library.clone();
                 thread::spawn(move || {
-                    library.load_cache(
+                    let valid = library.load_cache(
                         &config::cache_path(CACHE_TRACKS),
                         library.tracks.write().unwrap().as_mut(),
-                    );
-                    let complete = library.fetch_tracks();
-                    library.save_cache(
-                        &config::cache_path(CACHE_TRACKS),
-                        &library.tracks.read().unwrap(),
-                    );
-                    complete
-                })
-            };
-
-            let t_albums = {
-                let library = library.clone();
-                thread::spawn(move || {
-                    library.load_cache(
+                    ) & library.load_cache(
                         &config::cache_path(CACHE_ALBUMS),
                         library.albums.write().unwrap().as_mut(),
                     );
-                    let complete = library.fetch_albums();
-                    library.save_cache(
-                        &config::cache_path(CACHE_ALBUMS),
-                        &library.albums.read().unwrap(),
-                    );
-                    complete
+                    library.fetch_collection(valid)
                 })
             };
 
@@ -368,7 +355,7 @@ impl Library {
                 thread::spawn(move || library.fetch_shows())
             };
 
-            let tracks_complete = t_tracks.join().unwrap();
+            let collection_complete = t_collection.join().unwrap();
             let artists_complete = t_artists.join().unwrap();
 
             library.populate_artists();
@@ -377,18 +364,14 @@ impl Library {
                 &library.artists.read().unwrap(),
             );
 
-            let albums_complete = t_albums.join().unwrap();
             let playlists_complete = t_playlists.join().unwrap();
             let shows_complete = t_shows.join().unwrap();
 
             *library.is_done.write().unwrap() = true;
             library.ev.trigger();
 
-            let complete = tracks_complete
-                && artists_complete
-                && albums_complete
-                && playlists_complete
-                && shows_complete;
+            let complete =
+                collection_complete && artists_complete && playlists_complete && shows_complete;
             library.schedule_resume(complete, sync_start);
         });
     }
@@ -654,6 +637,117 @@ impl Library {
             artist.tracks = Some(Vec::new());
             artists.push(artist);
         }
+    }
+
+    /// Sync liked songs and saved albums, which share the `collection` set and its token.
+    /// Saves both caches; the token is stored only if both writes worked.
+    fn fetch_collection(&self, cache_valid: bool) -> bool {
+        let api = &self.spotify.api;
+        let token = self.sync_token(SET_COLLECTION);
+        let (now, full_due) = self.full_fetch_check(SET_COLLECTION, "collection");
+        let mode = plan_sync(
+            api.internal_usable(Area::Library),
+            full_due,
+            token.is_some(),
+            cache_valid,
+        );
+        // Mode::Web never goes through `outcome`: an area that is simply off must not latch.
+        let outcome = if mode == Mode::Web {
+            SetOutcome::Web
+        } else {
+            outcome(
+                api,
+                SET_COLLECTION,
+                self.collection_internal(mode, token.as_deref()),
+            )
+        };
+        let complete = match outcome {
+            SetOutcome::Web => {
+                // Two Web fetchers, both always run.
+                let tracks = self.fetch_tracks();
+                let albums = self.fetch_albums();
+                tracks && albums
+            }
+            SetOutcome::Incomplete => false,
+            SetOutcome::Synced(new_token) => {
+                let saved = self.save_cache(
+                    &config::cache_path(CACHE_TRACKS),
+                    &self.tracks.read().unwrap(),
+                ) & self.save_cache(
+                    &config::cache_path(CACHE_ALBUMS),
+                    &self.albums.read().unwrap(),
+                );
+                if saved {
+                    self.set_sync_token(SET_COLLECTION, new_token);
+                    if mode == Mode::Full {
+                        self.record_full_fetch(SET_COLLECTION, now);
+                    }
+                } else {
+                    self.clear_sync_token(SET_COLLECTION);
+                }
+                return saved;
+            }
+        };
+        self.save_cache(
+            &config::cache_path(CACHE_TRACKS),
+            &self.tracks.read().unwrap(),
+        );
+        self.save_cache(
+            &config::cache_path(CACHE_ALBUMS),
+            &self.albums.read().unwrap(),
+        );
+        complete
+    }
+
+    /// Sync the `collection` set over the internal API into the in-memory tracks and albums.
+    /// Returns the new sync token; the caller stores it once the caches are written.
+    fn collection_internal(
+        &self,
+        mode: Mode,
+        token: Option<&str>,
+    ) -> Result<String, InternalError> {
+        let api = &self.spotify.api;
+        let fetched = fetch_membership(api, SET_COLLECTION, mode, token)?;
+        let refetch = mode == Mode::Full;
+        let track_members = fetched.membership.only("track");
+        let album_members = fetched.membership.only("album");
+        let tracks_now = self.tracks.read().unwrap().clone();
+        let mut tracks = rebuild(&tracks_now, &track_members, refetch, |u| {
+            api.library_tracks(u)
+        })?;
+        let albums_now = self.albums.read().unwrap().clone();
+        let mut albums: Vec<Album> = rebuild(&albums_now, &album_members, refetch, |u| {
+            api.library_albums(u)
+        })?
+        .into_iter()
+        .map(with_artist)
+        .collect();
+        sort_newest_first(&mut tracks, |t| t.added_at);
+        sort_albums(&mut albums);
+        let changes = |m: &Membership| match m {
+            Membership::Changes { added, removed } => (added.len(), removed.len()),
+            Membership::Listing(_) => (0, 0),
+        };
+        if mode == Mode::Delta {
+            let (ta, tr) = changes(&track_members);
+            let (aa, ar) = changes(&album_members);
+            info!(
+                "collection: {mode:?}, {} tracks, {} albums, added {}, removed {}",
+                tracks.len(),
+                albums.len(),
+                ta + aa,
+                tr + ar
+            );
+        } else {
+            info!(
+                "collection: {mode:?}, {} tracks, {} albums",
+                tracks.len(),
+                albums.len()
+            );
+        }
+        *self.tracks.write().unwrap() = tracks;
+        *self.albums.write().unwrap() = albums;
+        Ok(fetched.sync_token)
     }
 
     /// Fetch the saved albums from the web API and store them in the local library, unless they
@@ -1216,6 +1310,38 @@ fn resume_delay(longest_remaining: Duration, jitter: Duration) -> Duration {
     longest_remaining.max(RESUME_MIN_DELAY) + jitter
 }
 
+/// What a set's internal sync did.
+enum SetOutcome {
+    /// Synced; the new token, to store once the cache file is written.
+    Synced(String),
+    /// Rate limited or transient: keep the cache, the set is incomplete.
+    Incomplete,
+    /// Use the Web API fetcher for this set (after latching when `latched`).
+    Web,
+}
+
+/// Map the result of a set's internal sync to what to do next, per the fallback rules.
+fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> SetOutcome {
+    match result {
+        Ok(token) => SetOutcome::Synced(token),
+        Err(err) => match decide_after(&err) {
+            Action::LatchThenWeb => {
+                api.latch_area(Area::Library, &err);
+                api.count_fallback(Area::Library);
+                SetOutcome::Web
+            }
+            Action::WebOnce => {
+                api.count_fallback(Area::Library);
+                SetOutcome::Web
+            }
+            Action::Fail => {
+                warn!("{set}: {err}");
+                SetOutcome::Incomplete
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1370,6 +1496,41 @@ mod test {
         assert!(!library.load_cache(&dir.join("missing.db"), &mut store));
         assert!(!library.save_cache(&dir.join("no-such-dir").join("x.db"), &[1u32]));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn outcome_follows_the_fallback_classes() {
+        use crate::internal_api::Area;
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert!(
+            matches!(outcome(&api, "artist", Ok("t".into())), SetOutcome::Synced(t) if t == "t")
+        );
+        assert!(matches!(
+            outcome(&api, "artist", Err(InternalError::RateLimited)),
+            SetOutcome::Incomplete
+        ));
+        assert!(matches!(
+            outcome(&api, "artist", Err(InternalError::Transient("x".into()))),
+            SetOutcome::Incomplete
+        ));
+        assert!(matches!(
+            outcome(&api, "artist", Err(InternalError::NoSession)),
+            SetOutcome::Web
+        ));
+        assert!(api.internal_usable(Area::Library));
+        assert!(matches!(
+            outcome(
+                &api,
+                "artist",
+                Err(InternalError::ProtocolChanged("400".into()))
+            ),
+            SetOutcome::Web
+        ));
+        assert!(
+            !api.internal_usable(Area::Library),
+            "a protocol change latches the area"
+        );
+        assert_eq!(api.area_counts(Area::Library).fallback, 2);
     }
 
     #[test]
