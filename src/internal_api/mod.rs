@@ -39,6 +39,8 @@ pub struct Settings {
     pub from_config: bool,
     /// `[internal_api_areas] metadata`.
     pub metadata: bool,
+    /// `[internal_api_areas] library`.
+    pub library: bool,
 }
 
 impl Settings {
@@ -48,6 +50,7 @@ impl Settings {
             enabled: values.internal_api.unwrap_or(INTERNAL_API_DEFAULT),
             from_config: values.internal_api.is_some(),
             metadata: areas.metadata.unwrap_or(true),
+            library: areas.library.unwrap_or(true),
         }
     }
 
@@ -56,6 +59,7 @@ impl Settings {
         self.enabled
             && match area {
                 Area::Metadata => self.metadata,
+                Area::Library => self.library,
             }
     }
 
@@ -76,6 +80,8 @@ impl Settings {
 pub enum Area {
     /// Tracks, albums, artists, shows, episodes and the current user.
     Metadata,
+    /// The library lists (collection sets).
+    Library,
 }
 
 impl Area {
@@ -83,6 +89,7 @@ impl Area {
     pub fn name(self) -> &'static str {
         match self {
             Self::Metadata => "metadata",
+            Self::Library => "library",
         }
     }
 }
@@ -113,6 +120,8 @@ pub struct InternalApi {
     pub(crate) throttle: Arc<RwLock<ThrottleState>>,
     latched_metadata: Arc<AtomicBool>,
     metadata_stats: Arc<AreaStats>,
+    latched_library: Arc<AtomicBool>,
+    library_stats: Arc<AreaStats>,
 }
 
 impl InternalApi {
@@ -123,12 +132,19 @@ impl InternalApi {
             throttle: Arc::new(RwLock::new(ThrottleState::default())),
             latched_metadata: Arc::new(AtomicBool::new(false)),
             metadata_stats: Arc::new(AreaStats::default()),
+            latched_library: Arc::new(AtomicBool::new(false)),
+            library_stats: Arc::new(AreaStats::default()),
         }
     }
 
     /// Use the session handle that [crate::spotify::Spotify] fills when its worker connects.
     pub fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
         self.session = session;
+    }
+
+    /// The resolved switches.
+    pub fn settings(&self) -> Settings {
+        self.settings
     }
 
     /// The connected session, if any.
@@ -143,6 +159,7 @@ impl InternalApi {
     fn latch_flag(&self, area: Area) -> &AtomicBool {
         match area {
             Area::Metadata => &self.latched_metadata,
+            Area::Library => &self.latched_library,
         }
     }
 
@@ -154,6 +171,7 @@ impl InternalApi {
     fn stats(&self, area: Area) -> &AreaStats {
         match area {
             Area::Metadata => &self.metadata_stats,
+            Area::Library => &self.library_stats,
         }
     }
 
@@ -376,6 +394,7 @@ mod tests {
             enabled: true,
             from_config: true,
             metadata: true,
+            library: true,
         };
         let api = InternalApi::new(on);
         assert!(!api.skip(Area::Metadata));
@@ -402,11 +421,37 @@ mod tests {
     }
 
     #[test]
+    fn library_area_follows_its_switch_and_the_master_switch() {
+        let mut values = crate::config::ConfigValues::default();
+        assert!(Settings::from_values(&values).area_enabled(Area::Library));
+        values.internal_api_areas = Some(crate::config::InternalApiAreas {
+            library: Some(false),
+            ..Default::default()
+        });
+        let s = Settings::from_values(&values);
+        assert!(!s.area_enabled(Area::Library));
+        assert!(s.area_enabled(Area::Metadata));
+        values.internal_api_areas = None;
+        values.internal_api = Some(false);
+        assert!(!Settings::from_values(&values).area_enabled(Area::Library));
+    }
+
+    #[test]
+    fn library_latch_is_separate_from_metadata() {
+        let api = InternalApi::new(Settings::from_values(&Default::default()));
+        assert!(api.latch(Area::Library));
+        assert!(api.skip(Area::Library));
+        assert!(!api.skip(Area::Metadata));
+        assert!(api.area_counts(Area::Library).latched);
+    }
+
+    #[test]
     fn no_session_handle_means_no_session() {
         let api = InternalApi::new(Settings {
             enabled: true,
             from_config: true,
             metadata: true,
+            library: true,
         });
         assert!(api.session().is_none());
     }

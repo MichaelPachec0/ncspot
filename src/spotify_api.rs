@@ -24,6 +24,7 @@ use crate::authentication::DEFAULT_WEB_API_CLIENT_ID;
 use crate::events::{Event, EventManager};
 #[cfg(any(test, feature = "harness"))]
 use crate::internal_api::AreaCounts;
+use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
@@ -215,46 +216,97 @@ impl WebApi {
         let skip = self.internal.skip(area);
         fallback::run_with_fallback(
             skip,
-            || {
-                let session = self.internal.session().ok_or(InternalError::NoSession)?;
-                // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
-                // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
-                let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
-                // Held across retries so backoff sleeps and throttle waits count as loading.
-                let _call = ACTIVITY.begin();
-                let result = run_attempts(
-                    no_waits,
-                    &self.internal.throttle,
-                    || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
-                    |window| {
-                        self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window)
-                    },
-                    thread::sleep,
-                );
-                if result.is_ok() {
-                    self.internal.count_ok(area);
-                }
-                result
-            },
+            || self.run_internal(area, internal),
             || {
                 if !skip {
-                    self.internal.count_fallback(area);
+                    self.count_fallback(area);
                 }
                 web()
             },
-            |err| {
-                if self.internal.latch(area) {
-                    // The InternalApiFallback handler logs the warning with the user-facing text.
-                    debug!("internal API {} latched to the Web API: {err}", area.name());
-                    if let Some(events) = &self.events {
-                        events.try_send(Event::InternalApiFallback {
-                            area: area.name(),
-                            reason: err.to_string(),
-                        });
-                    }
-                }
-            },
+            |err| self.latch_area(area, err),
         )
+    }
+
+    /// Run one call through the internal API for `area` with no Web API fallback, for callers
+    /// that choose the fallback themselves. Fails with `ProtocolChanged` when the area is off or
+    /// latched.
+    pub fn run_internal<T, F, Fut>(&self, area: Area, internal: F) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.internal.skip(area) {
+            return Err(InternalError::ProtocolChanged("area off or latched".into()));
+        }
+        let session = self.internal.session().ok_or(InternalError::NoSession)?;
+        // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
+        // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
+        let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
+        // Held across retries so backoff sleeps and throttle waits count as loading.
+        let _call = ACTIVITY.begin();
+        let result = run_attempts(
+            no_waits,
+            &self.internal.throttle,
+            || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
+            |window| self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window),
+            thread::sleep,
+        );
+        if result.is_ok() {
+            self.internal.count_ok(area);
+        }
+        result
+    }
+
+    /// Latch `area` to the Web API after `err`, and tell the UI once.
+    pub fn latch_area(&self, area: Area, err: &InternalError) {
+        if self.internal.latch(area) {
+            // The InternalApiFallback handler logs the warning with the user-facing text.
+            debug!("internal API {} latched to the Web API: {err}", area.name());
+            if let Some(events) = &self.events {
+                events.try_send(Event::InternalApiFallback {
+                    area: area.name(),
+                    reason: err.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Count a call in `area` that fell back to the Web API after an internal failure.
+    pub fn count_fallback(&self, area: Area) {
+        self.internal.count_fallback(area);
+    }
+
+    /// Whether calls in `area` would try the internal API right now (on and not latched).
+    pub fn internal_usable(&self, area: Area) -> bool {
+        !self.internal.skip(area)
+    }
+
+    /// Whether `area` is switched on in the settings, ignoring the latch.
+    pub fn internal_enabled(&self, area: Area) -> bool {
+        self.internal.settings().area_enabled(area)
+    }
+
+    /// Every item of a collection set, page by page (each page is one internal call).
+    pub fn collection_page_all(&self, set: &'static str) -> Result<Listing, InternalError> {
+        let mut listing = Listing::default();
+        let mut token = String::new();
+        loop {
+            let page = self.run_internal(Area::Library, |session| {
+                collection::page(session, set, token.clone())
+            })?;
+            match collection::absorb(&mut listing, page) {
+                Some(next) => token = next,
+                None => return Ok(listing),
+            }
+        }
+    }
+
+    pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
+        let token = token.to_string();
+        self.run_internal(Area::Library, |session| {
+            collection::delta(session, set, token.clone())
+        })
     }
 
     /// The personal client, if configured and not disabled.
@@ -1313,6 +1365,23 @@ mod test {
     use crate::config::Config;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn run_internal_without_a_session_is_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let result: Result<u8, _> = api.run_internal(Area::Library, |_session| async { Ok(1u8) });
+        assert_eq!(result, Err(InternalError::NoSession));
+    }
+
+    #[test]
+    fn run_internal_on_a_latched_area_does_not_run() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Library, &InternalError::ProtocolChanged("x".into()));
+        let result: Result<u8, _> = api.run_internal(Area::Library, |_session| async { Ok(1u8) });
+        assert!(matches!(result, Err(InternalError::ProtocolChanged(_))));
+        assert!(!api.internal_usable(Area::Library));
+        assert!(api.internal_enabled(Area::Library));
+    }
 
     #[test]
     fn call_on_counts_the_call_as_in_flight() {

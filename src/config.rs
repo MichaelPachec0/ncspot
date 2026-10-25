@@ -126,6 +126,8 @@ pub struct ConfigValues {
 pub struct InternalApiAreas {
     /// Tracks, albums, artists, shows, episodes and the current user.
     pub metadata: Option<bool>,
+    /// Liked songs, saved albums, followed artists, saved shows, Your Episodes.
+    pub library: Option<bool>,
 }
 
 /// Configuration for the lyrics feature.
