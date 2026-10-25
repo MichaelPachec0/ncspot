@@ -140,6 +140,20 @@ pub struct WebApi {
     internal: InternalApi,
 }
 
+/// `call` once per `size` items of `items`, in order, with the results concatenated; the first
+/// failed call fails the whole.
+fn in_batches<T: Clone, U, E>(
+    items: &[T],
+    size: usize,
+    mut call: impl FnMut(Vec<T>) -> Result<Vec<U>, E>,
+) -> Result<Vec<U>, E> {
+    let mut out = Vec::with_capacity(items.len());
+    for batch in items.chunks(size) {
+        out.extend(call(batch.to_vec())?);
+    }
+    Ok(out)
+}
+
 /// The Spotify URIs among `uris`; the others are dropped with a debug log.
 fn parse_uris(uris: &[String]) -> Vec<SpotifyUri> {
     uris.iter()
@@ -323,64 +337,55 @@ impl WebApi {
         })
     }
 
-    /// Metadata for library items by Spotify URI, through the internal API. URIs that do not
-    /// parse are dropped, and so are items the service no longer has.
-    pub fn library_tracks(&self, uris: &[String]) -> Result<Vec<Track>, InternalError> {
+    /// Metadata for library items by Spotify URI, through the internal API: one internal call
+    /// (with its own bridge timeout and retries) per [metadata::BATCH_SIZE] URIs, results in
+    /// request order. URIs that do not parse are dropped, and so are items the service no
+    /// longer has; with nothing left to ask for, no session is needed.
+    fn library_items<M, T, Fut>(
+        &self,
+        uris: &[String],
+        fetch: impl Fn(Session, Vec<SpotifyUri>) -> Fut,
+    ) -> Result<Vec<T>, InternalError>
+    where
+        Fut: Future<Output = Result<Vec<M>, InternalError>> + Send + 'static,
+        M: Send + 'static,
+        T: for<'a> From<&'a M>,
+    {
         if uris.is_empty() {
             return Ok(Vec::new());
         }
         let uris = parse_uris(uris);
-        self.run_internal(Area::Library, |session| {
-            metadata::tracks_by_uri(session, uris.clone())
+        in_batches(&uris, metadata::BATCH_SIZE, |batch| {
+            self.run_internal(Area::Library, |session| fetch(session, batch.clone()))
+                .map(|items| items.iter().map(T::from).collect())
         })
-        .map(|items| items.iter().map(Track::from).collect())
+    }
+
+    pub fn library_tracks(&self, uris: &[String]) -> Result<Vec<Track>, InternalError> {
+        self.library_items(uris, metadata::tracks_by_uri)
     }
 
     pub fn library_albums(&self, uris: &[String]) -> Result<Vec<Album>, InternalError> {
-        if uris.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uris = parse_uris(uris);
-        self.run_internal(Area::Library, |session| {
-            metadata::albums_by_uri(session, uris.clone(), Missing::Skip)
+        self.library_items(uris, |session, uris| {
+            metadata::albums_by_uri(session, uris, Missing::Skip)
         })
-        .map(|items| items.iter().map(Album::from).collect())
     }
 
     pub fn library_artists(&self, uris: &[String]) -> Result<Vec<Artist>, InternalError> {
-        if uris.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uris = parse_uris(uris);
-        self.run_internal(Area::Library, |session| {
-            metadata::artists_by_uri(session, uris.clone())
-        })
-        .map(|items| items.iter().map(Artist::from).collect())
+        self.library_items(uris, metadata::artists_by_uri)
     }
 
     pub fn library_shows(
         &self,
         uris: &[String],
     ) -> Result<Vec<crate::model::show::Show>, InternalError> {
-        if uris.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uris = parse_uris(uris);
-        self.run_internal(Area::Library, |session| {
-            metadata::shows_by_uri(session, uris.clone())
-        })
-        .map(|items| items.iter().map(crate::model::show::Show::from).collect())
+        self.library_items(uris, metadata::shows_by_uri)
     }
 
     pub fn library_episodes(&self, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
-        if uris.is_empty() {
-            return Ok(Vec::new());
-        }
-        let uris = parse_uris(uris);
-        self.run_internal(Area::Library, |session| {
-            metadata::episodes_by_uri(session, uris.clone(), Missing::Skip)
+        self.library_items(uris, |session, uris| {
+            metadata::episodes_by_uri(session, uris, Missing::Skip)
         })
-        .map(|items| items.iter().map(Episode::from).collect())
     }
 
     /// The personal client, if configured and not disabled.
@@ -1745,6 +1750,58 @@ mod test {
                 shared: 1,
                 personal: 2
             }
+        );
+    }
+
+    #[test]
+    fn in_batches_makes_one_call_per_batch_and_keeps_the_order() {
+        let items: Vec<u32> = (0..250).collect();
+        let mut sizes = Vec::new();
+        let got: Result<Vec<u32>, ()> = super::in_batches(&items, 100, |batch| {
+            sizes.push(batch.len());
+            Ok(batch.into_iter().map(|i| i * 2).collect())
+        });
+        assert_eq!(sizes, vec![100, 100, 50]);
+        assert_eq!(
+            got.unwrap(),
+            items.iter().map(|i| i * 2).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn in_batches_stops_at_the_first_failed_batch() {
+        let items: Vec<u32> = (0..250).collect();
+        let mut calls = 0;
+        let got: Result<Vec<u32>, &str> = super::in_batches(&items, 100, |batch| {
+            calls += 1;
+            if batch[0] == 100 {
+                Err("boom")
+            } else {
+                Ok(batch)
+            }
+        });
+        assert_eq!(got, Err("boom"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn in_batches_of_nothing_makes_no_call() {
+        let got: Result<Vec<u32>, ()> =
+            super::in_batches(&[] as &[u32], 100, |_| panic!("no call expected"));
+        assert_eq!(got, Ok(Vec::new()));
+    }
+
+    #[test]
+    fn library_metadata_of_only_unparseable_uris_needs_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert_eq!(
+            api.library_tracks(&["not a uri".into()]).map(|t| t.len()),
+            Ok(0)
+        );
+        assert_eq!(
+            api.library_tracks(&["spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()])
+                .map(|t| t.len()),
+            Err(InternalError::NoSession)
         );
     }
 }
