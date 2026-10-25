@@ -50,13 +50,19 @@ python3 tools/drive.py --play     # also play a track and stop
 python3 tools/drive.py show --keep
 ```
 
-The feature adds one command, also usable from the ncspot command line:
+The feature adds these commands, also usable from the ncspot command line:
 
 - `harness open <spotify URI or open.spotify.com URL>` pushes the album, artist, show or
   playlist view (a track opens its album, an episode its show).
+- `harness open library [tab]` switches to the library screen; `tab` is a tab's config name,
+  for example `episodes`.
+- `harness drop-session` shuts down the shared playback session, to exercise the reconnect.
 - `harness dump <path>` writes a JSON snapshot of the current view: rows, playable rows, paging
   total and busy flag per tab, calls in flight, milliseconds since the last call, the last
-  command error, internal API and Web API counters, and rate-limit state.
+  command error, internal API and Web API counters, and rate-limit state. It also reports
+  `library_done` (the first library sync finished), `player` (`status`, `position_ms`),
+  `session` (`valid`, `reconnects`) and `areas.library` (`internal_ok`, `fallback`, `latched`).
+  `internal_ok` counts each page request and each metadata batch, not each sync.
 
 Each scenario runs ncspot in its own tmux server (`nix shell nixpkgs#tmux` is used when tmux is
 not installed). `-b` points at a fresh base path holding the cache and config, and
@@ -71,6 +77,13 @@ may show a desktop notification with `--play`.
 
 A view counts as loaded when no tab is busy, no call is in flight and no call has ended for
 500 ms. Exit codes: 0 all passed, 1 a scenario failed, 2 setup error, 3 only rate limited.
+
+The library scenarios are `library` (every library tab loaded from the internal API),
+`library_delta` (a routine sync costs at most 6 requests), `library_area_off` (with the library
+area disabled, the Web API is used and there is no Your Episodes tab) and `reconnect` (playback
+resumes after the session is dropped; runs with `--play`). The first run after the internal
+library sync lands does a one-time full fetch of every set at startup, so expect it to be slower
+and `library_delta` to be meaningful only from the second run on.
 
 To add a scenario, write a function in `tools/drive.py` that sends commands and checks the dump,
 and register it in `SCENARIOS` with the config keys it needs. Headless probes of the same model
