@@ -19,7 +19,7 @@ use crate::events::EventManager;
 use crate::internal_api::Area;
 use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW};
 use crate::internal_api::error::InternalError;
-use crate::internal_api::fallback::{Action, decide_after};
+use crate::internal_api::fallback::{Action, decide_after, run_with_fallback};
 use crate::library_collection::{
     Membership, Mode, fetch_membership, merge_followed, plan_sync, rebuild, sort_albums,
     sort_newest_first, with_artist,
@@ -1153,12 +1153,18 @@ impl Library {
             return;
         }
 
-        let save_tracks_result = self
-            .spotify
-            .api
-            .current_user_saved_tracks_add(tracks.iter().filter_map(|t| t.id.as_deref()).collect());
-
-        if save_tracks_result.is_err() {
+        let ids: Vec<&str> = tracks.iter().filter_map(|t| t.id.as_deref()).collect();
+        let uris: Vec<String> = tracks
+            .iter()
+            .filter(|t| t.id.is_some())
+            .map(|t| t.uri.clone())
+            .collect();
+        let api = &self.spotify.api;
+        if !write_through(
+            api,
+            || api.collection_write(SET_COLLECTION, &uris, false),
+            || api.current_user_saved_tracks_add(ids).is_ok(),
+        ) {
             return;
         }
 
@@ -1193,14 +1199,18 @@ impl Library {
             return;
         }
 
-        if self
-            .spotify
-            .api
-            .current_user_saved_tracks_delete(
-                tracks.iter().filter_map(|t| t.id.as_deref()).collect(),
-            )
-            .is_err()
-        {
+        let ids: Vec<&str> = tracks.iter().filter_map(|t| t.id.as_deref()).collect();
+        let uris: Vec<String> = tracks
+            .iter()
+            .filter(|t| t.id.is_some())
+            .map(|t| t.uri.clone())
+            .collect();
+        let api = &self.spotify.api;
+        if !write_through(
+            api,
+            || api.collection_write(SET_COLLECTION, &uris, true),
+            || api.current_user_saved_tracks_delete(ids).is_ok(),
+        ) {
             return;
         }
 
@@ -1241,14 +1251,19 @@ impl Library {
             return;
         }
 
-        if let Some(ref album_id) = album.id
-            && self
-                .spotify
-                .api
-                .current_user_saved_albums_add(vec![album_id.as_str()])
-                .is_err()
-        {
-            return;
+        if let Some(ref album_id) = album.id {
+            let api = &self.spotify.api;
+            let uris = vec![format!("spotify:album:{album_id}")];
+            if !write_through(
+                api,
+                || api.collection_write(SET_COLLECTION, &uris, false),
+                || {
+                    api.current_user_saved_albums_add(vec![album_id.as_str()])
+                        .is_ok()
+                },
+            ) {
+                return;
+            }
         }
 
         {
@@ -1273,14 +1288,19 @@ impl Library {
             return;
         }
 
-        if let Some(ref album_id) = album.id
-            && self
-                .spotify
-                .api
-                .current_user_saved_albums_delete(vec![album_id.as_str()])
-                .is_err()
-        {
-            return;
+        if let Some(ref album_id) = album.id {
+            let api = &self.spotify.api;
+            let uris = vec![format!("spotify:album:{album_id}")];
+            if !write_through(
+                api,
+                || api.collection_write(SET_COLLECTION, &uris, true),
+                || {
+                    api.current_user_saved_albums_delete(vec![album_id.as_str()])
+                        .is_ok()
+                },
+            ) {
+                return;
+            }
         }
 
         {
@@ -1310,14 +1330,16 @@ impl Library {
             return;
         }
 
-        if let Some(ref artist_id) = artist.id
-            && self
-                .spotify
-                .api
-                .user_follow_artists(vec![artist_id.as_str()])
-                .is_err()
-        {
-            return;
+        if let Some(ref artist_id) = artist.id {
+            let api = &self.spotify.api;
+            let uris = vec![format!("spotify:artist:{artist_id}")];
+            if !write_through(
+                api,
+                || api.collection_write(SET_ARTIST, &uris, false),
+                || api.user_follow_artists(vec![artist_id.as_str()]).is_ok(),
+            ) {
+                return;
+            }
         }
 
         {
@@ -1345,14 +1367,16 @@ impl Library {
             return;
         }
 
-        if let Some(ref artist_id) = artist.id
-            && self
-                .spotify
-                .api
-                .user_unfollow_artists(vec![artist_id.as_str()])
-                .is_err()
-        {
-            return;
+        if let Some(ref artist_id) = artist.id {
+            let api = &self.spotify.api;
+            let uris = vec![format!("spotify:artist:{artist_id}")];
+            if !write_through(
+                api,
+                || api.collection_write(SET_ARTIST, &uris, true),
+                || api.user_unfollow_artists(vec![artist_id.as_str()]).is_ok(),
+            ) {
+                return;
+            }
         }
 
         {
@@ -1442,13 +1466,23 @@ impl Library {
             return;
         }
 
-        if self.spotify.api.save_shows(&[show.id.as_str()]).is_ok() {
+        let api = &self.spotify.api;
+        let uris = vec![show.uri.clone()];
+        if write_through(
+            api,
+            || api.collection_write(SET_SHOW, &uris, false),
+            || api.save_shows(&[show.id.as_str()]).is_ok(),
+        ) {
             {
                 let mut store = self.shows.write().unwrap();
                 if !store.iter().any(|s| s.id == show.id) {
                     store.insert(0, show.clone());
                 }
             }
+            self.save_cache(
+                &config::cache_path(CACHE_SHOWS),
+                &self.shows.read().unwrap(),
+            );
         }
     }
 
@@ -1458,9 +1492,21 @@ impl Library {
             return;
         }
 
-        if self.spotify.api.unsave_shows(&[show.id.as_str()]).is_ok() {
-            let mut store = self.shows.write().unwrap();
-            *store = store.iter().filter(|s| s.id != show.id).cloned().collect();
+        let api = &self.spotify.api;
+        let uris = vec![show.uri.clone()];
+        if write_through(
+            api,
+            || api.collection_write(SET_SHOW, &uris, true),
+            || api.unsave_shows(&[show.id.as_str()]).is_ok(),
+        ) {
+            {
+                let mut store = self.shows.write().unwrap();
+                *store = store.iter().filter(|s| s.id != show.id).cloned().collect();
+            }
+            self.save_cache(
+                &config::cache_path(CACHE_SHOWS),
+                &self.shows.read().unwrap(),
+            );
         }
     }
 
@@ -1625,6 +1671,28 @@ fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> Se
     }
 }
 
+/// One library write: the internal API first, then the Web API per the fallback classes.
+/// True when one of them wrote; the caller updates the store and `.db` only then.
+fn write_through(
+    api: &WebApi,
+    internal: impl FnOnce() -> Result<(), InternalError>,
+    web: impl FnOnce() -> bool,
+) -> bool {
+    let skip = !api.internal_usable(Area::Library);
+    run_with_fallback(
+        skip,
+        internal,
+        || {
+            if !skip {
+                api.count_fallback(Area::Library);
+            }
+            web().then_some(())
+        },
+        |err| api.latch_area(Area::Library, err),
+    )
+    .is_some()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1779,6 +1847,58 @@ mod test {
         assert!(!library.load_cache(&dir.join("missing.db"), &mut store));
         assert!(!library.save_cache(&dir.join("no-such-dir").join("x.db"), &[1u32]));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_through_follows_the_fallback_classes() {
+        use std::cell::Cell;
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let web = Cell::new(0);
+        let call = |r: Result<(), InternalError>, web_ok: bool| {
+            write_through(
+                &api,
+                || r,
+                || {
+                    web.set(web.get() + 1);
+                    web_ok
+                },
+            )
+        };
+        assert!(call(Ok(()), false));
+        assert_eq!(web.get(), 0);
+        assert!(
+            !call(Err(InternalError::RateLimited), true),
+            "rate limit fails the action"
+        );
+        assert!(!call(Err(InternalError::Transient("x".into())), true));
+        assert_eq!(
+            web.get(),
+            0,
+            "no Web API call for rate limits or transient errors"
+        );
+        assert!(call(Err(InternalError::NoSession), true));
+        assert!(
+            !call(Err(InternalError::Denied), false),
+            "a failed Web call fails the action"
+        );
+        assert_eq!(web.get(), 2);
+        assert!(api.internal_usable(Area::Library));
+        assert!(call(
+            Err(InternalError::ProtocolChanged("400".into())),
+            true
+        ));
+        assert!(
+            !api.internal_usable(Area::Library),
+            "a protocol change latches the area"
+        );
+        assert_eq!(web.get(), 3);
+        // Latched: straight to the Web API, the internal call never runs.
+        assert!(write_through(
+            &api,
+            || panic!("internal ran while latched"),
+            || true
+        ));
+        assert_eq!(api.area_counts(Area::Library).fallback, 3);
     }
 
     #[test]
