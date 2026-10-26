@@ -167,3 +167,91 @@ fn collection_sets_page_completely_and_accept_a_delta() {
         }
     });
 }
+
+/// Save `uri` to `set`, see it in a delta, remove it, see the removal. Skips (and never
+/// removes) an item already in the set. Prints only the set name and the outcome.
+fn write_round_trip(
+    rt: &tokio::runtime::Runtime,
+    session: &Session,
+    set: &'static str,
+    uri: String,
+) {
+    use super::collection::{self, Delta, Listing};
+    let mut listing = Listing::default();
+    let mut token = String::new();
+    loop {
+        let page = rt
+            .block_on(collection::page(session.clone(), set, token.clone()))
+            .expect("page");
+        match collection::absorb(&mut listing, page) {
+            Some(next) => token = next,
+            None => break,
+        }
+    }
+    if listing.items.iter().any(|i| i.uri == uri) {
+        println!("{set}: test item already in the library, skipped");
+        return;
+    }
+    let sync = listing.sync_token.expect("complete listing");
+    rt.block_on(collection::write(
+        session.clone(),
+        set,
+        vec![uri.clone()],
+        false,
+    ))
+    .expect("save");
+    let after_save = rt
+        .block_on(collection::delta(session.clone(), set, sync))
+        .expect("delta");
+    let Delta::Changes {
+        added, sync_token, ..
+    } = after_save
+    else {
+        panic!("{set}: delta refused after save");
+    };
+    assert!(
+        added.iter().any(|i| i.uri == uri),
+        "{set}: saved item in the delta"
+    );
+    rt.block_on(collection::write(
+        session.clone(),
+        set,
+        vec![uri.clone()],
+        true,
+    ))
+    .expect("remove");
+    let after_remove = rt
+        .block_on(collection::delta(session.clone(), set, sync_token))
+        .expect("delta");
+    let Delta::Changes { removed, .. } = after_remove else {
+        panic!("{set}: delta refused after remove");
+    };
+    assert!(removed.contains(&uri), "{set}: removal in the delta");
+    println!("{set}: save and remove round trip ok");
+}
+
+#[test]
+#[ignore = "needs cached librespot credentials and network; writes to the account (net no change)"]
+fn collection_write_saves_and_removes() {
+    with_session(|rt, session| {
+        write_round_trip(
+            rt,
+            &session,
+            super::collection::SET_COLLECTION,
+            format!("spotify:track:{TRACK}"),
+        );
+        let ids = rt
+            .block_on(super::metadata::show_episode_ids(
+                session.clone(),
+                SHOW.into(),
+            ))
+            .expect("episode ids");
+        let episode_uri = ids.first().expect("an episode").to_uri();
+        write_round_trip(
+            rt,
+            &session,
+            super::collection::SET_LISTEN_LATER,
+            episode_uri,
+        );
+    });
+}
