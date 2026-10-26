@@ -337,6 +337,24 @@ impl WebApi {
         })
     }
 
+    /// Add or remove `uris` in a collection set: one internal call per [collection::WRITE_BATCH]
+    /// items. A failed batch stops the write; batches before it stay written, and the next
+    /// delta sync brings them into the store.
+    pub fn collection_write(
+        &self,
+        set: &'static str,
+        uris: &[String],
+        removed: bool,
+    ) -> Result<(), InternalError> {
+        for batch in uris.chunks(collection::WRITE_BATCH) {
+            let batch = batch.to_vec();
+            self.run_internal(Area::Library, |session| {
+                collection::write(session, set, batch.clone(), removed)
+            })?;
+        }
+        Ok(())
+    }
+
     /// Metadata for library items by Spotify URI, through the internal API: one internal call
     /// (with its own bridge timeout and retries) per [metadata::BATCH_SIZE] URIs, results in
     /// request order. URIs that do not parse are dropped, and so are items the service no
@@ -1446,6 +1464,17 @@ mod test {
     use crate::config::Config;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn collection_write_needs_a_session_unless_empty() {
+        let api = WebApi::new(&Config::new_for_test());
+        let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert_eq!(
+            api.collection_write("collection", &uris, false),
+            Err(InternalError::NoSession)
+        );
+        assert_eq!(api.collection_write("collection", &[], true), Ok(()));
+    }
 
     #[test]
     fn run_internal_without_a_session_is_no_session() {

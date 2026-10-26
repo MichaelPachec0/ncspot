@@ -184,7 +184,6 @@ pub async fn delta(
 }
 
 /// Items per write request.
-#[expect(dead_code)]
 pub const WRITE_BATCH: usize = 100;
 
 /// A random id for one write, as the desktop client sends.
@@ -222,7 +221,6 @@ pub fn write_request(
 
 /// Add or remove `uris` in `set` (at most [WRITE_BATCH]). Set membership makes a repeated
 /// write harmless, so librespot's own network retry is fine here.
-#[expect(dead_code)]
 pub async fn write(
     session: Session,
     set: &'static str,
