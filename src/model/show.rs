@@ -5,6 +5,7 @@ use crate::queue::Queue;
 use crate::spotify::Spotify;
 use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
 use crate::ui::show::ShowView;
+use chrono::{DateTime, Utc};
 use rspotify::model::Id;
 use rspotify::model::show::{FullShow, SimplifiedShow};
 use std::fmt;
@@ -18,6 +19,9 @@ pub struct Show {
     pub description: String,
     pub cover_url: Option<String>,
     pub episodes: Option<Vec<Episode>>,
+    /// When the user saved the show, if known.
+    #[serde(default)]
+    pub added_at: Option<DateTime<Utc>>,
 }
 
 impl Show {
@@ -46,6 +50,7 @@ impl From<&SimplifiedShow> for Show {
             description: show.description.clone(),
             cover_url: show.images.first().map(|i| i.url.clone()),
             episodes: None,
+            added_at: None,
         }
     }
 }
@@ -59,6 +64,7 @@ impl From<&FullShow> for Show {
             description: show.description.clone(),
             cover_url: show.images.first().map(|i| i.url.clone()),
             episodes: None,
+            added_at: None,
         }
     }
 }
@@ -160,5 +166,17 @@ impl ListItem for Show {
 
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Show;
+
+    #[test]
+    fn a_cached_show_without_added_at_still_loads() {
+        let json = r#"{"id":"s","uri":"spotify:show:s","name":"n","description":"d","cover_url":null,"episodes":null}"#;
+        let show: Show = serde_json::from_str(json).unwrap();
+        assert!(show.added_at.is_none());
     }
 }

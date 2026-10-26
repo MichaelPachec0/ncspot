@@ -31,6 +31,22 @@ pub struct Album {
 }
 
 impl Album {
+    #[cfg(test)]
+    pub fn default_for_test(title: &str) -> Self {
+        Self {
+            id: None,
+            title: title.into(),
+            artists: vec!["X".into()],
+            artist_ids: Vec::new(),
+            year: String::new(),
+            cover_url: None,
+            url: None,
+            tracks: None,
+            added_at: None,
+            total_tracks: None,
+        }
+    }
+
     pub fn load_all_tracks(&mut self, spotify: Spotify) {
         if self.tracks.is_some() && self.tracks.as_ref().map(|t| t.len()) == self.total_tracks {
             return;

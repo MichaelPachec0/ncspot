@@ -1,6 +1,13 @@
 use std::process::Command;
 
 fn main() {
+    protobuf_codegen::Codegen::new()
+        .pure()
+        .includes(["src/internal_api/proto"])
+        .input("src/internal_api/proto/collection2v2.proto")
+        .cargo_out_dir("collection_proto")
+        .run_from_script();
+
     let mut version = String::from(env!("CARGO_PKG_VERSION"));
     if let Some(commit_hash) = commit_hash() {
         version = format!("{version} ({commit_hash})");

@@ -28,7 +28,7 @@ pub enum PlaybackState {
 }
 
 /// The focussed library tab when ncspot is started.
-#[derive(Clone, Serialize, Deserialize, Debug, Hash, strum_macros::EnumIter)]
+#[derive(Clone, Serialize, Deserialize, Debug, Hash, PartialEq, strum_macros::EnumIter)]
 #[serde(rename_all = "lowercase")]
 pub enum LibraryTab {
     Tracks,
@@ -36,6 +36,7 @@ pub enum LibraryTab {
     Artists,
     Playlists,
     Podcasts,
+    Episodes,
     Browse,
 }
 
@@ -126,6 +127,8 @@ pub struct ConfigValues {
 pub struct InternalApiAreas {
     /// Tracks, albums, artists, shows, episodes and the current user.
     pub metadata: Option<bool>,
+    /// Liked songs, saved albums, followed artists, saved shows, Your Episodes.
+    pub library: Option<bool>,
 }
 
 /// Configuration for the lyrics feature.
@@ -278,6 +281,9 @@ pub struct UserState {
     /// "albums", "shows"), so a sync re-downloads a list once its cached details are a day old.
     #[serde(default)]
     pub library_full_fetch: HashMap<String, i64>,
+    /// Collection v2 sync token per set ("collection", "artist", "show", "listenlater"), valid only together with that set's cache file.
+    #[serde(default)]
+    pub collection_sync: HashMap<String, String>,
 }
 
 impl Default for UserState {
@@ -294,6 +300,7 @@ impl Default for UserState {
             jukebox_overrides: HashMap::new(),
             jukebox_override_per_song: false,
             library_full_fetch: HashMap::new(),
+            collection_sync: HashMap::new(),
         }
     }
 }
@@ -682,6 +689,23 @@ mod test {
     use super::*;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn episodes_tab_parses_from_its_config_name() {
+        let tabs: Vec<LibraryTab> = serde_json::from_str(r#"["podcasts","episodes"]"#).unwrap();
+        assert_eq!(tabs, vec![LibraryTab::Podcasts, LibraryTab::Episodes]);
+    }
+
+    #[test]
+    fn old_user_state_loads_with_empty_sync_tokens() {
+        let state: UserState = serde_json::from_str(
+            &serde_json::to_string(&UserState::default())
+                .unwrap()
+                .replace(",\"collection_sync\":{}", ""),
+        )
+        .unwrap();
+        assert!(state.collection_sync.is_empty());
+    }
 
     #[test]
     fn client_id_parses_from_toml() {

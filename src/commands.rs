@@ -395,11 +395,41 @@ impl CommandManager {
                 let (title, state, error) = s
                     .call_on_name("main", |v: &mut Layout| v.harness_view())
                     .unwrap_or_default();
-                let dump = crate::harness::build_dump(title, state, error, &self.spotify.api);
+                let dump = crate::harness::build_dump(
+                    title,
+                    state,
+                    error,
+                    &self.spotify,
+                    *self.library.is_done.read().unwrap(),
+                );
                 crate::harness::write_dump(std::path::Path::new(path), &dump).map_err(|e| {
                     error!("harness dump to {path} failed: {e}");
                     format!("harness dump failed: {e}")
                 })?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::OpenLibrary(tab)) => {
+                let tab = tab
+                    .as_ref()
+                    .map(|tab| {
+                        serde_json::from_value::<crate::config::LibraryTab>(
+                            serde_json::Value::String(tab.clone()),
+                        )
+                        .map_err(|_| format!("harness open library: unknown tab {tab}"))
+                    })
+                    .transpose()?;
+                s.call_on_name("main", |v: &mut Layout| v.set_screen("library"));
+                if let Some(tab) = tab {
+                    s.call_on_name("library", |v: &mut crate::ui::library::LibraryView| {
+                        v.select_tab(&tab)
+                    });
+                }
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::DropSession) => {
+                self.spotify.drop_session();
                 Ok(None)
             }
             #[cfg(feature = "harness")]

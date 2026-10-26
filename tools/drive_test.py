@@ -41,6 +41,25 @@ class RedactTest(unittest.TestCase):
         self.assertEqual(drive.redact(["a b"], None), ["a b"])
 
 
+class ScrubTest(unittest.TestCase):
+    def test_redact_masks_spotify_ids(self):
+        out = drive.redact(["open spotify:track:4uLU6hMCjMI75M1A2tKUQC now"], None)
+        self.assertEqual(out, ["open spotify:track:[id] now"])
+
+    def test_status_segments_keep_only_bracketed_segments(self):
+        pane = ["  Some Artist - Some Song   3:01 |", " >> Song  [rate limited: shared 24s] [R1] 0:02"]
+        self.assertEqual(drive.status_segments(pane), ["[rate limited: shared 24s] [R1]"])
+        self.assertEqual(drive.status_segments(["no brackets"]), [])
+
+    def test_scrub_dump_drops_the_title(self):
+        self.assertEqual(drive.scrub_dump({"title": "Library of x", "seq": 1}), {"seq": 1})
+
+    def test_library_client_follows_the_personal_client_id(self):
+        self.assertEqual(drive.library_client({}), "shared")
+        self.assertEqual(drive.library_client({"NCSPOT_CLIENT_ID": " "}), "shared")
+        self.assertEqual(drive.library_client({"NCSPOT_CLIENT_ID": "ab" * 16}), "personal")
+
+
 class ConfigTest(unittest.TestCase):
     def test_renders_scalars_and_one_level_tables(self):
         text = drive.render_config(
@@ -118,6 +137,60 @@ class TokenFileTest(unittest.TestCase):
         with self.assertRaises(OSError):
             drive.write_atomic(real, b"new")
         self.assertFalse(os.path.exists(real + ".tmp"))
+
+
+class AreaDeltaTest(unittest.TestCase):
+    def test_area_delta_subtracts_the_baseline_and_sums_web_calls(self):
+        def d(lib_ok, lib_fb, meta_ok, shared, personal):
+            return {
+                "areas": {
+                    "library": {"internal_ok": lib_ok, "fallback": lib_fb},
+                    "metadata": {"internal_ok": meta_ok, "fallback": 0},
+                },
+                "web": {"shared": shared, "personal": personal},
+            }
+
+        class Inst:
+            base_dump = d(10, 1, 5, 2, 3)
+
+        now = d(14, 2, 9, 3, 7)
+        self.assertEqual(
+            drive.area_delta(Inst, now, "library"), {"internal_ok": 4, "fallback": 1, "web": 5}
+        )
+        self.assertEqual(drive.delta(Inst, now), {"internal_ok": 4, "fallback": 0, "web": 5})
+
+
+class LibraryDeltaTest(unittest.TestCase):
+    @staticmethod
+    def run_with(ok, fallback):
+        def d(lib_ok, lib_fb):
+            return {
+                "areas": {"library": {"internal_ok": lib_ok, "fallback": lib_fb}},
+                "web": {"shared": 0, "personal": 0},
+                "throttled": {},
+            }
+
+        class Inst:
+            base_dump = d(10, 0)
+
+            def send(self, cmd):
+                pass
+
+            def wait_library(self, timeout):
+                return d(10 + ok, fallback)
+
+        class Args:
+            settle_timeout = 1
+
+        drive.sc_library_delta(Inst(), Args())
+
+    def test_a_small_internal_delta_passes(self):
+        self.run_with(4, 0)
+
+    def test_a_fallback_no_request_or_a_repage_fails(self):
+        for ok, fallback in [(0, 1), (2, 1), (0, 0), (7, 0)]:
+            with self.assertRaises(drive.Fail, msg=(ok, fallback)):
+                self.run_with(ok, fallback)
 
 
 if __name__ == "__main__":

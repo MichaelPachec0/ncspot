@@ -27,6 +27,7 @@ use crate::events::{Event, EventManager};
 use crate::model::playable::Playable;
 #[cfg(feature = "mpris")]
 use crate::mpris::{MprisCommand, MprisManager};
+use crate::session_slot::SessionSlot;
 use crate::spotify_api::WebApi;
 use crate::spotify_worker::{Worker, WorkerCommand};
 use crate::traits::ListItem;
@@ -70,6 +71,22 @@ pub struct Spotify {
     /// The active librespot session, set once the worker has successfully connected and cleared
     /// when the worker exits. Callers may clone it cheaply (Session is Arc-backed).
     session: Arc<RwLock<Option<Session>>>,
+    /// Keeps `session` current across the worker's reconnects and tracks the reconnect state.
+    slot: SessionSlot<Session>,
+}
+
+/// The credentials a worker restart uses. A browser login's access token expires after about
+/// an hour, the reusable credentials librespot caches after connecting do not, so those win
+/// when they are for the same user.
+pub(crate) fn restart_credentials(
+    saved: Option<Credentials>,
+    user: Option<&str>,
+    current: Credentials,
+) -> Credentials {
+    match (saved, user) {
+        (Some(saved), Some(user)) if saved.username.as_deref() == Some(user) => saved,
+        _ => current,
+    }
 }
 
 impl Spotify {
@@ -78,6 +95,7 @@ impl Spotify {
         credentials: Credentials,
         cfg: Arc<config::Config>,
     ) -> Result<Self, Box<dyn Error>> {
+        let session = Arc::new(RwLock::new(None));
         let mut spotify = Self {
             events,
             #[cfg(feature = "mpris")]
@@ -89,13 +107,19 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
-            session: Arc::new(RwLock::new(None)),
+            slot: SessionSlot::new(session.clone()),
+            session,
         };
         spotify.api.set_session(spotify.session.clone());
 
         let (user_tx, user_rx) = oneshot::channel();
         spotify.start_worker(Some(user_tx))?;
         let user = ASYNC_RUNTIME.get().unwrap().block_on(user_rx).ok();
+        let saved = Cache::new(Some(config::cache_path("librespot")), None, None, None)
+            .ok()
+            .and_then(|cache| cache.credentials());
+        spotify.credentials =
+            restart_credentials(saved, user.as_deref(), spotify.credentials.clone());
         let volume = cfg.state().volume;
         spotify.set_volume(volume, false);
 
@@ -129,6 +153,7 @@ impl Spotify {
             elapsed: Arc::new(RwLock::new(None)),
             since: Arc::new(RwLock::new(None)),
             channel: Arc::new(RwLock::new(None)),
+            slot: SessionSlot::new(session.clone()),
             session,
         }
     }
@@ -143,6 +168,7 @@ impl Spotify {
         *self.channel.write().unwrap() = Some(tx);
         let worker_channel = self.channel.clone();
         let session_handle = self.session.clone();
+        let slot = self.slot.clone();
         let cfg = self.cfg.clone();
         let events = self.events.clone();
         let volume = self.volume();
@@ -159,6 +185,7 @@ impl Spotify {
             user_tx,
             volume,
             backend,
+            slot,
         ));
         Ok(())
     }
@@ -270,6 +297,7 @@ impl Spotify {
         user_tx: Option<oneshot::Sender<String>>,
         volume: u16,
         backend: SinkBuilder,
+        slot: SessionSlot<Session>,
     ) {
         let bitrate_str = cfg.values().bitrate.unwrap_or(320).to_string();
         let bitrate = Bitrate::from_str(&bitrate_str);
@@ -285,7 +313,7 @@ impl Spotify {
             ..Default::default()
         };
 
-        let session = match Self::create_session(&cfg, credentials).await {
+        let session = match Self::create_session(&cfg, credentials.clone()).await {
             Ok(session) => session,
             Err(e) => {
                 // A transient DNS/network failure here is common right after a dropped
@@ -330,11 +358,12 @@ impl Spotify {
         mixer.set_volume(volume);
 
         let audio_format: librespot_playback::config::AudioFormat = Default::default();
+        let backend_cfg = cfg.clone();
         let player = Player::new(
             player_config,
             session.clone(),
             mixer.get_soft_volume(),
-            move || (backend)(cfg.values().backend_device.clone(), audio_format),
+            move || (backend)(backend_cfg.values().backend_device.clone(), audio_format),
         );
         let player_events = player.get_player_event_channel();
 
@@ -345,6 +374,9 @@ impl Spotify {
             session,
             player,
             mixer,
+            cfg,
+            credentials,
+            slot.clone(),
         );
         debug!("worker thread ready.");
         worker.run_loop().await;
@@ -352,6 +384,7 @@ impl Spotify {
         error!("worker thread died, requesting restart");
         *worker_channel.write().unwrap() = None;
         *session_handle.write().unwrap() = None;
+        slot.reset();
         events.send(Event::SessionDied)
     }
 
@@ -561,6 +594,35 @@ impl Spotify {
         *self.mpris.lock().unwrap() = Some(mpris);
     }
 
+    /// Whether the worker is reconnecting its session.
+    pub fn is_reconnecting(&self) -> bool {
+        self.slot.is_reconnecting()
+    }
+
+    /// Reconnects since startup.
+    #[cfg(feature = "harness")]
+    pub fn reconnects(&self) -> u64 {
+        self.slot.reconnects()
+    }
+
+    /// Shut the current session down, so the worker sees it invalid and reconnects.
+    #[cfg(feature = "harness")]
+    pub fn drop_session(&self) {
+        if let Some(session) = self.session.read().unwrap().clone() {
+            session.shutdown();
+        }
+    }
+
+    /// Whether the slot holds a session that is not invalid.
+    #[cfg(feature = "harness")]
+    pub fn session_valid(&self) -> bool {
+        self.session
+            .read()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|s| !s.is_invalid())
+    }
+
     /// Return a clone of the current librespot [Session], or `None` if the worker has not yet
     /// connected (or has exited). [Session] is cheaply cloneable (Arc-backed).
     pub fn session(&self) -> Option<Session> {
@@ -633,5 +695,35 @@ mod tests {
     fn parse_playlist_uri() {
         let uri_type = "spotify:playlist:37i9dQZF1DX36Xw4IJIVKA".parse();
         assert!(matches!(uri_type, Ok(UriType::Playlist)));
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    use super::restart_credentials;
+    use librespot_core::authentication::Credentials;
+
+    fn creds(user: &str, secret: &str) -> Credentials {
+        Credentials::with_password(user, secret)
+    }
+
+    #[test]
+    fn saved_credentials_of_the_same_user_win() {
+        let got = restart_credentials(Some(creds("u1", "saved")), Some("u1"), creds("u1", "token"));
+        assert_eq!(got.auth_data, b"saved".to_vec());
+    }
+
+    #[test]
+    fn saved_credentials_of_another_user_are_ignored() {
+        let got = restart_credentials(Some(creds("u2", "saved")), Some("u1"), creds("u1", "token"));
+        assert_eq!(got.auth_data, b"token".to_vec());
+    }
+
+    #[test]
+    fn no_saved_credentials_or_no_user_keep_the_current_ones() {
+        let got = restart_credentials(None, Some("u1"), creds("u1", "token"));
+        assert_eq!(got.auth_data, b"token".to_vec());
+        let got = restart_credentials(Some(creds("u1", "saved")), None, creds("u1", "token"));
+        assert_eq!(got.auth_data, b"token".to_vec());
     }
 }

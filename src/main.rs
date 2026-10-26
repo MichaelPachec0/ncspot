@@ -25,15 +25,18 @@ mod harness;
 mod internal_api;
 mod jukebox;
 mod library;
+mod library_collection;
 mod library_sync;
 mod lyrics;
 mod model;
 mod panic;
+mod pending_load;
 #[cfg(test)]
 mod probe_tests;
 mod queue;
 mod rate_limit;
 mod serialization;
+mod session_slot;
 mod sharing;
 mod spotify;
 mod spotify_api;

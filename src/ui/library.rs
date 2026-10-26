@@ -17,6 +17,9 @@ use crate::ui::tabbedview::TabbedView;
 
 pub struct LibraryView {
     tabs: TabbedView,
+    /// The tabs added to `tabs`, in order.
+    #[cfg(feature = "harness")]
+    added: Vec<LibraryTab>,
     display_name: Option<String>,
 }
 
@@ -30,7 +33,13 @@ impl LibraryView {
             .clone()
             .unwrap_or_else(|| Vec::from_iter(LibraryTab::iter()));
 
+        #[cfg(feature = "harness")]
+        let mut added = Vec::new();
         for tab in selected_tabs {
+            #[cfg(feature = "harness")]
+            if tab != LibraryTab::Episodes || library.episodes_enabled {
+                added.push(tab.clone());
+            }
             match tab {
                 LibraryTab::Tracks => tabview.add_tab(
                     "Tracks",
@@ -52,6 +61,14 @@ impl LibraryView {
                     "Podcasts",
                     ListView::new(library.shows.clone(), queue.clone(), library.clone()),
                 ),
+                LibraryTab::Episodes => {
+                    if library.episodes_enabled {
+                        tabview.add_tab(
+                            "Your Episodes",
+                            ListView::new(library.episodes.clone(), queue.clone(), library.clone()),
+                        )
+                    }
+                }
                 LibraryTab::Browse => {
                     tabview.add_tab("Browse", BrowseView::new(queue.clone(), library.clone()))
                 }
@@ -60,6 +77,8 @@ impl LibraryView {
 
         Self {
             tabs: tabview,
+            #[cfg(feature = "harness")]
+            added,
             display_name: {
                 let hide_username = library.cfg.values().hide_display_names.unwrap_or(false);
                 if hide_username {
@@ -68,6 +87,18 @@ impl LibraryView {
                     library.display_name.clone()
                 }
             },
+        }
+    }
+
+    #[cfg(feature = "harness")]
+    /// Show `tab`; false when this library does not have it.
+    pub fn select_tab(&mut self, tab: &LibraryTab) -> bool {
+        match self.added.iter().position(|t| t == tab) {
+            Some(index) => {
+                self.tabs.set_selected(index);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -83,6 +114,11 @@ impl ViewExt for LibraryView {
         } else {
             "Library".to_string()
         }
+    }
+
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        self.tabs.harness_state()
     }
 
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {

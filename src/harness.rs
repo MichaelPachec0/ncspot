@@ -18,8 +18,8 @@ use crate::model::show::Show;
 use crate::model::track::Track;
 use crate::queue::Queue;
 use crate::rate_limit::{ClientLabel, Stamp};
-use crate::spotify::UriType;
-use crate::spotify_api::{WebApi, WebCalls};
+use crate::spotify::{PlayerEvent, Spotify, UriType};
+use crate::spotify_api::WebCalls;
 use crate::spotify_url::SpotifyUrl;
 use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
 use crate::ui::{album::AlbumView, artist::ArtistView, playlist::PlaylistView, show::ShowView};
@@ -51,6 +51,7 @@ pub struct HarnessState {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Areas {
     pub metadata: AreaCounts,
+    pub library: AreaCounts,
 }
 
 /// Which clients are inside a rate-limit window.
@@ -78,17 +79,38 @@ pub struct Dump {
     pub areas: Areas,
     pub web: WebCalls,
     pub throttled: Throttled,
+    /// Whether the first library sync finished.
+    pub library_done: bool,
+    pub player: PlayerState,
+    pub session: SessionState,
+}
+
+/// What the player is doing.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlayerState {
+    /// One of `playing`, `paused`, `stopped`, `finished`.
+    pub status: String,
+    pub position_ms: u64,
+}
+
+/// The playback session's health.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SessionState {
+    pub valid: bool,
+    pub reconnects: u64,
 }
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Snapshot the view state plus the counters of `api` and the call gauge.
+/// Snapshot the view state plus the counters of the web API, the player and the session.
 pub fn build_dump(
     title: String,
     state: Option<HarnessState>,
     error: Option<String>,
-    api: &WebApi,
+    spotify: &Spotify,
+    library_done: bool,
 ) -> Dump {
+    let api = &spotify.api;
     let limited = api.rate_limit_status();
     let throttled = |label: ClientLabel| limited.iter().any(|(l, _)| *l == label);
     let (view, tab, tabs) = match state {
@@ -108,12 +130,29 @@ pub fn build_dump(
         error,
         areas: Areas {
             metadata: api.area_counts(Area::Metadata),
+            library: api.area_counts(Area::Library),
         },
         web: api.web_calls(),
         throttled: Throttled {
             shared: throttled(ClientLabel::Shared),
             personal: throttled(ClientLabel::Personal),
             internal: throttled(ClientLabel::Internal),
+        },
+        library_done,
+        player: PlayerState {
+            status: match spotify.get_current_status() {
+                PlayerEvent::Playing(_) => "playing",
+                PlayerEvent::Paused(_) => "paused",
+                PlayerEvent::Stopped => "stopped",
+                PlayerEvent::FinishedTrack => "finished",
+            }
+            .into(),
+            position_ms: u64::try_from(spotify.get_current_progress().as_millis())
+                .unwrap_or(u64::MAX),
+        },
+        session: SessionState {
+            valid: spotify.session_valid(),
+            reconnects: spotify.reconnects(),
         },
     }
 }
@@ -231,6 +270,11 @@ mod tests {
                     fallback: 0,
                     latched: false,
                 },
+                library: AreaCounts {
+                    internal_ok: 3,
+                    fallback: 0,
+                    latched: false,
+                },
             },
             web: WebCalls {
                 shared: 0,
@@ -241,6 +285,15 @@ mod tests {
                 personal: false,
                 internal: false,
             },
+            library_done: true,
+            player: PlayerState {
+                status: "playing".into(),
+                position_ms: 1200,
+            },
+            session: SessionState {
+                valid: true,
+                reconnects: 1,
+            },
         }
     }
 
@@ -249,7 +302,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false}}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1}}"#
         );
     }
 
@@ -274,9 +327,13 @@ mod tests {
 
     #[test]
     fn build_dump_reads_the_counters_and_bumps_seq() {
-        let api = crate::spotify_api::WebApi::new(&crate::config::Config::new_for_test());
-        let first = build_dump("x".into(), None, Some("boom".into()), &api);
-        let second = build_dump("x".into(), None, None, &api);
+        let cfg = crate::config::Config::new_for_test();
+        let spotify = Spotify::new_for_test(cfg, crate::events::EventManager::new_for_test());
+        let first = build_dump("x".into(), None, Some("boom".into()), &spotify, false);
+        let second = build_dump("x".into(), None, None, &spotify, false);
+        assert!(!first.session.valid);
+        assert_eq!(first.session.reconnects, 0);
+        assert_eq!(first.player.status, "stopped");
         assert!(second.seq > first.seq);
         assert_eq!(first.error.as_deref(), Some("boom"));
         assert_eq!(first.view, None);

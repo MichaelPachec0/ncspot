@@ -11,7 +11,7 @@ use log::debug;
 use protobuf::{EnumOrUnknown, Message};
 use rspotify::model::{
     AlbumType, FullAlbum, FullArtist, FullEpisode, FullShow, FullTrack, Page, PrivateUser,
-    SimplifiedAlbum, SimplifiedEpisode, SimplifiedTrack, SubscriptionLevel, UserId,
+    SimplifiedAlbum, SimplifiedEpisode, SimplifiedShow, SimplifiedTrack, SubscriptionLevel, UserId,
 };
 
 use super::convert;
@@ -179,6 +179,30 @@ async fn get_many<T: Kind>(
     Ok(out)
 }
 
+/// Convert each of `items` with `f`, in order. With `Missing::Skip` an item that converts to
+/// `NotFound` (Spotify sends a nameless stub for some pulled items) is dropped, like an item
+/// the response lacked, so one such item cannot fail a whole library set; any other error
+/// still fails the call. With `Missing::Fail` the first error fails it.
+fn convert_each<T, U>(
+    items: &[T],
+    nameless: Missing,
+    kind: &str,
+    f: impl Fn(&T) -> Result<U, InternalError>,
+) -> Result<Vec<U>, InternalError> {
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        match f(item) {
+            Ok(u) => out.push(u),
+            Err(InternalError::NotFound) if nameless == Missing::Skip => {
+                debug!("internal metadata: skipping a {kind} without usable metadata");
+            }
+            // Anything else (e.g. ProtocolChanged) signals a schema change: fail the batch.
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(out)
+}
+
 /// The user's catalogue as librespot reads it, "premium" when the session has none.
 fn catalogue(session: &Session) -> String {
     session
@@ -270,16 +294,16 @@ pub async fn artist_album_ids(
     Ok(group_ids(&a, album_type))
 }
 
+/// The albums of `uris`; one the response lacks is dropped. `nameless` says what a nameless
+/// album does: `Skip` for the library, `Fail` (Web API for the call) for a page.
 pub async fn albums_by_uri(
     session: Session,
     uris: Vec<SpotifyUri>,
+    nameless: Missing,
 ) -> Result<Vec<SimplifiedAlbum>, InternalError> {
     // Skip: callers advance by the requested limit, so a short page is fine.
-    get_many::<Album>(&session, &uris, Missing::Skip)
-        .await?
-        .iter()
-        .map(convert::simplified_album)
-        .collect()
+    let albums = get_many::<Album>(&session, &uris, Missing::Skip).await?;
+    convert_each(&albums, nameless, "album", convert::simplified_album)
 }
 
 pub async fn artist_top_tracks(
@@ -301,7 +325,8 @@ pub async fn artist_top_tracks(
 pub async fn show(session: Session, id: String) -> Result<FullShow, InternalError> {
     let s: Show = get_one(&session, &uri("show", &id)?).await?;
     let ids: Vec<SpotifyUri> = s.episodes.0.clone();
-    let first = episodes_by_uri(session.clone(), window(&ids, 0, FIRST_PAGE)).await?;
+    let first =
+        episodes_by_uri(session.clone(), window(&ids, 0, FIRST_PAGE), Missing::Fail).await?;
     convert::full_show(&s, first, ids.len())
 }
 
@@ -313,17 +338,46 @@ pub async fn show_episode_ids(
     Ok(s.episodes.0.clone())
 }
 
+/// The episodes of `uris`; one the response lacks is dropped. `nameless` as for
+/// [albums_by_uri].
 pub async fn episodes_by_uri(
     session: Session,
     uris: Vec<SpotifyUri>,
+    nameless: Missing,
 ) -> Result<Vec<SimplifiedEpisode>, InternalError> {
     // Skip: callers advance by the requested limit, so a short page is fine (and one pulled
     // episode must not hide a whole show).
-    get_many::<Episode>(&session, &uris, Missing::Skip)
-        .await?
-        .iter()
-        .map(convert::simplified_episode)
-        .collect()
+    let episodes = get_many::<Episode>(&session, &uris, Missing::Skip).await?;
+    convert_each(&episodes, nameless, "episode", convert::simplified_episode)
+}
+
+pub async fn tracks_by_uri(
+    session: Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<FullTrack>, InternalError> {
+    let country = session.country();
+    let catalogue = catalogue(&session);
+    // Skip: a library item without metadata keeps its cached copy (library_collection).
+    let tracks = get_many::<Track>(&session, &uris, Missing::Skip).await?;
+    convert_each(&tracks, Missing::Skip, "track", |t| {
+        convert::full_track(t, &country, &catalogue)
+    })
+}
+
+pub async fn artists_by_uri(
+    session: Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<FullArtist>, InternalError> {
+    let artists = get_many::<Artist>(&session, &uris, Missing::Skip).await?;
+    convert_each(&artists, Missing::Skip, "artist", convert::full_artist)
+}
+
+pub async fn shows_by_uri(
+    session: Session,
+    uris: Vec<SpotifyUri>,
+) -> Result<Vec<SimplifiedShow>, InternalError> {
+    let shows = get_many::<Show>(&session, &uris, Missing::Skip).await?;
+    convert_each(&shows, Missing::Skip, "show", convert::simplified_show)
 }
 
 /// The show of an episode message, if it names one.
@@ -461,6 +515,75 @@ mod tests {
             assert_eq!(pick_one(a, &f).unwrap_err(), InternalError::NotFound);
         }
         assert_eq!(pick_one(a, &found(&[(A, 200, Some(b"a"))])), Ok(&b"a"[..]));
+    }
+
+    /// The shape seen live in a liked-songs chunk: a track stub whose name, album name and
+    /// artist names are all empty.
+    fn nameless_stub() -> Track {
+        use librespot_protocol::metadata as proto;
+        let artist = proto::Artist {
+            gid: Some(vec![1; 16]),
+            name: Some(String::new()),
+            ..Default::default()
+        };
+        Track::try_from(&proto::Track {
+            gid: Some(vec![2; 16]),
+            name: Some(String::new()),
+            album: protobuf::MessageField::some(proto::Album {
+                gid: Some(vec![3; 16]),
+                name: Some(String::new()),
+                artist: vec![artist.clone()],
+                ..Default::default()
+            }),
+            artist: vec![artist],
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn named(name: &str) -> Track {
+        let mut t = nameless_stub();
+        t.name = name.to_string();
+        t.album.name = "Album".to_string();
+        for a in t.artists.iter_mut().chain(t.album.artists.iter_mut()) {
+            a.name = "Artist".to_string();
+        }
+        t
+    }
+
+    #[test]
+    fn a_nameless_library_track_is_skipped_not_failing_the_batch() {
+        let batch = vec![named("one"), nameless_stub(), named("two")];
+        let convert = |t: &Track| convert::full_track(t, "US", "premium");
+        assert_eq!(
+            convert(&batch[1]).unwrap_err(),
+            InternalError::NotFound,
+            "the stub itself does not convert"
+        );
+        let got = convert_each(&batch, Missing::Skip, "track", convert).unwrap();
+        let names: Vec<&str> = got.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["one", "two"]);
+        assert_eq!(
+            convert_each(&batch, Missing::Fail, "track", convert).unwrap_err(),
+            InternalError::NotFound,
+            "pages keep failing the call"
+        );
+    }
+
+    #[test]
+    fn convert_each_skips_only_not_found() {
+        let items = [1, 2, 3];
+        let changed = |i: &i32| {
+            if *i == 2 {
+                Err(InternalError::ProtocolChanged("x".into()))
+            } else {
+                Ok(*i)
+            }
+        };
+        assert!(matches!(
+            convert_each(&items, Missing::Skip, "track", changed),
+            Err(InternalError::ProtocolChanged(_))
+        ));
     }
 
     #[test]

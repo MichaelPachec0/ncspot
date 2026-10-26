@@ -4,7 +4,7 @@
 Each scenario starts ncspot (built with --features harness) in a private tmux server, with
 its own base path (-b, which holds the cache and the config) and runtime directory (the IPC
 socket), using a copy of the cached login. The user's own instance, cache and config are never
-touched. Credentials, tokens and the username are never printed.
+touched. Credentials, tokens, the username, Spotify IDs and library contents are never printed.
 
 Usage: python3 tools/drive.py [--play] [--keep] [--no-build] [--settle-timeout S] [scenario ...]
 Exit codes: 0 all PASS, 1 any FAIL, 2 setup error, 3 only BLOCKED (rate limited, retry later).
@@ -14,6 +14,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -31,9 +32,19 @@ REAL_CONFIG = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ncspot"
 )
 SECRET_WORDS = ("token", "bearer", "auth")
+URI_RE = re.compile(r"(spotify[:/])([a-z]+)[:/][A-Za-z0-9]{22}")
+STATUS_RE = re.compile(r"\[[^\]\n]*\]")
 SOCKET_WAIT = 15.0
 DUMP_WAIT = 15.0
 QUIET_MS = 500
+CACHE_FILES = {
+    "Tracks": "tracks.db",
+    "Albums": "albums.db",
+    "Artists": "artists.db",
+    "Podcasts": "shows.db",
+    "Your Episodes": "episodes.db",
+}
+LIBRARY_TABS = list(CACHE_FILES)
 
 TRACK = "4uLU6hMCjMI75M1A2tKUQC"
 ARTIST = "0OdUWJ0sBjDrqHygGUXeCF"
@@ -120,8 +131,26 @@ def redact(lines, username):
         if secret or (username and username in line):
             out.append("[redacted]")
         else:
-            out.append(line)
+            out.append(URI_RE.sub(r"\1\2:[id]", line))
     return out
+
+
+def status_segments(lines):
+    """Only the bracketed status bar segments of a screen capture, such as
+    `[rate limited: shared 24s]`. Rows, titles and the playing track show library contents."""
+    segments = [seg for line in lines for seg in STATUS_RE.findall(line)]
+    return [" ".join(segments)] if segments else []
+
+
+def scrub_dump(d):
+    """A dump without its view title, which can name the user."""
+    return {k: v for k, v in d.items() if k != "title"}
+
+
+def library_client(env):
+    """The Web API client the library's Web calls go through: the personal one when a
+    personal client ID is set in the environment, otherwise the shared one."""
+    return "personal" if env.get("NCSPOT_CLIENT_ID", "").strip() else "shared"
 
 
 def _toml_value(v):
@@ -172,6 +201,7 @@ class Instance:
         self.tokens = []  # (real path, temp path, bytes copied)
         self.pid = None
         self.seq = 0
+        self.cache_counts = {}
 
     def start(self):
         """Set up files and launch ncspot. Separate from __init__ so the caller
@@ -193,10 +223,26 @@ class Instance:
             self.tokens.append((token, temp, copy_token(token, temp)))
         # Library caches and user state keep the startup sync incremental instead of
         # a full sync per scenario against the account. Contents are never printed.
-        for name in ("albums.db", "artists.db", "playlists.db", "tracks.db"):
+        for name in (
+            "albums.db",
+            "artists.db",
+            "playlists.db",
+            "tracks.db",
+            "shows.db",
+            "episodes.db",
+        ):
             src = os.path.join(REAL_CACHE, name)
             if os.path.exists(src):
                 shutil.copy2(src, cache)
+        # Row counts of the copied caches, for the library scenarios. Counts only.
+        for tab_name, name in CACHE_FILES.items():
+            path = os.path.join(cache, name)
+            if os.path.exists(path):
+                try:
+                    with open(path) as f:
+                        self.cache_counts[tab_name] = len(json.load(f))
+                except (OSError, ValueError, TypeError):
+                    pass
         os.makedirs(os.path.join(self.base, ".config"))
         state = os.path.join(REAL_CONFIG, "userstate.cbor")
         if os.path.exists(state):
@@ -306,13 +352,14 @@ class Instance:
             time.sleep(0.25)
 
     def wait_idle(self, timeout):
-        """Bounded wait for the startup sync to go idle and its rate limit to lapse; never fails. The dump it
-        ends on is the baseline scenarios take counter deltas from."""
+        """Bounded wait for the startup sync to finish and go idle and its rate limit to lapse;
+        never fails. The dump it ends on is the baseline scenarios take counter deltas from."""
         deadline = time.monotonic() + timeout
         while True:
             d = self.dump()
             if (
-                d["in_flight"] == 0
+                d.get("library_done")
+                and d["in_flight"] == 0
                 and (d.get("quiet_ms") or 0) >= QUIET_MS
                 and not any(d["throttled"].values())
             ) or (
@@ -321,6 +368,19 @@ class Instance:
                 self.base_dump = d
                 return d
             time.sleep(1.0)
+
+    def wait_library(self, timeout, blocked_on=()):
+        """Poll dumps until the library sync is done and the views are settled. A timeout while
+        a client in `blocked_on` is rate limited is BLOCKED, not FAIL."""
+        deadline = time.monotonic() + timeout
+        while True:
+            d = self.dump()
+            if d.get("library_done") and settled(d):
+                return d
+            if time.monotonic() > deadline:
+                blocked_if_throttled(d, blocked_on)
+                raise Fail(f"library sync not done within {timeout} s")
+            time.sleep(0.5)
 
     def load_fully(self, timeout, tab=0):
         d = self.wait_settled(timeout)
@@ -343,13 +403,13 @@ class Instance:
             pass
         pane = self.tmux("capture-pane", "-p", "-t", "ncspot", check=False).stdout
         out = ["--- log tail ---", *redact(lines, self.username)]
-        out += ["--- pane ---", *redact(pane.splitlines(), self.username)]
+        out += ["--- status bar ---", *redact(status_segments(pane.splitlines()), self.username)]
         bt = os.path.join(self.base, ".cache", "backtrace.log")
         if os.path.exists(bt):
             with open(bt, errors="replace") as f:
                 out += ["--- backtrace.log ---", *redact(f.read().splitlines(), self.username)]
         if self.last:
-            out += ["--- last dump ---", *redact([json.dumps(self.last)], self.username)]
+            out += ["--- last dump ---", *redact([json.dumps(scrub_dump(self.last))], self.username)]
         return out
 
     def _write_back_tokens(self):
@@ -411,16 +471,21 @@ def blocked_if_throttled(d, clients):
         raise Blocked(f"rate limited: {', '.join(hit)}")
 
 
-def delta(inst, d):
-    """Metadata and Web API counters since the post-startup baseline."""
+def area_delta(inst, d, area):
+    """An area's and the Web API counters since the post-startup baseline."""
     b = inst.base_dump
-    bm, m = b["areas"]["metadata"], d["areas"]["metadata"]
+    bm, m = b["areas"][area], d["areas"][area]
     return {
         "internal_ok": m["internal_ok"] - bm["internal_ok"],
         "fallback": m["fallback"] - bm["fallback"],
         "web": (d["web"]["shared"] + d["web"]["personal"])
         - (b["web"]["shared"] + b["web"]["personal"]),
     }
+
+
+def delta(inst, d):
+    """Metadata and Web API counters since the post-startup baseline."""
+    return area_delta(inst, d, "metadata")
 
 
 def tab(d, name):
@@ -488,7 +553,8 @@ def _web_only(inst, args):
     expect(m["web"] >= 1, "Web API calls", m)
 
 
-def sc_play(inst, args):
+def sc_play_start(inst, args):
+    """Open the track, play it and wait until it is playing; returns the status."""
     inst.send(f"harness open spotify:track:{TRACK}")
     inst.wait_settled(args.settle_timeout)
     inst.send("play")
@@ -501,6 +567,74 @@ def sc_play(inst, args):
             raise Fail(f"playback never started: {st and st.get('mode')}")
         time.sleep(0.5)
     expect(bool(st["playable"]), "metadata of the playing track", st["playable"])
+    return st
+
+
+def sc_play(inst, args):
+    sc_play_start(inst, args)
+    inst.send("stop")
+
+
+def sc_library(inst, args):
+    inst.send("update")
+    d = inst.wait_library(args.settle_timeout)
+    inst.send("harness open library")
+    d = inst.wait_settled(args.settle_timeout)
+    blocked_if_throttled(d, ["internal"])
+    for name in LIBRARY_TABS:
+        t = tab(d, name)
+        want = inst.cache_counts.get(name)
+        if want:
+            expect(t["rows"] * 100 >= want * 99, f"{name} at 99% of its cache ({want})", t)
+        else:
+            expect(t["rows"] > 0, f"{name} non-empty", t)
+    m = area_delta(inst, d, "library")
+    expect(m["internal_ok"] >= 1 and m["fallback"] == 0, "library on the internal API", m)
+
+
+def sc_library_delta(inst, args):
+    inst.send("update")
+    d = inst.wait_library(args.settle_timeout)
+    blocked_if_throttled(d, ["internal"])
+    m = area_delta(inst, d, "library")
+    expect(
+        1 <= m["internal_ok"] <= 6 and m["fallback"] == 0,
+        "a delta sync of 1 to 6 internal requests, no fallback",
+        m,
+    )
+
+
+def sc_library_area_off(inst, args):
+    # Only the client the library's Web calls use: Browse and other startup calls always go
+    # through the shared one, and its rate limit says nothing about the library.
+    client = library_client(os.environ)
+    inst.send("update")
+    d = inst.wait_library(args.settle_timeout, blocked_on=[client])
+    blocked_if_throttled(d, [client])
+    inst.send("harness open library")
+    d = inst.wait_settled(args.settle_timeout)
+    m = area_delta(inst, d, "library")
+    expect(m["internal_ok"] == 0, "no library calls on the internal API", m)
+    expect(m["web"] >= 1, "Web API library calls", m)
+    expect(all(t["name"] != "Your Episodes" for t in d["tabs"]), "no Your Episodes tab", d["tabs"])
+
+
+def sc_reconnect(inst, args):
+    sc_play_start(inst, args)
+    before = inst.dump()["player"]["position_ms"]
+    inst.send("harness drop-session")
+    deadline = time.monotonic() + 45
+    while True:
+        d = inst.dump()
+        if (
+            d["session"]["reconnects"] >= 1
+            and d["player"]["status"] == "playing"
+            and d["player"]["position_ms"] > before
+        ):
+            break
+        if time.monotonic() > deadline:
+            raise Fail(f"no reconnect within 45s: {d['session']} {d['player']}")
+        time.sleep(1)
     inst.send("stop")
 
 
@@ -512,6 +646,10 @@ SCENARIOS = {
     "internal_off": ({"internal_api": False}, _web_only, False),
     "area_off": ({"internal_api_areas": {"metadata": False}}, _web_only, False),
     "play": ({}, sc_play, True),
+    "library": ({}, sc_library, False),
+    "library_delta": ({}, sc_library_delta, False),
+    "library_area_off": ({"internal_api_areas": {"library": False}}, sc_library_area_off, False),
+    "reconnect": ({}, sc_reconnect, True),
 }
 
 

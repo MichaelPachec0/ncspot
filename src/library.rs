@@ -16,15 +16,25 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::config::{self, CACHE_VERSION};
 use crate::events::EventManager;
+use crate::internal_api::Area;
+use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW};
+use crate::internal_api::error::InternalError;
+use crate::internal_api::fallback::{Action, decide_after};
+use crate::library_collection::{
+    Membership, Mode, fetch_membership, merge_followed, plan_sync, rebuild, sort_albums,
+    sort_newest_first, with_artist,
+};
 use crate::library_sync::{SavedItem, SavedPage, Synced, full_fetch_due, sync_liked, sync_saved};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
+use crate::model::episode::Episode;
 use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
 use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
+use crate::spotify_api::WebApi;
 
 /// Keys of `UserState::library_full_fetch`.
 const FULL_FETCH_TRACKS: &str = "tracks";
@@ -43,6 +53,12 @@ const CACHE_ARTISTS: &str = "artists.db";
 /// Cached playlists database filename.
 const CACHE_PLAYLISTS: &str = "playlists.db";
 
+/// Cached saved shows database filename.
+const CACHE_SHOWS: &str = "shows.db";
+
+/// Cached Your Episodes database filename.
+const CACHE_EPISODES: &str = "episodes.db";
+
 /// The user library with all their saved tracks, albums, playlists... High level interface to the
 /// Spotify API used to manage items in the user library.
 #[derive(Clone)]
@@ -52,6 +68,10 @@ pub struct Library {
     pub artists: Arc<RwLock<Vec<Artist>>>,
     pub playlists: Arc<RwLock<Vec<Playlist>>>,
     pub shows: Arc<RwLock<Vec<Show>>>,
+    /// Saved episodes (Your Episodes), filled only over the internal API.
+    pub episodes: Arc<RwLock<Vec<Episode>>>,
+    /// The Your Episodes tab is offered: the internal API library area is on.
+    pub episodes_enabled: bool,
     pub is_done: Arc<RwLock<bool>>,
     /// Set while a library sync runs, so a second one (Shift+U twice, or during the startup
     /// sync) is skipped instead of doubling the API traffic.
@@ -85,6 +105,8 @@ impl Library {
             artists: Arc::new(RwLock::new(Vec::new())),
             playlists: Arc::new(RwLock::new(Vec::new())),
             shows: Arc::new(RwLock::new(Vec::new())),
+            episodes: Arc::new(RwLock::new(Vec::new())),
+            episodes_enabled: false,
             is_done: Arc::new(RwLock::new(false)),
             syncing: Arc::new(AtomicBool::new(false)),
             resume_pending: Arc::new(AtomicBool::new(false)),
@@ -108,6 +130,8 @@ impl Library {
             artists: Arc::new(RwLock::new(Vec::new())),
             playlists: Arc::new(RwLock::new(Vec::new())),
             shows: Arc::new(RwLock::new(Vec::new())),
+            episodes: Arc::new(RwLock::new(Vec::new())),
+            episodes_enabled: spotify.api.internal_enabled(Area::Library),
             is_done: Arc::new(RwLock::new(false)),
             syncing: Arc::new(AtomicBool::new(false)),
             resume_pending: Arc::new(AtomicBool::new(false)),
@@ -123,14 +147,15 @@ impl Library {
         library
     }
 
-    /// Load cached items from the file at `cache_path` into the given `store`.
-    fn load_cache<T: DeserializeOwned>(&self, cache_path: &Path, store: &mut Vec<T>) {
+    /// Load cached items from the file at `cache_path` into the given `store`. True when a file
+    /// was read and parsed; false when it is missing, unparseable or ignored for its version.
+    fn load_cache<T: DeserializeOwned>(&self, cache_path: &Path, store: &mut Vec<T>) -> bool {
         let saved_cache_version = self.cfg.state().cache_version;
         if saved_cache_version < CACHE_VERSION {
             debug!(
                 "Cache version for {cache_path:?} has changed from {saved_cache_version} to {CACHE_VERSION}, ignoring cache"
             );
-            return;
+            return false;
         }
 
         if let Ok(contents) = std::fs::read_to_string(cache_path) {
@@ -149,21 +174,47 @@ impl Library {
 
                     // force refresh of UI (if visible)
                     self.trigger_redraw();
+                    return true;
                 }
                 Err(e) => {
                     error!("can't parse cache: {e}");
                 }
             }
         }
+        false
     }
 
-    /// Save the items from `store` in the file at `cache_path`.
-    fn save_cache<T: Serialize>(&self, cache_path: &Path, store: &[T]) {
-        let cache_file = File::create(cache_path).unwrap();
-        let serialize_result = serde_json::to_writer(cache_file, store);
-        if let Err(message) = serialize_result {
-            error!("could not write cache: {message:?}");
+    /// Save the items from `store` in the file at `cache_path`. False (logged) on failure.
+    fn save_cache<T: Serialize>(&self, cache_path: &Path, store: &[T]) -> bool {
+        let written = File::create(cache_path)
+            .map_err(|e| e.to_string())
+            .and_then(|file| serde_json::to_writer(file, store).map_err(|e| e.to_string()));
+        match written {
+            Ok(()) => true,
+            Err(e) => {
+                error!("could not write cache {}: {e}", cache_path.display());
+                false
+            }
         }
+    }
+
+    /// The stored collection v2 sync token of `set`, if any.
+    fn sync_token(&self, set: &str) -> Option<String> {
+        self.cfg.state().collection_sync.get(set).cloned()
+    }
+
+    /// Remember the collection v2 sync token of `set`.
+    fn set_sync_token(&self, set: &str, token: String) {
+        self.cfg.with_state_mut(|state| {
+            state.collection_sync.insert(set.to_string(), token.clone());
+        });
+    }
+
+    /// Forget the collection v2 sync token of `set`.
+    fn clear_sync_token(&self, set: &str) {
+        self.cfg.with_state_mut(|state| {
+            state.collection_sync.remove(set);
+        });
     }
 
     /// Check whether the `remote` [Playlist] is newer than its locally saved version. Returns
@@ -263,46 +314,28 @@ impl Library {
             let _guard = SyncGuard(library.syncing.clone());
             let sync_start = Stamp::now();
 
-            let t_tracks = {
+            let t_collection = {
                 let library = library.clone();
                 thread::spawn(move || {
-                    library.load_cache(
+                    let valid = library.load_cache(
                         &config::cache_path(CACHE_TRACKS),
                         library.tracks.write().unwrap().as_mut(),
-                    );
-                    let complete = library.fetch_tracks();
-                    library.save_cache(
-                        &config::cache_path(CACHE_TRACKS),
-                        &library.tracks.read().unwrap(),
-                    );
-                    complete
-                })
-            };
-
-            let t_albums = {
-                let library = library.clone();
-                thread::spawn(move || {
-                    library.load_cache(
+                    ) & library.load_cache(
                         &config::cache_path(CACHE_ALBUMS),
                         library.albums.write().unwrap().as_mut(),
                     );
-                    let complete = library.fetch_albums();
-                    library.save_cache(
-                        &config::cache_path(CACHE_ALBUMS),
-                        &library.albums.read().unwrap(),
-                    );
-                    complete
+                    library.fetch_collection(valid)
                 })
             };
 
             let t_artists = {
                 let library = library.clone();
                 thread::spawn(move || {
-                    library.load_cache(
+                    let valid = library.load_cache(
                         &config::cache_path(CACHE_ARTISTS),
                         library.artists.write().unwrap().as_mut(),
                     );
-                    library.fetch_artists()
+                    library.fetch_artists_any(valid)
                 })
             };
 
@@ -326,30 +359,65 @@ impl Library {
 
             let t_shows = {
                 let library = library.clone();
-                thread::spawn(move || library.fetch_shows())
+                thread::spawn(move || {
+                    // With the area off nothing is loaded: the Web fetcher runs as before.
+                    let valid = library.spotify.api.internal_enabled(Area::Library)
+                        && library.load_cache(
+                            &config::cache_path(CACHE_SHOWS),
+                            library.shows.write().unwrap().as_mut(),
+                        );
+                    library.fetch_shows_any(valid)
+                })
             };
 
-            let tracks_complete = t_tracks.join().unwrap();
-            let artists_complete = t_artists.join().unwrap();
+            let t_episodes = {
+                let library = library.clone();
+                thread::spawn(move || {
+                    if !library.episodes_enabled {
+                        return true;
+                    }
+                    let valid = library.load_cache(
+                        &config::cache_path(CACHE_EPISODES),
+                        library.episodes.write().unwrap().as_mut(),
+                    );
+                    library.fetch_episodes(valid)
+                })
+            };
+
+            let collection_complete = t_collection.join().unwrap();
+            let artists = t_artists.join().unwrap();
 
             library.populate_artists();
-            library.save_cache(
+            let artists_saved = library.save_cache(
                 &config::cache_path(CACHE_ARTISTS),
                 &library.artists.read().unwrap(),
             );
+            // The token is stored only once the cache it describes is on disk.
+            let synced = matches!(artists.outcome, SetOutcome::Synced(_));
+            let artists_complete = artists.fetched && (artists_saved || !synced);
+            library.apply_finish(
+                SET_ARTIST,
+                finish_set(
+                    artists.outcome,
+                    artists_saved,
+                    artists.mode,
+                    artists.cache_valid,
+                ),
+                artists.now,
+            );
 
-            let albums_complete = t_albums.join().unwrap();
             let playlists_complete = t_playlists.join().unwrap();
             let shows_complete = t_shows.join().unwrap();
+            let episodes_complete = t_episodes.join().unwrap();
 
             *library.is_done.write().unwrap() = true;
             library.ev.trigger();
 
-            let complete = tracks_complete
+            let complete = collection_complete
                 && artists_complete
-                && albums_complete
                 && playlists_complete
-                && shows_complete;
+                && shows_complete
+                && episodes_complete;
             library.schedule_resume(complete, sync_start);
         });
     }
@@ -428,6 +496,21 @@ impl Library {
         self.cfg.with_state_mut(|state| {
             state.library_full_fetch.insert(key.to_string(), now);
         });
+    }
+
+    /// Carry out a set's [Finish]: store or clear its token, and record a full fetch at `now`
+    /// under every key of [full_fetch_keys].
+    fn apply_finish(&self, set: &str, finish: Finish, now: i64) {
+        match finish.token {
+            TokenAction::Store(token) => self.set_sync_token(set, token),
+            TokenAction::Clear => self.clear_sync_token(set),
+            TokenAction::Keep => {}
+        }
+        if finish.record_full {
+            for key in full_fetch_keys(set) {
+                self.record_full_fetch(key, now);
+            }
+        }
     }
 
     /// Fetch the saved shows from the web API and save them to the local library, unless they
@@ -617,6 +700,255 @@ impl Library {
         }
     }
 
+    /// Sync liked songs and saved albums, which share the `collection` set and its token.
+    /// Saves both caches; the token is stored only if both writes worked.
+    fn fetch_collection(&self, cache_valid: bool) -> bool {
+        let api = &self.spotify.api;
+        // A token describes its cache only: without a valid cache it must not survive a sync
+        // that ends without a new one.
+        if !cache_valid {
+            self.clear_sync_token(SET_COLLECTION);
+        }
+        let token = self.sync_token(SET_COLLECTION);
+        let usable = api.internal_usable(Area::Library);
+        let (now, full_due) = if usable {
+            self.full_fetch_check(SET_COLLECTION, "collection")
+        } else {
+            (0, false)
+        };
+        let mode = plan_sync(usable, full_due, token.is_some(), cache_valid);
+        // Mode::Web never goes through `outcome`: an area that is simply off must not latch.
+        let outcome = if mode == Mode::Web {
+            SetOutcome::Web
+        } else {
+            outcome(
+                api,
+                SET_COLLECTION,
+                self.collection_internal(mode, token.as_deref()),
+            )
+        };
+        let fetched = match outcome {
+            SetOutcome::Web => {
+                // Two Web fetchers, both always run, in parallel.
+                let (tracks, albums) = thread::scope(|scope| {
+                    let tracks = scope.spawn(|| self.fetch_tracks());
+                    let albums = scope.spawn(|| self.fetch_albums());
+                    (tracks.join().unwrap(), albums.join().unwrap())
+                });
+                tracks && albums
+            }
+            SetOutcome::Incomplete => false,
+            SetOutcome::Synced(_) => true,
+        };
+        let saved = self.save_cache(
+            &config::cache_path(CACHE_TRACKS),
+            &self.tracks.read().unwrap(),
+        ) & self.save_cache(
+            &config::cache_path(CACHE_ALBUMS),
+            &self.albums.read().unwrap(),
+        );
+        let synced = matches!(outcome, SetOutcome::Synced(_));
+        self.apply_finish(
+            SET_COLLECTION,
+            finish_set(outcome, saved, mode, cache_valid),
+            now,
+        );
+        fetched && (saved || !synced)
+    }
+
+    /// Sync the `collection` set over the internal API into the in-memory tracks and albums.
+    /// Returns the new sync token; the caller stores it once the caches are written.
+    fn collection_internal(
+        &self,
+        mode: Mode,
+        token: Option<&str>,
+    ) -> Result<String, InternalError> {
+        let api = &self.spotify.api;
+        let fetched = fetch_membership(api, SET_COLLECTION, mode, token)?;
+        let refetch = mode == Mode::Full;
+        let track_members = fetched.membership.only("track");
+        let album_members = fetched.membership.only("album");
+        let tracks_now = self.tracks.read().unwrap().clone();
+        let mut tracks = rebuild(&tracks_now, &track_members, refetch, |u| {
+            api.library_tracks(u)
+        })?;
+        let albums_now = self.albums.read().unwrap().clone();
+        let mut albums: Vec<Album> = rebuild(&albums_now, &album_members, refetch, |u| {
+            api.library_albums(u)
+        })?
+        .into_iter()
+        .map(with_artist)
+        .collect();
+        sort_newest_first(&mut tracks, |t| t.added_at);
+        sort_albums(&mut albums);
+        info!(
+            "collection: {}, {} tracks, {} albums",
+            describe_sync(mode, &[&track_members, &album_members]),
+            tracks.len(),
+            albums.len()
+        );
+        *self.tracks.write().unwrap() = tracks;
+        *self.albums.write().unwrap() = albums;
+        Ok(fetched.sync_token)
+    }
+
+    /// Sync the followed artists from the `artist` set into the store. The caller saves
+    /// `artists.db` and then finishes the set with the returned [ArtistsSync].
+    fn fetch_artists_any(&self, cache_valid: bool) -> ArtistsSync {
+        let api = &self.spotify.api;
+        if !cache_valid {
+            self.clear_sync_token(SET_ARTIST);
+        }
+        let token = self.sync_token(SET_ARTIST);
+        let usable = api.internal_usable(Area::Library);
+        let (now, full_due) = if usable {
+            self.full_fetch_check(SET_ARTIST, "artists")
+        } else {
+            (0, false)
+        };
+        let mode = plan_sync(usable, full_due, token.is_some(), cache_valid);
+        let outcome = if mode == Mode::Web {
+            SetOutcome::Web
+        } else {
+            let result = (|| {
+                let fetched = fetch_membership(api, SET_ARTIST, mode, token.as_deref())?;
+                let members = fetched.membership.only("artist");
+                let followed_now: Vec<Artist> = self
+                    .artists
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .filter(|a| a.is_followed)
+                    .cloned()
+                    .collect();
+                let followed = rebuild(&followed_now, &members, mode == Mode::Full, |u| {
+                    api.library_artists(u)
+                })?;
+                info!(
+                    "artists: {}, {} followed",
+                    describe_sync(mode, &[&members]),
+                    followed.len()
+                );
+                merge_followed(&mut self.artists.write().unwrap(), followed);
+                Ok::<String, InternalError>(fetched.sync_token)
+            })();
+            outcome(api, SET_ARTIST, result)
+        };
+        let fetched = match outcome {
+            SetOutcome::Synced(_) => true,
+            SetOutcome::Incomplete => false,
+            SetOutcome::Web => self.fetch_artists(),
+        };
+        ArtistsSync {
+            fetched,
+            outcome,
+            mode,
+            cache_valid,
+            now,
+        }
+    }
+
+    /// Sync the saved shows from the `show` set, caching them in `shows.db`. Returns whether
+    /// the sync was complete.
+    fn fetch_shows_any(&self, cache_valid: bool) -> bool {
+        let api = &self.spotify.api;
+        if !cache_valid {
+            self.clear_sync_token(SET_SHOW);
+        }
+        let token = self.sync_token(SET_SHOW);
+        let usable = api.internal_usable(Area::Library);
+        let (now, full_due) = if usable {
+            self.full_fetch_check(SET_SHOW, "shows")
+        } else {
+            (0, false)
+        };
+        let mode = plan_sync(usable, full_due, token.is_some(), cache_valid);
+        let outcome = if mode == Mode::Web {
+            SetOutcome::Web
+        } else {
+            let result = (|| {
+                let fetched = fetch_membership(api, SET_SHOW, mode, token.as_deref())?;
+                let members = fetched.membership.only("show");
+                let shows_now = self.shows.read().unwrap().clone();
+                let mut shows = rebuild(&shows_now, &members, mode == Mode::Full, |u| {
+                    api.library_shows(u)
+                })?;
+                sort_newest_first(&mut shows, |s| s.added_at);
+                info!(
+                    "shows: {}, {} shows",
+                    describe_sync(mode, &[&members]),
+                    shows.len()
+                );
+                *self.shows.write().unwrap() = shows;
+                Ok::<String, InternalError>(fetched.sync_token)
+            })();
+            outcome(api, SET_SHOW, result)
+        };
+        let (complete, saved) = match outcome {
+            SetOutcome::Synced(_) => {
+                let saved = self.save_cache(
+                    &config::cache_path(CACHE_SHOWS),
+                    &self.shows.read().unwrap(),
+                );
+                (saved, saved)
+            }
+            SetOutcome::Incomplete => (false, false),
+            SetOutcome::Web => (self.fetch_shows(), false),
+        };
+        self.apply_finish(SET_SHOW, finish_set(outcome, saved, mode, cache_valid), now);
+        complete
+    }
+
+    /// Sync Your Episodes from the `listenlater` set, caching them in `episodes.db`. There is
+    /// no Web fetcher: with the area unusable or the session falling back to the Web API the
+    /// cache stays as it is. Returns whether the sync was complete.
+    fn fetch_episodes(&self, cache_valid: bool) -> bool {
+        let api = &self.spotify.api;
+        if !api.internal_usable(Area::Library) {
+            return true;
+        }
+        if !cache_valid {
+            self.clear_sync_token(SET_LISTEN_LATER);
+        }
+        let token = self.sync_token(SET_LISTEN_LATER);
+        let (now, full_due) = self.full_fetch_check(SET_LISTEN_LATER, "episodes");
+        let mode = plan_sync(true, full_due, token.is_some(), cache_valid);
+        let result = (|| {
+            let fetched = fetch_membership(api, SET_LISTEN_LATER, mode, token.as_deref())?;
+            let members = fetched.membership.only("episode");
+            let episodes_now = self.episodes.read().unwrap().clone();
+            let mut episodes = rebuild(&episodes_now, &members, mode == Mode::Full, |u| {
+                api.library_episodes(u)
+            })?;
+            sort_newest_first(&mut episodes, |e| e.added_at);
+            info!(
+                "episodes: {}, {} episodes",
+                describe_sync(mode, &[&members]),
+                episodes.len()
+            );
+            *self.episodes.write().unwrap() = episodes;
+            Ok::<String, InternalError>(fetched.sync_token)
+        })();
+        let outcome = outcome(api, SET_LISTEN_LATER, result);
+        let (complete, saved) = match outcome {
+            SetOutcome::Synced(_) => {
+                let saved = self.save_cache(
+                    &config::cache_path(CACHE_EPISODES),
+                    &self.episodes.read().unwrap(),
+                );
+                (saved, saved)
+            }
+            SetOutcome::Incomplete => (false, false),
+            SetOutcome::Web => (true, false),
+        };
+        self.apply_finish(
+            SET_LISTEN_LATER,
+            finish_set(outcome, saved, mode, cache_valid),
+            now,
+        );
+        complete
+    }
+
     /// Fetch the saved albums from the web API and store them in the local library, unless they
     /// are unchanged. Returns false, leaving the stored albums unchanged, if a page failed.
     fn fetch_albums(&self) -> bool {
@@ -644,7 +976,7 @@ impl Library {
                     .map(|saved| SavedItem {
                         id: Some(saved.album.id.id().to_string()),
                         added_at: Some(saved.added_at),
-                        value: Album::from(saved),
+                        value: with_artist(Album::from(saved)),
                     })
                     .collect(),
             })
@@ -662,18 +994,7 @@ impl Library {
             }
         };
 
-        albums.sort_unstable_by_key(|album| {
-            let album_artist = album.artists[0]
-                .strip_prefix("The ")
-                .unwrap_or(&album.artists[0]);
-            let album_title = album.title.strip_prefix("The ").unwrap_or(&album.title);
-            format!(
-                "{}{}{}",
-                album_artist.to_lowercase(),
-                album.year,
-                album_title.to_lowercase()
-            )
-        });
+        sort_albums(&mut albums);
 
         *self.albums.write().unwrap() = albums;
         self.record_full_fetch(FULL_FETCH_ALBUMS, now);
@@ -936,7 +1257,7 @@ impl Library {
                 store.insert(0, album.clone());
 
                 // resort list of albums
-                store.sort_unstable_by_key(|a| format!("{}{}{}", a.artists[0], a.year, a.title));
+                sort_albums(&mut store);
             }
         }
 
@@ -1188,6 +1509,122 @@ fn resume_delay(longest_remaining: Duration, jitter: Duration) -> Duration {
     longest_remaining.max(RESUME_MIN_DELAY) + jitter
 }
 
+/// The followed artists' sync, finished by the coordinator once `artists.db` is saved.
+struct ArtistsSync {
+    /// The artists were fetched (internally or over the Web API).
+    fetched: bool,
+    outcome: SetOutcome,
+    mode: Mode,
+    cache_valid: bool,
+    /// When the sync started (Unix seconds), for the full-fetch record.
+    now: i64,
+}
+
+/// What a set's internal sync did.
+enum SetOutcome {
+    /// Synced; the new token, to store once the cache file is written.
+    Synced(String),
+    /// Rate limited or transient: keep the cache, the set is incomplete.
+    Incomplete,
+    /// Use the Web API fetcher for this set (the area may have been latched).
+    Web,
+}
+
+/// What happens to a set's sync token after its sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TokenAction {
+    /// The set synced and its cache is on disk: this token describes that cache.
+    Store(String),
+    /// No token may describe the cache now on disk.
+    Clear,
+    /// The old token still describes the (valid) cache.
+    Keep,
+}
+
+/// The token action for a finished set sync, and whether to record its full fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Finish {
+    token: TokenAction,
+    /// An internal Full of the set synced and its cache was saved.
+    record_full: bool,
+}
+
+/// Decide a set's token after its sync: a token is only kept or stored when it describes the
+/// cache file. `saved` is whether the set's cache files were written after a `Synced` sync
+/// (ignored otherwise); `cache_valid` is whether the cache was valid at load. A set that did
+/// not sync over an invalid cache (the store started empty) must leave no token, or the next
+/// sync would apply a delta to that empty cache.
+fn finish_set(outcome: SetOutcome, saved: bool, mode: Mode, cache_valid: bool) -> Finish {
+    let (token, record_full) = match outcome {
+        SetOutcome::Synced(token) if saved => (TokenAction::Store(token), mode == Mode::Full),
+        SetOutcome::Synced(_) => (TokenAction::Clear, false),
+        SetOutcome::Incomplete | SetOutcome::Web if cache_valid => (TokenAction::Keep, false),
+        SetOutcome::Incomplete | SetOutcome::Web => (TokenAction::Clear, false),
+    };
+    Finish { token, record_full }
+}
+
+/// The `library_full_fetch` keys an internal Full of `set` refreshes: its own, and those of
+/// the Web fetchers for the same lists, so a later Web fallback takes their incremental route
+/// instead of a full re-download.
+fn full_fetch_keys(set: &str) -> &'static [&'static str] {
+    match set {
+        SET_COLLECTION => &[SET_COLLECTION, FULL_FETCH_TRACKS, FULL_FETCH_ALBUMS],
+        SET_SHOW => &[SET_SHOW, FULL_FETCH_SHOWS],
+        SET_ARTIST => &[SET_ARTIST],
+        SET_LISTEN_LATER => &[SET_LISTEN_LATER],
+        _ => &[],
+    }
+}
+
+/// How a set was synced, for the log: from what was actually fetched, not from the planned
+/// mode (a refused delta pages the set). Changes are summed over `parts`.
+fn describe_sync(mode: Mode, parts: &[&Membership]) -> String {
+    let (mut added, mut removed, mut listed) = (0, 0, false);
+    for part in parts {
+        match part {
+            Membership::Changes {
+                added: a,
+                removed: r,
+            } => {
+                added += a.len();
+                removed += r.len();
+            }
+            Membership::Listing(_) => listed = true,
+        }
+    }
+    if listed {
+        let kind = if mode == Mode::Full { "Full" } else { "Repage" };
+        kind.to_string()
+    } else {
+        format!("Delta, added {added}, removed {removed}")
+    }
+}
+
+/// Map the result of a set's internal sync to what to do next, per the fallback rules.
+fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> SetOutcome {
+    match result {
+        Ok(token) => SetOutcome::Synced(token),
+        Err(err) => match decide_after(&err) {
+            Action::LatchThenWeb => {
+                info!("{set}: internal sync failed ({err}), latching to the Web API");
+                api.latch_area(Area::Library, &err);
+                api.count_fallback(Area::Library);
+                SetOutcome::Web
+            }
+            Action::WebOnce => {
+                info!("{set}: internal sync failed ({err}), using the Web API this time");
+                api.count_fallback(Area::Library);
+                SetOutcome::Web
+            }
+            Action::Fail => {
+                warn!("{set}: {err}");
+                SetOutcome::Incomplete
+            }
+        },
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1309,12 +1746,99 @@ mod test {
         assert!(!flag.load(Ordering::SeqCst));
     }
 
-    #[test]
-    fn a_second_sync_is_skipped_while_one_runs() {
+    fn test_library() -> Arc<Library> {
         let cfg = Config::new_for_test();
+        cfg.with_state_mut(|s| s.cache_version = CACHE_VERSION);
         let ev = EventManager::new_for_test();
         let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
-        let library = Library::new_for_test(ev, spotify, cfg);
+        Library::new_for_test(ev, spotify, cfg)
+    }
+
+    #[test]
+    fn sync_tokens_are_stored_and_cleared_per_set() {
+        let library = test_library();
+        assert_eq!(library.sync_token("artist"), None);
+        library.set_sync_token("artist", "t1".into());
+        library.set_sync_token("show", "t2".into());
+        assert_eq!(library.sync_token("artist").as_deref(), Some("t1"));
+        library.clear_sync_token("artist");
+        assert_eq!(library.sync_token("artist"), None);
+        assert_eq!(library.sync_token("show").as_deref(), Some("t2"));
+    }
+
+    #[test]
+    fn cache_results_report_success() {
+        let library = test_library();
+        let dir = std::env::temp_dir().join(format!("ncspot-cache-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.db");
+        assert!(library.save_cache(&path, &[1u32, 2]));
+        let mut store: Vec<u32> = Vec::new();
+        assert!(library.load_cache(&path, &mut store));
+        assert_eq!(store, vec![1, 2]);
+        assert!(!library.load_cache(&dir.join("missing.db"), &mut store));
+        assert!(!library.save_cache(&dir.join("no-such-dir").join("x.db"), &[1u32]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn outcome_follows_the_fallback_classes() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert!(
+            matches!(outcome(&api, "artist", Ok("t".into())), SetOutcome::Synced(t) if t == "t")
+        );
+        assert!(matches!(
+            outcome(&api, "artist", Err(InternalError::RateLimited)),
+            SetOutcome::Incomplete
+        ));
+        assert!(matches!(
+            outcome(&api, "artist", Err(InternalError::Transient("x".into()))),
+            SetOutcome::Incomplete
+        ));
+        assert!(matches!(
+            outcome(&api, "artist", Err(InternalError::NoSession)),
+            SetOutcome::Web
+        ));
+        assert!(api.internal_usable(Area::Library));
+        assert!(matches!(
+            outcome(
+                &api,
+                "artist",
+                Err(InternalError::ProtocolChanged("400".into()))
+            ),
+            SetOutcome::Web
+        ));
+        assert!(
+            !api.internal_usable(Area::Library),
+            "a protocol change latches the area"
+        );
+        assert_eq!(api.area_counts(Area::Library).fallback, 2);
+    }
+
+    #[test]
+    fn describe_sync_goes_by_the_membership_not_the_mode() {
+        use crate::internal_api::collection::Item;
+        let item = |uri: &str| Item {
+            uri: uri.to_string(),
+            added_at: 0,
+        };
+        let changes = Membership::Changes {
+            added: vec![item("spotify:artist:a"), item("spotify:artist:b")],
+            removed: vec!["spotify:artist:c".to_string()],
+        };
+        assert_eq!(
+            describe_sync(Mode::Delta, &[&changes, &changes]),
+            "Delta, added 4, removed 2"
+        );
+        let listing = Membership::Listing(vec![item("spotify:artist:a")]);
+        assert_eq!(describe_sync(Mode::Delta, &[&listing]), "Repage");
+        assert_eq!(describe_sync(Mode::Repage, &[&listing]), "Repage");
+        assert_eq!(describe_sync(Mode::Full, &[&listing]), "Full");
+    }
+
+    #[test]
+    fn a_second_sync_is_skipped_while_one_runs() {
+        let library = test_library();
         library.syncing.store(true, Ordering::SeqCst);
         *library.is_done.write().unwrap() = true;
 
@@ -1322,5 +1846,145 @@ mod test {
 
         assert!(*library.is_done.read().unwrap());
         assert!(library.syncing.load(Ordering::SeqCst));
+    }
+
+    fn synced(t: &str) -> SetOutcome {
+        SetOutcome::Synced(t.to_string())
+    }
+
+    #[test]
+    fn a_synced_and_saved_set_stores_its_token() {
+        for mode in [Mode::Delta, Mode::Repage, Mode::Full] {
+            for valid in [true, false] {
+                assert_eq!(
+                    finish_set(synced("t"), true, mode, valid),
+                    Finish {
+                        token: TokenAction::Store("t".into()),
+                        record_full: mode == Mode::Full,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_synced_set_whose_save_failed_clears_its_token() {
+        for mode in [Mode::Delta, Mode::Repage, Mode::Full] {
+            assert_eq!(
+                finish_set(synced("t"), false, mode, true),
+                Finish {
+                    token: TokenAction::Clear,
+                    record_full: false,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn an_unsynced_set_keeps_its_token_only_over_a_valid_cache() {
+        for mode in [Mode::Web, Mode::Delta, Mode::Repage, Mode::Full] {
+            for saved in [true, false] {
+                let outcomes: [fn() -> SetOutcome; 2] =
+                    [|| SetOutcome::Incomplete, || SetOutcome::Web];
+                for outcome in outcomes {
+                    assert_eq!(
+                        finish_set(outcome(), saved, mode, false),
+                        Finish {
+                            token: TokenAction::Clear,
+                            record_full: false,
+                        },
+                        "an invalid cache written without a new token must not keep the old one"
+                    );
+                    assert_eq!(
+                        finish_set(outcome(), saved, mode, true),
+                        Finish {
+                            token: TokenAction::Keep,
+                            record_full: false,
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_internal_full_also_records_the_web_keys() {
+        assert_eq!(
+            full_fetch_keys(SET_COLLECTION),
+            &[SET_COLLECTION, FULL_FETCH_TRACKS, FULL_FETCH_ALBUMS]
+        );
+        assert_eq!(full_fetch_keys(SET_SHOW), &[SET_SHOW, FULL_FETCH_SHOWS]);
+        assert_eq!(full_fetch_keys(SET_ARTIST), &[SET_ARTIST]);
+        assert_eq!(full_fetch_keys(SET_LISTEN_LATER), &[SET_LISTEN_LATER]);
+    }
+
+    #[test]
+    fn error_classes_map_to_token_actions() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let cases = [
+            (Err(InternalError::RateLimited), TokenAction::Keep),
+            (Err(InternalError::Transient("x".into())), TokenAction::Keep),
+            (Err(InternalError::NoSession), TokenAction::Keep),
+            (Err(InternalError::NotFound), TokenAction::Keep),
+            (Err(InternalError::Denied), TokenAction::Keep),
+            (Ok("t".to_string()), TokenAction::Store("t".into())),
+        ];
+        for (result, valid_action) in cases {
+            let unsynced = result.is_err();
+            let o = outcome(&api, "artist", result.clone());
+            assert_eq!(finish_set(o, true, Mode::Repage, true).token, valid_action);
+            let o = outcome(&api, "artist", result);
+            let invalid_action = if unsynced {
+                TokenAction::Clear
+            } else {
+                TokenAction::Store("t".into())
+            };
+            assert_eq!(
+                finish_set(o, true, Mode::Repage, false).token,
+                invalid_action
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_fetch_is_recorded_under_every_key_of_the_set() {
+        let library = test_library();
+        library.apply_finish(
+            SET_COLLECTION,
+            Finish {
+                token: TokenAction::Store("t".into()),
+                record_full: true,
+            },
+            42,
+        );
+        assert_eq!(library.sync_token(SET_COLLECTION).as_deref(), Some("t"));
+        let state = library.cfg.state();
+        for key in [SET_COLLECTION, FULL_FETCH_TRACKS, FULL_FETCH_ALBUMS] {
+            assert_eq!(state.library_full_fetch.get(key), Some(&42), "{key}");
+        }
+        assert_eq!(state.library_full_fetch.get(FULL_FETCH_SHOWS), None);
+        drop(state);
+        library.apply_finish(
+            SET_COLLECTION,
+            Finish {
+                token: TokenAction::Keep,
+                record_full: false,
+            },
+            43,
+        );
+        assert_eq!(library.sync_token(SET_COLLECTION).as_deref(), Some("t"));
+        library.apply_finish(
+            SET_COLLECTION,
+            Finish {
+                token: TokenAction::Clear,
+                record_full: false,
+            },
+            44,
+        );
+        assert_eq!(library.sync_token(SET_COLLECTION), None);
+        assert_eq!(
+            library.cfg.state().library_full_fetch.get(SET_COLLECTION),
+            Some(&42)
+        );
     }
 }

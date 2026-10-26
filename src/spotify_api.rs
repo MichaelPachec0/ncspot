@@ -24,7 +24,9 @@ use crate::authentication::DEFAULT_WEB_API_CLIENT_ID;
 use crate::events::{Event, EventManager};
 #[cfg(any(test, feature = "harness"))]
 use crate::internal_api::AreaCounts;
+use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
+use crate::internal_api::metadata::Missing;
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -138,6 +140,33 @@ pub struct WebApi {
     internal: InternalApi,
 }
 
+/// `call` once per `size` items of `items`, in order, with the results concatenated; the first
+/// failed call fails the whole.
+fn in_batches<T: Clone, U, E>(
+    items: &[T],
+    size: usize,
+    mut call: impl FnMut(Vec<T>) -> Result<Vec<U>, E>,
+) -> Result<Vec<U>, E> {
+    let mut out = Vec::with_capacity(items.len());
+    for batch in items.chunks(size) {
+        out.extend(call(batch.to_vec())?);
+    }
+    Ok(out)
+}
+
+/// The Spotify URIs among `uris`; the others are dropped with a debug log.
+fn parse_uris(uris: &[String]) -> Vec<SpotifyUri> {
+    uris.iter()
+        .filter_map(|u| match SpotifyUri::from_uri(u) {
+            Ok(uri) => Some(uri),
+            Err(_) => {
+                debug!("library: skipping an unparseable uri");
+                None
+            }
+        })
+        .collect()
+}
+
 impl WebApi {
     /// Create the Web API wrapper. A personal client is set up only if `cfg` has a personal
     /// client ID.
@@ -215,46 +244,148 @@ impl WebApi {
         let skip = self.internal.skip(area);
         fallback::run_with_fallback(
             skip,
-            || {
-                let session = self.internal.session().ok_or(InternalError::NoSession)?;
-                // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
-                // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
-                let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
-                // Held across retries so backoff sleeps and throttle waits count as loading.
-                let _call = ACTIVITY.begin();
-                let result = run_attempts(
-                    no_waits,
-                    &self.internal.throttle,
-                    || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
-                    |window| {
-                        self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window)
-                    },
-                    thread::sleep,
-                );
-                if result.is_ok() {
-                    self.internal.count_ok(area);
-                }
-                result
-            },
+            || self.run_internal(area, internal),
             || {
                 if !skip {
-                    self.internal.count_fallback(area);
+                    self.count_fallback(area);
                 }
                 web()
             },
-            |err| {
-                if self.internal.latch(area) {
-                    // The InternalApiFallback handler logs the warning with the user-facing text.
-                    debug!("internal API {} latched to the Web API: {err}", area.name());
-                    if let Some(events) = &self.events {
-                        events.try_send(Event::InternalApiFallback {
-                            area: area.name(),
-                            reason: err.to_string(),
-                        });
-                    }
-                }
-            },
+            |err| self.latch_area(area, err),
         )
+    }
+
+    /// Run one call through the internal API for `area` with no Web API fallback, for callers
+    /// that choose the fallback themselves. Fails with `ProtocolChanged` when the area is off or
+    /// latched.
+    pub fn run_internal<T, F, Fut>(&self, area: Area, internal: F) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        if self.internal.skip(area) {
+            return Err(InternalError::ProtocolChanged("area off or latched".into()));
+        }
+        let session = self.internal.session().ok_or(InternalError::NoSession)?;
+        // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
+        // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
+        let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
+        // Held across retries so backoff sleeps and throttle waits count as loading.
+        let _call = ACTIVITY.begin();
+        let result = run_attempts(
+            no_waits,
+            &self.internal.throttle,
+            || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
+            |window| self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window),
+            thread::sleep,
+        );
+        if result.is_ok() {
+            self.internal.count_ok(area);
+        }
+        result
+    }
+
+    /// Latch `area` to the Web API after `err`, and tell the UI once.
+    pub fn latch_area(&self, area: Area, err: &InternalError) {
+        if self.internal.latch(area) {
+            // The InternalApiFallback handler logs the warning with the user-facing text.
+            debug!("internal API {} latched to the Web API: {err}", area.name());
+            if let Some(events) = &self.events {
+                events.try_send(Event::InternalApiFallback {
+                    area: area.name(),
+                    reason: err.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Count a call in `area` that fell back to the Web API after an internal failure.
+    pub fn count_fallback(&self, area: Area) {
+        self.internal.count_fallback(area);
+    }
+
+    /// Whether calls in `area` would try the internal API right now (on and not latched).
+    pub fn internal_usable(&self, area: Area) -> bool {
+        !self.internal.skip(area)
+    }
+
+    /// Whether `area` is switched on in the settings, ignoring the latch.
+    pub fn internal_enabled(&self, area: Area) -> bool {
+        self.internal.settings().area_enabled(area)
+    }
+
+    /// Every item of a collection set, page by page (each page is one internal call).
+    pub fn collection_page_all(&self, set: &'static str) -> Result<Listing, InternalError> {
+        let mut listing = Listing::default();
+        let mut token = String::new();
+        loop {
+            let page = self.run_internal(Area::Library, |session| {
+                collection::page(session, set, token.clone())
+            })?;
+            match collection::absorb(&mut listing, page) {
+                Some(next) => token = next,
+                None => return Ok(listing),
+            }
+        }
+    }
+
+    pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
+        let token = token.to_string();
+        self.run_internal(Area::Library, |session| {
+            collection::delta(session, set, token.clone())
+        })
+    }
+
+    /// Metadata for library items by Spotify URI, through the internal API: one internal call
+    /// (with its own bridge timeout and retries) per [metadata::BATCH_SIZE] URIs, results in
+    /// request order. URIs that do not parse are dropped, and so are items the service no
+    /// longer has; with nothing left to ask for, no session is needed.
+    fn library_items<M, T, Fut>(
+        &self,
+        uris: &[String],
+        fetch: impl Fn(Session, Vec<SpotifyUri>) -> Fut,
+    ) -> Result<Vec<T>, InternalError>
+    where
+        Fut: Future<Output = Result<Vec<M>, InternalError>> + Send + 'static,
+        M: Send + 'static,
+        T: for<'a> From<&'a M>,
+    {
+        if uris.is_empty() {
+            return Ok(Vec::new());
+        }
+        let uris = parse_uris(uris);
+        in_batches(&uris, metadata::BATCH_SIZE, |batch| {
+            self.run_internal(Area::Library, |session| fetch(session, batch.clone()))
+                .map(|items| items.iter().map(T::from).collect())
+        })
+    }
+
+    pub fn library_tracks(&self, uris: &[String]) -> Result<Vec<Track>, InternalError> {
+        self.library_items(uris, metadata::tracks_by_uri)
+    }
+
+    pub fn library_albums(&self, uris: &[String]) -> Result<Vec<Album>, InternalError> {
+        self.library_items(uris, |session, uris| {
+            metadata::albums_by_uri(session, uris, Missing::Skip)
+        })
+    }
+
+    pub fn library_artists(&self, uris: &[String]) -> Result<Vec<Artist>, InternalError> {
+        self.library_items(uris, metadata::artists_by_uri)
+    }
+
+    pub fn library_shows(
+        &self,
+        uris: &[String],
+    ) -> Result<Vec<crate::model::show::Show>, InternalError> {
+        self.library_items(uris, metadata::shows_by_uri)
+    }
+
+    pub fn library_episodes(&self, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
+        self.library_items(uris, |session, uris| {
+            metadata::episodes_by_uri(session, uris, Missing::Skip)
+        })
     }
 
     /// The personal client, if configured and not disabled.
@@ -997,7 +1128,8 @@ impl WebApi {
                             };
                             let page_ids =
                                 metadata::window(&all, offset as usize, MAX_SIZE as usize);
-                            let items = metadata::albums_by_uri(session, page_ids).await?;
+                            let items =
+                                metadata::albums_by_uri(session, page_ids, Missing::Fail).await?;
                             Ok((items, all.len() as u32))
                         }
                     },
@@ -1055,7 +1187,8 @@ impl WebApi {
                             };
                             let page_ids =
                                 metadata::window(&all, offset as usize, MAX_SIZE as usize);
-                            let items = metadata::episodes_by_uri(session, page_ids).await?;
+                            let items =
+                                metadata::episodes_by_uri(session, page_ids, Missing::Fail).await?;
                             Ok((items, all.len() as u32))
                         }
                     },
@@ -1313,6 +1446,34 @@ mod test {
     use crate::config::Config;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn run_internal_without_a_session_is_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let result: Result<u8, _> = api.run_internal(Area::Library, |_session| async { Ok(1u8) });
+        assert_eq!(result, Err(InternalError::NoSession));
+    }
+
+    #[test]
+    fn library_metadata_without_a_session_is_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert!(matches!(
+            api.library_tracks(&uris),
+            Err(InternalError::NoSession)
+        ));
+        assert_eq!(api.library_episodes(&[]).map(|v| v.len()), Ok(0));
+    }
+
+    #[test]
+    fn run_internal_on_a_latched_area_does_not_run() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Library, &InternalError::ProtocolChanged("x".into()));
+        let result: Result<u8, _> = api.run_internal(Area::Library, |_session| async { Ok(1u8) });
+        assert!(matches!(result, Err(InternalError::ProtocolChanged(_))));
+        assert!(!api.internal_usable(Area::Library));
+        assert!(api.internal_enabled(Area::Library));
+    }
 
     #[test]
     fn call_on_counts_the_call_as_in_flight() {
@@ -1589,6 +1750,58 @@ mod test {
                 shared: 1,
                 personal: 2
             }
+        );
+    }
+
+    #[test]
+    fn in_batches_makes_one_call_per_batch_and_keeps_the_order() {
+        let items: Vec<u32> = (0..250).collect();
+        let mut sizes = Vec::new();
+        let got: Result<Vec<u32>, ()> = super::in_batches(&items, 100, |batch| {
+            sizes.push(batch.len());
+            Ok(batch.into_iter().map(|i| i * 2).collect())
+        });
+        assert_eq!(sizes, vec![100, 100, 50]);
+        assert_eq!(
+            got.unwrap(),
+            items.iter().map(|i| i * 2).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn in_batches_stops_at_the_first_failed_batch() {
+        let items: Vec<u32> = (0..250).collect();
+        let mut calls = 0;
+        let got: Result<Vec<u32>, &str> = super::in_batches(&items, 100, |batch| {
+            calls += 1;
+            if batch[0] == 100 {
+                Err("boom")
+            } else {
+                Ok(batch)
+            }
+        });
+        assert_eq!(got, Err("boom"));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn in_batches_of_nothing_makes_no_call() {
+        let got: Result<Vec<u32>, ()> =
+            super::in_batches(&[] as &[u32], 100, |_| panic!("no call expected"));
+        assert_eq!(got, Ok(Vec::new()));
+    }
+
+    #[test]
+    fn library_metadata_of_only_unparseable_uris_needs_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert_eq!(
+            api.library_tracks(&["not a uri".into()]).map(|t| t.len()),
+            Ok(0)
+        );
+        assert_eq!(
+            api.library_tracks(&["spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()])
+                .map(|t| t.len()),
+            Err(InternalError::NoSession)
         );
     }
 }
