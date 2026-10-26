@@ -165,7 +165,9 @@ class LibraryDeltaTest(unittest.TestCase):
     def run_with(ok, fallback):
         def d(lib_ok, lib_fb):
             return {
-                "areas": {"library": {"internal_ok": lib_ok, "fallback": lib_fb}},
+                "areas": {
+                    "library": {"internal_ok": lib_ok, "fallback": lib_fb, "latched": False}
+                },
                 "web": {"shared": 0, "personal": 0},
                 "throttled": {},
             }
@@ -207,7 +209,9 @@ class LibraryWriteTest(unittest.TestCase):
         def d(lib_ok, lib_fb, error=None):
             return {
                 "error": error,
-                "areas": {"library": {"internal_ok": lib_ok, "fallback": lib_fb}},
+                "areas": {
+                    "library": {"internal_ok": lib_ok, "fallback": lib_fb, "latched": False}
+                },
                 "web": {"shared": 0, "personal": 0},
                 "throttled": {},
             }
@@ -248,6 +252,10 @@ class LibraryWriteTest(unittest.TestCase):
     def test_an_error_fails(self):
         with self.assertRaises(drive.Fail):
             self.run_with(6, 0, errors=["harness save: library unchanged"])
+
+    def test_every_item_skipped_is_blocked(self):
+        with self.assertRaises(drive.Blocked):
+            self.run_with(0, 0, errors=["harness save: already in the library"] * 3)
 
     def test_an_item_already_saved_is_skipped_not_removed(self):
         sent = self.run_with(4, 0, errors=["harness save: already in the library"])

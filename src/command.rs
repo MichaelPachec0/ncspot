@@ -1080,12 +1080,18 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     }
                     (Some(sub), _) => Err(E::BadEnumArg {
                         arg: sub.into(),
-                        accept: vec!["open".into(), "dump".into(), "drop-session".into()],
+                        accept: vec![
+                            "open".into(),
+                            "dump".into(),
+                            "drop-session".into(),
+                            "save".into(),
+                            "unsave".into(),
+                        ],
                         optional: false,
                     }),
                     (None, _) => Err(E::InsufficientArgs {
                         cmd: command.into(),
-                        hint: Some("open|dump|drop-session".into()),
+                        hint: Some("open|dump|drop-session|save|unsave".into()),
                     }),
                 }?,
                 _ => {

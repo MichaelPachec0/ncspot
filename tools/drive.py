@@ -634,6 +634,8 @@ def sc_library_write(inst, args):
     inst.send("update")
     d = inst.wait_library(args.settle_timeout, blocked_on=["internal"])
     blocked_if_throttled(d, ["internal"])
+    # Measure the writes only: the delta sync above also counts as internal calls.
+    inst.base_dump = d
     wrote = 0
     for kind, uri in WRITE_TARGETS:
         inst.send(f"harness save {uri}")
@@ -646,9 +648,12 @@ def sc_library_write(inst, args):
         d = inst.wait_settled(args.settle_timeout)
         expect(d.get("error") is None, f"{kind}: remove without error", d.get("error"))
         wrote += 2
+    if wrote == 0:
+        raise Blocked("every test item is already in the library")
     blocked_if_throttled(d, ["internal"])
     m = area_delta(inst, d, "library")
     expect(m["fallback"] == 0, "no library fallback", m)
+    expect(not d["areas"]["library"]["latched"], "library area not latched", d["areas"]["library"])
     expect(m["internal_ok"] >= wrote, "one internal call per write", m)
 
 

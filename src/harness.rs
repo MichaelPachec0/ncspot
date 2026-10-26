@@ -236,7 +236,12 @@ pub fn write_item(
     let url = parse_target(target)?;
     let spotify = queue.get_spotify();
     let api = &spotify.api;
-    let failed = |what: &str| format!("harness save: could not load {what}");
+    let verb = if removed {
+        "harness unsave"
+    } else {
+        "harness save"
+    };
+    let failed = |what: &str| format!("{verb}: could not load {what}");
     let lib = &library;
     let (is_saved, write): ItemOps = match url.uri_type {
         UriType::Track => {
@@ -309,18 +314,18 @@ pub fn write_item(
                 }),
             )
         }
-        UriType::Playlist => return Err("harness save: playlists are not a library set".into()),
+        UriType::Playlist => return Err(format!("{verb}: playlists are not a library set")),
     };
     let before = is_saved();
     if !removed && before {
-        return Err("harness save: already in the library".into());
+        return Err(format!("{verb}: already in the library"));
     }
     if removed && !before {
-        return Err("harness unsave: not in the library".into());
+        return Err(format!("{verb}: not in the library"));
     }
     write();
     if is_saved() == before {
-        return Err("harness save: library unchanged".into());
+        return Err(format!("{verb}: library unchanged"));
     }
     Ok(())
 }

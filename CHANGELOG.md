@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Save episodes to Your Episodes from their context menu
+
 ### Changed
 
-- Saving and removing tracks, albums, artists and shows goes through Spotify's internal API,
-  and episodes can be saved to Your Episodes from their context menu
+- Saving and removing tracks, albums, artists and shows goes through Spotify's internal API
 
 ### Fixed
 
