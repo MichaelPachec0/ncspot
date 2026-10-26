@@ -27,6 +27,7 @@ mod jukebox;
 mod library;
 mod library_collection;
 mod library_sync;
+mod log_redact;
 mod lyrics;
 mod model;
 mod panic;
@@ -63,7 +64,8 @@ fn main() -> Result<(), String> {
 
     // Enable debug logging to a file if specified on the command line.
     if let Some(filename) = matches.get_one::<PathBuf>("debug") {
-        setup_logging(filename).expect("logger could not be initialized");
+        setup_logging(filename, matches.get_flag("log-secrets"))
+            .expect("logger could not be initialized");
     }
 
     // Set the configuration base path. All configuration files are read/written relative to this

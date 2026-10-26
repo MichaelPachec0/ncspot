@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Playback dying on `:reconnect` an hour after logging in via the browser
 - Playback stopping when Spotify closes the connection
+- Debug logs containing Web API tokens; pass `--log-secrets` to keep them
 
 ## [1.5.0]
 
