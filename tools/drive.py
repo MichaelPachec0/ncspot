@@ -4,7 +4,7 @@
 Each scenario starts ncspot (built with --features harness) in a private tmux server, with
 its own base path (-b, which holds the cache and the config) and runtime directory (the IPC
 socket), using a copy of the cached login. The user's own instance, cache and config are never
-touched. Credentials, tokens and the username are never printed.
+touched. Credentials, tokens, the username, Spotify IDs and library contents are never printed.
 
 Usage: python3 tools/drive.py [--play] [--keep] [--no-build] [--settle-timeout S] [scenario ...]
 Exit codes: 0 all PASS, 1 any FAIL, 2 setup error, 3 only BLOCKED (rate limited, retry later).
@@ -14,6 +14,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -31,6 +32,8 @@ REAL_CONFIG = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ncspot"
 )
 SECRET_WORDS = ("token", "bearer", "auth")
+URI_RE = re.compile(r"(spotify[:/])([a-z]+)[:/][A-Za-z0-9]{22}")
+STATUS_RE = re.compile(r"\[[^\]\n]*\]")
 SOCKET_WAIT = 15.0
 DUMP_WAIT = 15.0
 QUIET_MS = 500
@@ -128,8 +131,26 @@ def redact(lines, username):
         if secret or (username and username in line):
             out.append("[redacted]")
         else:
-            out.append(line)
+            out.append(URI_RE.sub(r"\1\2:[id]", line))
     return out
+
+
+def status_segments(lines):
+    """Only the bracketed status bar segments of a screen capture, such as
+    `[rate limited: shared 24s]`. Rows, titles and the playing track show library contents."""
+    segments = [seg for line in lines for seg in STATUS_RE.findall(line)]
+    return [" ".join(segments)] if segments else []
+
+
+def scrub_dump(d):
+    """A dump without its view title, which can name the user."""
+    return {k: v for k, v in d.items() if k != "title"}
+
+
+def library_client(env):
+    """The Web API client the library's Web calls go through: the personal one when a
+    personal client ID is set in the environment, otherwise the shared one."""
+    return "personal" if env.get("NCSPOT_CLIENT_ID", "").strip() else "shared"
 
 
 def _toml_value(v):
@@ -348,14 +369,16 @@ class Instance:
                 return d
             time.sleep(1.0)
 
-    def wait_library(self, timeout):
-        """Poll dumps until the library sync is done and the views are settled."""
+    def wait_library(self, timeout, blocked_on=()):
+        """Poll dumps until the library sync is done and the views are settled. A timeout while
+        a client in `blocked_on` is rate limited is BLOCKED, not FAIL."""
         deadline = time.monotonic() + timeout
         while True:
             d = self.dump()
             if d.get("library_done") and settled(d):
                 return d
             if time.monotonic() > deadline:
+                blocked_if_throttled(d, blocked_on)
                 raise Fail(f"library sync not done within {timeout} s")
             time.sleep(0.5)
 
@@ -380,13 +403,13 @@ class Instance:
             pass
         pane = self.tmux("capture-pane", "-p", "-t", "ncspot", check=False).stdout
         out = ["--- log tail ---", *redact(lines, self.username)]
-        out += ["--- pane ---", *redact(pane.splitlines(), self.username)]
+        out += ["--- status bar ---", *redact(status_segments(pane.splitlines()), self.username)]
         bt = os.path.join(self.base, ".cache", "backtrace.log")
         if os.path.exists(bt):
             with open(bt, errors="replace") as f:
                 out += ["--- backtrace.log ---", *redact(f.read().splitlines(), self.username)]
         if self.last:
-            out += ["--- last dump ---", *redact([json.dumps(self.last)], self.username)]
+            out += ["--- last dump ---", *redact([json.dumps(scrub_dump(self.last))], self.username)]
         return out
 
     def _write_back_tokens(self):
@@ -582,9 +605,12 @@ def sc_library_delta(inst, args):
 
 
 def sc_library_area_off(inst, args):
+    # Only the client the library's Web calls use: Browse and other startup calls always go
+    # through the shared one, and its rate limit says nothing about the library.
+    client = library_client(os.environ)
     inst.send("update")
-    d = inst.wait_library(args.settle_timeout)
-    blocked_if_throttled(d, ["shared", "personal"])
+    d = inst.wait_library(args.settle_timeout, blocked_on=[client])
+    blocked_if_throttled(d, [client])
     inst.send("harness open library")
     d = inst.wait_settled(args.settle_timeout)
     m = area_delta(inst, d, "library")

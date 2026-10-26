@@ -41,6 +41,25 @@ class RedactTest(unittest.TestCase):
         self.assertEqual(drive.redact(["a b"], None), ["a b"])
 
 
+class ScrubTest(unittest.TestCase):
+    def test_redact_masks_spotify_ids(self):
+        out = drive.redact(["open spotify:track:4uLU6hMCjMI75M1A2tKUQC now"], None)
+        self.assertEqual(out, ["open spotify:track:[id] now"])
+
+    def test_status_segments_keep_only_bracketed_segments(self):
+        pane = ["  Some Artist - Some Song   3:01 |", " >> Song  [rate limited: shared 24s] [R1] 0:02"]
+        self.assertEqual(drive.status_segments(pane), ["[rate limited: shared 24s] [R1]"])
+        self.assertEqual(drive.status_segments(["no brackets"]), [])
+
+    def test_scrub_dump_drops_the_title(self):
+        self.assertEqual(drive.scrub_dump({"title": "Library of x", "seq": 1}), {"seq": 1})
+
+    def test_library_client_follows_the_personal_client_id(self):
+        self.assertEqual(drive.library_client({}), "shared")
+        self.assertEqual(drive.library_client({"NCSPOT_CLIENT_ID": " "}), "shared")
+        self.assertEqual(drive.library_client({"NCSPOT_CLIENT_ID": "ab" * 16}), "personal")
+
+
 class ConfigTest(unittest.TestCase):
     def test_renders_scalars_and_one_level_tables(self):
         text = drive.render_config(
