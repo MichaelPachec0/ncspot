@@ -1743,7 +1743,13 @@ fn write_through(
     let skip = !api.internal_usable(Area::Library);
     run_with_fallback(
         skip,
-        internal,
+        || {
+            internal().inspect_err(|err| {
+                if decide_after(err) == Action::Fail {
+                    warn!("Could not update the library: {err}");
+                }
+            })
+        },
         || {
             if !skip {
                 api.count_fallback(Area::Library);
