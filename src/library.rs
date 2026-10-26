@@ -1695,21 +1695,6 @@ fn describe_sync(mode: Mode, parts: &[&Membership]) -> String {
 }
 
 /// Map the result of a set's internal sync to what to do next, per the fallback rules.
-/// An episode write. Episodes have no Web API fallback: any failure fails the action with a
-/// warning; a protocol change still latches the area.
-fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
-    match api.collection_write(SET_LISTEN_LATER, uris, removed) {
-        Ok(()) => true,
-        Err(err) => {
-            if let InternalError::ProtocolChanged(_) = err {
-                api.latch_area(Area::Library, &err);
-            }
-            warn!("Could not update Your Episodes: {err}");
-            false
-        }
-    }
-}
-
 fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> SetOutcome {
     match result {
         Ok(token) => SetOutcome::Synced(token),
@@ -1730,6 +1715,21 @@ fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> Se
                 SetOutcome::Incomplete
             }
         },
+    }
+}
+
+/// An episode write. Episodes have no Web API fallback: any failure fails the action with a
+/// warning; a protocol change still latches the area.
+fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
+    match api.collection_write(SET_LISTEN_LATER, uris, removed) {
+        Ok(()) => true,
+        Err(err) => {
+            if let InternalError::ProtocolChanged(_) = err {
+                api.latch_area(Area::Library, &err);
+            }
+            warn!("Could not update Your Episodes: {err}");
+            false
+        }
     }
 }
 
