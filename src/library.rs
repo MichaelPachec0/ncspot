@@ -1460,6 +1460,53 @@ impl Library {
         shows.iter().any(|s| s.id == show.id)
     }
 
+    /// Whether `episode` is in Your Episodes; None while Your Episodes is off or loading.
+    pub fn is_saved_episode(&self, episode: &Episode) -> Option<bool> {
+        if !self.episodes_enabled || !*self.is_done.read().unwrap() {
+            return None;
+        }
+        Some(
+            self.episodes
+                .read()
+                .unwrap()
+                .iter()
+                .any(|e| e.id == episode.id),
+        )
+    }
+
+    /// Add `episode` to Your Episodes.
+    pub fn save_episode(&self, episode: &Episode) {
+        if self.is_saved_episode(episode) != Some(false)
+            || !episode_write(&self.spotify.api, std::slice::from_ref(&episode.uri), false)
+        {
+            return;
+        }
+        let mut episode = episode.clone();
+        episode.added_at = Some(chrono::Utc::now());
+        self.episodes.write().unwrap().insert(0, episode);
+        self.save_cache(
+            &config::cache_path(CACHE_EPISODES),
+            &self.episodes.read().unwrap(),
+        );
+    }
+
+    /// Remove `episode` from Your Episodes.
+    pub fn unsave_episode(&self, episode: &Episode) {
+        if self.is_saved_episode(episode) != Some(true)
+            || !episode_write(&self.spotify.api, std::slice::from_ref(&episode.uri), true)
+        {
+            return;
+        }
+        self.episodes
+            .write()
+            .unwrap()
+            .retain(|e| e.id != episode.id);
+        self.save_cache(
+            &config::cache_path(CACHE_EPISODES),
+            &self.episodes.read().unwrap(),
+        );
+    }
+
     /// Save the `show` to the user's library.
     pub fn save_show(&self, show: &Show) {
         if !*self.is_done.read().unwrap() {
@@ -1648,6 +1695,21 @@ fn describe_sync(mode: Mode, parts: &[&Membership]) -> String {
 }
 
 /// Map the result of a set's internal sync to what to do next, per the fallback rules.
+/// An episode write. Episodes have no Web API fallback: any failure fails the action with a
+/// warning; a protocol change still latches the area.
+fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
+    match api.collection_write(SET_LISTEN_LATER, uris, removed) {
+        Ok(()) => true,
+        Err(err) => {
+            if let InternalError::ProtocolChanged(_) = err {
+                api.latch_area(Area::Library, &err);
+            }
+            warn!("Could not update Your Episodes: {err}");
+            false
+        }
+    }
+}
+
 fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> SetOutcome {
     match result {
         Ok(token) => SetOutcome::Synced(token),
@@ -1820,6 +1882,41 @@ mod test {
         let ev = EventManager::new_for_test();
         let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
         Library::new_for_test(ev, spotify, cfg)
+    }
+
+    #[test]
+    fn episode_writes_have_no_web_fallback() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        // No session: NoSession, which for other sets would use the Web API.
+        assert!(!episode_write(
+            &api,
+            &["spotify:episode:e".to_string()],
+            false
+        ));
+        assert_eq!(
+            api.area_counts(Area::Library).fallback,
+            0,
+            "no fallback counted"
+        );
+        assert!(api.internal_usable(Area::Library));
+    }
+
+    #[test]
+    fn episode_save_state_is_hidden_while_episodes_are_off() {
+        let mut library = test_library();
+        Arc::get_mut(&mut library).unwrap().episodes_enabled = false;
+        let episode = Episode {
+            id: "e".into(),
+            uri: "spotify:episode:e".into(),
+            duration: 0,
+            name: String::new(),
+            description: String::new(),
+            release_date: String::new(),
+            cover_url: None,
+            added_at: None,
+            list_index: 0,
+        };
+        assert_eq!(library.is_saved_episode(&episode), None);
     }
 
     #[test]
