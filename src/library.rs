@@ -1926,6 +1926,31 @@ mod test {
     }
 
     #[test]
+    fn episode_store_is_unchanged_when_the_write_fails() {
+        let mut library = test_library();
+        Arc::get_mut(&mut library).unwrap().episodes_enabled = true;
+        *library.is_done.write().unwrap() = true;
+        let episode = |id: &str| Episode {
+            id: id.into(),
+            uri: format!("spotify:episode:{id}"),
+            duration: 0,
+            name: String::new(),
+            description: String::new(),
+            release_date: String::new(),
+            cover_url: None,
+            added_at: None,
+            list_index: 0,
+        };
+        library.save_episode(&episode("new"));
+        assert!(library.episodes.read().unwrap().is_empty());
+        library.episodes.write().unwrap().push(episode("kept"));
+        library.unsave_episode(&episode("kept"));
+        let store = library.episodes.read().unwrap();
+        assert_eq!(store.len(), 1);
+        assert_eq!(store[0].id, "kept");
+    }
+
+    #[test]
     fn sync_tokens_are_stored_and_cleared_per_set() {
         let library = test_library();
         assert_eq!(library.sync_token("artist"), None);
