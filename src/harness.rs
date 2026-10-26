@@ -13,6 +13,8 @@ use crate::internal_api::{Area, AreaCounts};
 use crate::library::Library;
 use crate::model::album::Album;
 use crate::model::artist::Artist;
+use crate::model::episode::Episode;
+use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
@@ -216,6 +218,111 @@ pub fn open_view(
         }
     };
     Ok(view)
+}
+
+/// A library membership check and its write, for one item.
+type ItemOps<'a> = (Box<dyn Fn() -> bool + 'a>, Box<dyn Fn() + 'a>);
+
+/// Save (or remove, with `removed`) one item through the library, as the UI would. Refuses to
+/// save an item already in the library, so a test that saves then removes never removes
+/// something the user saved, and refuses to remove an item that is not in it. Fails when the
+/// library did not change (the write failed). Errors carry no URI or ID.
+pub fn write_item(
+    queue: Arc<Queue>,
+    library: Arc<Library>,
+    target: &str,
+    removed: bool,
+) -> Result<(), String> {
+    let url = parse_target(target)?;
+    let spotify = queue.get_spotify();
+    let api = &spotify.api;
+    let failed = |what: &str| format!("harness save: could not load {what}");
+    let lib = &library;
+    let (is_saved, write): ItemOps = match url.uri_type {
+        UriType::Track => {
+            let track = Track::from(&api.track(&url.id).map_err(|_| failed("track"))?);
+            let playable = Playable::Track(track.clone());
+            (
+                Box::new(move || lib.is_saved_track(&playable)),
+                Box::new(move || {
+                    if removed {
+                        lib.unsave_tracks(&[&track]);
+                    } else {
+                        lib.save_tracks(&[&track]);
+                    }
+                }),
+            )
+        }
+        UriType::Album => {
+            let album = Album::from(&api.album(&url.id).map_err(|_| failed("album"))?);
+            let check = album.clone();
+            (
+                Box::new(move || lib.is_saved_album(&check)),
+                Box::new(move || {
+                    if removed {
+                        lib.unsave_album(&album);
+                    } else {
+                        lib.save_album(&album);
+                    }
+                }),
+            )
+        }
+        UriType::Artist => {
+            let artist = Artist::from(&api.artist(&url.id).map_err(|_| failed("artist"))?);
+            let check = artist.clone();
+            (
+                Box::new(move || lib.is_followed_artist(&check)),
+                Box::new(move || {
+                    if removed {
+                        lib.unfollow_artist(&artist);
+                    } else {
+                        lib.follow_artist(&artist);
+                    }
+                }),
+            )
+        }
+        UriType::Show => {
+            let show = Show::from(&api.show(&url.id).map_err(|_| failed("show"))?);
+            let check = show.clone();
+            (
+                Box::new(move || lib.is_saved_show(&check)),
+                Box::new(move || {
+                    if removed {
+                        lib.unsave_show(&show);
+                    } else {
+                        lib.save_show(&show);
+                    }
+                }),
+            )
+        }
+        UriType::Episode => {
+            let episode = Episode::from(&api.episode(&url.id).map_err(|_| failed("episode"))?);
+            let check = episode.clone();
+            (
+                Box::new(move || lib.is_saved_episode(&check) == Some(true)),
+                Box::new(move || {
+                    if removed {
+                        lib.unsave_episode(&episode);
+                    } else {
+                        lib.save_episode(&episode);
+                    }
+                }),
+            )
+        }
+        UriType::Playlist => return Err("harness save: playlists are not a library set".into()),
+    };
+    let before = is_saved();
+    if !removed && before {
+        return Err("harness save: already in the library".into());
+    }
+    if removed && !before {
+        return Err("harness unsave: not in the library".into());
+    }
+    write();
+    if is_saved() == before {
+        return Err("harness save: library unchanged".into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]

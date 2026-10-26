@@ -245,6 +245,10 @@ pub enum HarnessCommand {
     Open(String),
     /// Show the library screen, optionally on one tab (a `LibraryTab` config name).
     OpenLibrary(Option<String>),
+    /// Save a Spotify URI to the library (refuses one already saved).
+    Save(String),
+    /// Remove a Spotify URI from the library (refuses one not saved).
+    Unsave(String),
     /// Shut the playback session down so the worker has to reconnect.
     DropSession,
     /// Write a JSON snapshot of the current view to a file.
@@ -343,6 +347,10 @@ impl fmt::Display for Command {
                 args.extend(tab.clone());
                 args
             }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::Save(uri)) => vec!["save".into(), uri.clone()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::Unsave(uri)) => vec!["unsave".into(), uri.clone()],
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::DropSession) => vec!["drop-session".into()],
             Self::Goto(mode) => vec![mode.to_string()],
@@ -1045,23 +1053,31 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                         HarnessCommand::OpenLibrary(rest.first().map(|s| (*s).to_string())),
                     )),
                     (Some("drop-session"), []) => Ok(Command::Harness(HarnessCommand::DropSession)),
+                    (Some("save"), [target]) => Ok(Command::Harness(HarnessCommand::Save(
+                        (*target).to_string(),
+                    ))),
+                    (Some("unsave"), [target]) => Ok(Command::Harness(HarnessCommand::Unsave(
+                        (*target).to_string(),
+                    ))),
                     (Some("open"), [target, ..]) => Ok(Command::Harness(HarnessCommand::Open(
                         (*target).to_string(),
                     ))),
                     (Some("dump"), rest) if !rest.is_empty() => {
                         Ok(Command::Harness(HarnessCommand::Dump(rest.join(" "))))
                     }
-                    (Some(sub @ ("open" | "dump")), _) => Err(E::InsufficientArgs {
-                        cmd: format!("{command} {sub}"),
-                        hint: Some(
-                            if sub == "open" {
-                                "a Spotify URI or URL"
-                            } else {
-                                "a file path"
-                            }
-                            .into(),
-                        ),
-                    }),
+                    (Some(sub @ ("open" | "dump" | "save" | "unsave")), _) => {
+                        Err(E::InsufficientArgs {
+                            cmd: format!("{command} {sub}"),
+                            hint: Some(
+                                if sub != "dump" {
+                                    "a Spotify URI or URL"
+                                } else {
+                                    "a file path"
+                                }
+                                .into(),
+                            ),
+                        })
+                    }
                     (Some(sub), _) => Err(E::BadEnumArg {
                         arg: sub.into(),
                         accept: vec!["open".into(), "dump".into(), "drop-session".into()],
@@ -1109,6 +1125,14 @@ mod tests {
                 HarnessCommand::OpenLibrary(Some("episodes".into())),
             ),
             ("harness drop-session", HarnessCommand::DropSession),
+            (
+                "harness save spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+                HarnessCommand::Save("spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()),
+            ),
+            (
+                "harness unsave spotify:show:4rOoJ6Egrf8K2IrywzwOMk",
+                HarnessCommand::Unsave("spotify:show:4rOoJ6Egrf8K2IrywzwOMk".into()),
+            ),
         ] {
             let cmds = parse(line).unwrap();
             assert!(matches!(cmds.as_slice(), [Command::Harness(c)] if *c == expect));

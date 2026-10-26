@@ -433,6 +433,21 @@ impl CommandManager {
                 Ok(None)
             }
             #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::Save(target)) => {
+                crate::harness::write_item(
+                    self.queue.clone(),
+                    self.library.clone(),
+                    target,
+                    false,
+                )?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::Unsave(target)) => {
+                crate::harness::write_item(self.queue.clone(), self.library.clone(), target, true)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
             Command::Harness(crate::command::HarnessCommand::Open(target)) => {
                 let view =
                     crate::harness::open_view(self.queue.clone(), self.library.clone(), target)?;
