@@ -15,7 +15,7 @@ use log::debug;
 use protobuf::Message;
 
 use super::error::{InternalError, classify};
-use proto::{DeltaRequest, DeltaResponse, PageRequest, PageResponse};
+use proto::{CollectionItem, DeltaRequest, DeltaResponse, PageRequest, PageResponse, WriteRequest};
 
 pub const SET_COLLECTION: &str = "collection";
 pub const SET_ARTIST: &str = "artist";
@@ -183,10 +183,120 @@ pub async fn delta(
     delta_answer(post(&session, "/collection/v2/delta", encode(&request)?).await)
 }
 
+/// Items per write request.
+pub const WRITE_BATCH: usize = 100;
+
+/// A random id for one write, as the desktop client sends.
+fn update_id() -> String {
+    format!("{:016x}", rand::random::<u64>())
+}
+
+/// One write of `uris` to `set`: all added, or all removed. `now` is Unix seconds; the field
+/// is 32 bits wide.
+pub fn write_request(
+    username: String,
+    set: &str,
+    uris: &[String],
+    removed: bool,
+    now: i64,
+    update_id: String,
+) -> WriteRequest {
+    let added_at = i32::try_from(now).unwrap_or(i32::MAX);
+    WriteRequest {
+        username,
+        set: set.to_string(),
+        items: uris
+            .iter()
+            .map(|uri| CollectionItem {
+                uri: uri.clone(),
+                added_at,
+                is_removed: removed,
+                ..Default::default()
+            })
+            .collect(),
+        client_update_id: update_id,
+        ..Default::default()
+    }
+}
+
+/// Add or remove `uris` in `set` (at most [WRITE_BATCH]). Set membership makes a repeated
+/// write harmless, so librespot's own network retry is fine here.
+pub async fn write(
+    session: Session,
+    set: &'static str,
+    uris: Vec<String>,
+    removed: bool,
+) -> Result<(), InternalError> {
+    debug!("collection write: {set}, {} items", uris.len());
+    let request = write_request(
+        session.username(),
+        set,
+        &uris,
+        removed,
+        chrono::Utc::now().timestamp(),
+        update_id(),
+    );
+    post(&session, "/collection/v2/write", encode(&request)?)
+        .await
+        .map(|_| ())
+        .map_err(|e| classify_collection(&e))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::proto::{CollectionItem, DeltaRequest, DeltaResponse, PageRequest, PageResponse};
+    use super::proto::{
+        CollectionItem, DeltaRequest, DeltaResponse, PageRequest, PageResponse, WriteRequest,
+    };
     use protobuf::Message;
+
+    #[test]
+    fn write_request_marks_every_item() {
+        let uris = vec!["spotify:track:a".to_string(), "spotify:track:b".to_string()];
+        let req = super::write_request(
+            "u".into(),
+            "collection",
+            &uris,
+            true,
+            1_700_000_000,
+            "0123456789abcdef".into(),
+        );
+        assert_eq!(req.username, "u");
+        assert_eq!(req.set, "collection");
+        assert_eq!(req.client_update_id, "0123456789abcdef");
+        assert_eq!(req.items.len(), 2);
+        assert!(
+            req.items
+                .iter()
+                .all(|i| i.is_removed && i.added_at == 1_700_000_000)
+        );
+        assert_eq!(req.items[1].uri, "spotify:track:b");
+        let bytes = req.write_to_bytes().unwrap();
+        assert_eq!(WriteRequest::parse_from_bytes(&bytes).unwrap(), req);
+    }
+
+    #[test]
+    fn write_request_clamps_a_time_past_i32() {
+        let req = super::write_request(
+            "u".into(),
+            "show",
+            &["spotify:show:s".into()],
+            false,
+            i64::MAX,
+            String::new(),
+        );
+        assert_eq!(req.items[0].added_at, i32::MAX);
+        assert!(!req.items[0].is_removed);
+    }
+
+    #[test]
+    fn update_ids_are_16_hex_chars() {
+        let id = super::update_id();
+        assert_eq!(id.len(), 16);
+        assert!(
+            id.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+    }
 
     #[test]
     fn page_request_round_trips() {

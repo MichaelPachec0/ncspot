@@ -165,7 +165,9 @@ class LibraryDeltaTest(unittest.TestCase):
     def run_with(ok, fallback):
         def d(lib_ok, lib_fb):
             return {
-                "areas": {"library": {"internal_ok": lib_ok, "fallback": lib_fb}},
+                "areas": {
+                    "library": {"internal_ok": lib_ok, "fallback": lib_fb, "latched": False}
+                },
                 "web": {"shared": 0, "personal": 0},
                 "throttled": {},
             }
@@ -191,6 +193,74 @@ class LibraryDeltaTest(unittest.TestCase):
         for ok, fallback in [(0, 1), (2, 1), (0, 0), (7, 0)]:
             with self.assertRaises(drive.Fail, msg=(ok, fallback)):
                 self.run_with(ok, fallback)
+
+
+class LibraryWriteTest(unittest.TestCase):
+    URIS = [
+        f"spotify:{k}:{i}"
+        for k, i in [("track", drive.TRACK), ("artist", drive.ARTIST), ("show", drive.SHOW)]
+    ]
+
+    @staticmethod
+    def run_with(ok, fallback, errors=()):
+        """Run the scenario against a fake instance; `errors` is the error of each successive
+        save/unsave dump. Returns the lines sent."""
+
+        def d(lib_ok, lib_fb, error=None):
+            return {
+                "error": error,
+                "areas": {
+                    "library": {"internal_ok": lib_ok, "fallback": lib_fb, "latched": False}
+                },
+                "web": {"shared": 0, "personal": 0},
+                "throttled": {},
+            }
+
+        errs = list(errors)
+
+        class Inst:
+            base_dump = d(10, 0)
+            sent = []
+
+            def send(self, cmd):
+                self.sent.append(cmd)
+
+            def wait_library(self, timeout, blocked_on=()):
+                return d(10, 0)
+
+            def wait_settled(self, timeout):
+                return d(10 + ok, fallback, errs.pop(0) if errs else None)
+
+        class Args:
+            settle_timeout = 1
+
+        inst = Inst()
+        drive.sc_library_write(inst, Args())
+        return inst.sent
+
+    def test_saves_then_removes_each_item(self):
+        sent = self.run_with(6, 0)
+        expected = ["update"]
+        for u in self.URIS:
+            expected += [f"harness save {u}", f"harness unsave {u}"]
+        self.assertEqual(sent, expected)
+
+    def test_a_fallback_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(6, 1)
+
+    def test_an_error_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(6, 0, errors=["harness save: library unchanged"])
+
+    def test_every_item_skipped_is_blocked(self):
+        with self.assertRaises(drive.Blocked):
+            self.run_with(0, 0, errors=["harness save: already in the library"] * 3)
+
+    def test_an_item_already_saved_is_skipped_not_removed(self):
+        sent = self.run_with(4, 0, errors=["harness save: already in the library"])
+        self.assertNotIn(f"harness unsave {self.URIS[0]}", sent)
+        self.assertIn(f"harness unsave {self.URIS[1]}", sent)
 
 
 if __name__ == "__main__":

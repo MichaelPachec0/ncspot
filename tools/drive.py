@@ -619,6 +619,44 @@ def sc_library_area_off(inst, args):
     expect(all(t["name"] != "Your Episodes" for t in d["tabs"]), "no Your Episodes tab", d["tabs"])
 
 
+WRITE_TARGETS = [
+    ("track", f"spotify:track:{TRACK}"),
+    ("artist", f"spotify:artist:{ARTIST}"),
+    ("show", f"spotify:show:{SHOW}"),
+]
+
+
+def sc_library_write(inst, args):
+    """Save then remove items not already in the library, through the internal API. `harness
+    save/unsave` check that the library changed, so a clean error field is the per-item check;
+    the counters show each write was one internal call with no fallback. Row counts are not
+    used: the Artists tab also lists unfollowed artists of saved tracks."""
+    inst.send("update")
+    d = inst.wait_library(args.settle_timeout, blocked_on=["internal"])
+    blocked_if_throttled(d, ["internal"])
+    # Measure the writes only: the delta sync above also counts as internal calls.
+    inst.base_dump = d
+    wrote = 0
+    for kind, uri in WRITE_TARGETS:
+        inst.send(f"harness save {uri}")
+        d = inst.wait_settled(args.settle_timeout)
+        if d.get("error") and "already in the library" in d["error"]:
+            print(f"  skip {kind}: test item already in the library")
+            continue
+        expect(d.get("error") is None, f"{kind}: save without error", d.get("error"))
+        inst.send(f"harness unsave {uri}")
+        d = inst.wait_settled(args.settle_timeout)
+        expect(d.get("error") is None, f"{kind}: remove without error", d.get("error"))
+        wrote += 2
+    if wrote == 0:
+        raise Blocked("every test item is already in the library")
+    blocked_if_throttled(d, ["internal"])
+    m = area_delta(inst, d, "library")
+    expect(m["fallback"] == 0, "no library fallback", m)
+    expect(not d["areas"]["library"]["latched"], "library area not latched", d["areas"]["library"])
+    expect(m["internal_ok"] >= wrote, "one internal call per write", m)
+
+
 def sc_reconnect(inst, args):
     sc_play_start(inst, args)
     before = inst.dump()["player"]["position_ms"]
@@ -649,6 +687,7 @@ SCENARIOS = {
     "library": ({}, sc_library, False),
     "library_delta": ({}, sc_library_delta, False),
     "library_area_off": ({"internal_api_areas": {"library": False}}, sc_library_area_off, False),
+    "library_write": ({}, sc_library_write, False),
     "reconnect": ({}, sc_reconnect, True),
 }
 
