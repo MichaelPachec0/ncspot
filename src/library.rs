@@ -1123,6 +1123,11 @@ impl Library {
                     *stopped = true;
                     None
                 }
+                Err(err @ InternalError::ProtocolChanged(_)) => {
+                    // The rest of this sync goes to the Web API; this playlist keeps its copy.
+                    self.spotify.api.latch_area(Area::Playlists, &err);
+                    None
+                }
                 Err(err) => {
                     debug!(
                         "playlists: a head was not read ({}), using the cached snapshot",
