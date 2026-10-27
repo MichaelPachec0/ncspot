@@ -1,6 +1,7 @@
 //! Spotify's playlist v2 service (the rootlist and playlist contents) over the librespot
 //! session.
 
+use http::Method;
 use librespot_core::{Session, SpotifyId};
 use librespot_protocol::playlist4_external::{ListAttributes, MetaItem, SelectedListContent};
 use log::debug;
@@ -50,6 +51,16 @@ pub struct Rootlist {
     pub read: usize,
     /// Pages absorbed.
     pub pages: usize,
+}
+
+/// A playlist's (or the rootlist's) head without its items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    pub revision: Vec<u8>,
+    /// base64 (standard) of `revision`, the form `Playlist.snapshot_id` stores.
+    pub snapshot_id: String,
+    pub length: usize,
+    pub name: Option<String>,
 }
 
 /// One item of a playlist.
@@ -195,6 +206,17 @@ pub fn parse_contents(content: SelectedListContent) -> Vec<PlaylistItem> {
         .collect()
 }
 
+/// The head fields of a reply: revision, length and name; missing fields are empty.
+pub fn parse_head(content: &SelectedListContent) -> Head {
+    let revision = content.revision.clone().unwrap_or_default();
+    Head {
+        snapshot_id: base64_encode(&revision),
+        revision,
+        length: usize::try_from(content.length.unwrap_or(0)).unwrap_or(0),
+        name: content.attributes.as_ref().and_then(|a| a.name.clone()),
+    }
+}
+
 fn parse(bytes: &[u8]) -> Result<SelectedListContent, InternalError> {
     SelectedListContent::parse_from_bytes(bytes)
         .map_err(|e| InternalError::ProtocolChanged(format!("playlist parse: {e}")))
@@ -228,6 +250,30 @@ pub async fn contents(session: Session, id: String) -> Result<Vec<PlaylistItem>,
         .await
         .map_err(|e| classify(&e))?;
     Ok(parse_contents(parse(&bytes)?))
+}
+
+/// The head of one playlist (`?length=0`: no items). An id that does not parse does not exist.
+pub async fn head(session: Session, id: String) -> Result<Head, InternalError> {
+    debug!("playlist head");
+    let id = SpotifyId::from_base62(&id).map_err(|_| InternalError::NotFound)?;
+    let endpoint = format!("/playlist/v2/playlist/{}?length=0", id.to_base62());
+    let bytes = session
+        .spclient()
+        .request(&Method::GET, &endpoint, None, None)
+        .await
+        .map_err(|e| classify(&e))?;
+    Ok(parse_head(&parse(&bytes)?))
+}
+
+/// The rootlist revision and length, without entries.
+pub async fn rootlist_head(session: Session) -> Result<Head, InternalError> {
+    debug!("rootlist head");
+    let bytes = session
+        .spclient()
+        .get_rootlist(0, Some(0))
+        .await
+        .map_err(|e| classify(&e))?;
+    Ok(parse_head(&parse(&bytes)?))
 }
 
 #[cfg(test)]
@@ -475,5 +521,32 @@ mod tests {
         assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!((list.read, list.pages), (4, 2));
+    }
+
+    #[test]
+    fn head_reads_revision_length_and_name() {
+        let content = SelectedListContent {
+            revision: Some(b"rev1".to_vec()),
+            length: Some(5272),
+            attributes: protobuf::MessageField::some(ListAttributes {
+                name: Some("ncspot-test-1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let head = parse_head(&content);
+        assert_eq!(head.revision, b"rev1".to_vec());
+        assert_eq!(head.snapshot_id, "cmV2MQ==");
+        assert_eq!(head.length, 5272);
+        assert_eq!(head.name.as_deref(), Some("ncspot-test-1"));
+    }
+
+    #[test]
+    fn head_without_fields_is_empty() {
+        let head = parse_head(&SelectedListContent::default());
+        assert_eq!(
+            (head.length, head.name, head.snapshot_id.as_str()),
+            (0, None, "")
+        );
     }
 }

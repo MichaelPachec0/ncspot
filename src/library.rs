@@ -829,7 +829,8 @@ impl Library {
         let mut stopped = false;
         let mut items_complete = true;
 
-        for (index, (remote, status)) in listed.iter().enumerate() {
+        for (index, (listed_remote, status)) in listed.iter().enumerate() {
+            let remote = &self.with_head_snapshot(listed_remote, *status, force_full, &mut stopped);
             // Download without holding the store lock; only the merge locks.
             let current = !needs_download(&self.playlists.read().unwrap(), remote, force_full);
             let mut downloaded = if current {
@@ -915,6 +916,53 @@ impl Library {
             listing_complete,
             items_complete,
         })
+    }
+
+    /// `listed` with the snapshot it is compared and stored with, see [listed_snapshot]. The
+    /// head of a playlist the user does not own is read (not spaced) unless `force_full`, the
+    /// entry is 403 or a rate limit has set `stopped`; a rate limited read sets `stopped`.
+    fn with_head_snapshot(
+        &self,
+        listed: &Playlist,
+        status: i32,
+        force_full: bool,
+        stopped: &mut bool,
+    ) -> Playlist {
+        let owned = is_owned(&listed.owner_id, self.user_id.as_deref());
+        if owned || force_full || status == FORBIDDEN {
+            return listed.clone();
+        }
+        let head = if *stopped {
+            None
+        } else {
+            match self.spotify.api.playlist_head(&listed.id) {
+                Ok(head) => Some(head.snapshot_id),
+                Err(InternalError::RateLimited) => {
+                    warn!("playlists: rate limited reading a head, stopping the head reads");
+                    *stopped = true;
+                    None
+                }
+                Err(err) => {
+                    debug!("playlists: a head was not read ({err}), using the cached snapshot");
+                    None
+                }
+            }
+        };
+        let cached = self
+            .playlists
+            .read()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == listed.id)
+            .map(|p| p.snapshot_id.clone());
+        let mut playlist = listed.clone();
+        playlist.snapshot_id = listed_snapshot(
+            &listed.snapshot_id,
+            owned,
+            head.as_deref(),
+            cached.as_deref(),
+        );
+        playlist
     }
 
     /// One changed playlist's tracks for the internal sync, through [sync_download]. A
@@ -1943,6 +1991,26 @@ fn is_current(store: &[Playlist], remote: &Playlist) -> bool {
         .any(|p| p.id == remote.id && p.snapshot_id == remote.snapshot_id && p.tracks.is_some())
 }
 
+/// Whether `owner_id` is the logged-in user; an unknown user owns nothing.
+fn is_owned(owner_id: &str, user_id: Option<&str>) -> bool {
+    Some(owner_id) == user_id
+}
+
+/// The snapshot a listed playlist is compared and stored with. Owned playlists use the free
+/// rootlist revision; for the others the rootlist revision is not the head, so the head read
+/// decides, and a failed head read keeps the cached copy current for this sync.
+fn listed_snapshot(
+    rootlist: &str,
+    owned: bool,
+    head: Option<&str>,
+    cached: Option<&str>,
+) -> String {
+    if owned {
+        return rootlist.to_string();
+    }
+    head.or(cached).unwrap_or(rootlist).to_string()
+}
+
 /// Whether the tracks of `remote` must be downloaded: always with `force_full`, otherwise
 /// unless the store already holds it [is_current].
 fn needs_download(store: &[Playlist], remote: &Playlist, force_full: bool) -> bool {
@@ -2363,6 +2431,31 @@ mod test {
     #[test]
     fn invalid_cache_is_replaced_even_if_unchanged() {
         assert!(cache_write_needed(false, false));
+    }
+
+    #[test]
+    fn owned_playlists_use_the_rootlist_snapshot() {
+        assert_eq!(
+            listed_snapshot("root", true, Some("head"), Some("old")),
+            "root"
+        );
+    }
+
+    #[test]
+    fn other_playlists_use_the_head_then_the_cache() {
+        assert_eq!(
+            listed_snapshot("root", false, Some("head"), Some("old")),
+            "head"
+        );
+        assert_eq!(listed_snapshot("root", false, None, Some("old")), "old");
+        assert_eq!(listed_snapshot("root", false, None, None), "root");
+    }
+
+    #[test]
+    fn ownership_needs_a_known_matching_user() {
+        assert!(is_owned("me", Some("me")));
+        assert!(!is_owned("spotify", Some("me")));
+        assert!(!is_owned("me", None));
     }
 
     #[test]

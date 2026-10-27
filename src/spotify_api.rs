@@ -28,7 +28,7 @@ use crate::internal_api::AreaCounts;
 use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
 use crate::internal_api::metadata::Missing;
-use crate::internal_api::playlist::{self, PlaylistItem, Rootlist};
+use crate::internal_api::playlist::{self, Head, PlaylistItem, Rootlist};
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -342,6 +342,19 @@ impl WebApi {
     /// The whole rootlist (playlists and folder markers): one internal call per page.
     pub fn playlist_rootlist(&self) -> Result<Rootlist, InternalError> {
         self.run_internal(Area::Playlists, playlist::rootlist)
+    }
+
+    /// The head (revision, length, name) of one playlist, by base62 id, without its items.
+    pub fn playlist_head(&self, id: &str) -> Result<Head, InternalError> {
+        let id = id.to_string();
+        self.run_internal(Area::Playlists, |session| {
+            playlist::head(session, id.clone())
+        })
+    }
+
+    /// The rootlist revision and length, without entries.
+    pub fn rootlist_head(&self) -> Result<Head, InternalError> {
+        self.run_internal(Area::Playlists, playlist::rootlist_head)
     }
 
     /// The items of one playlist, by base62 id.
