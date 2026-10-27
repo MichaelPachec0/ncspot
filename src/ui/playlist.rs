@@ -88,14 +88,15 @@ impl ViewExt for PlaylistView {
         if let Command::Delete = cmd {
             let pos = self.list.get_selected_index();
 
-            return if self
+            return match self
                 .playlist
                 .delete_track(pos, self.spotify.clone(), &self.library)
             {
-                self.list.remove(pos);
-                Ok(CommandResult::Consumed(None))
-            } else {
-                Err("Could not delete track.".to_string())
+                Ok(()) => {
+                    self.list.remove(pos);
+                    Ok(CommandResult::Consumed(None))
+                }
+                Err(note) => Err(note),
             };
         }
 

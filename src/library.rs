@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::iter::Iterator;
@@ -36,6 +37,7 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
+use crate::playlist_edit;
 use crate::playlist_items::UNAVAILABLE;
 use crate::playlist_layout::{
     LayoutEntry, PLAYLIST_FETCH_SPACING, Spacer, layout_from, pinned_ids,
@@ -269,9 +271,39 @@ impl Library {
     /// tracks, they will be removed. Update the cache to match the new state.
     pub fn overwrite_playlist(&self, id: &str, tracks: &[Playable]) {
         debug!("saving {} tracks to list {}", tracks.len(), id);
-        self.spotify.api.overwrite_playlist(id, tracks);
+        let api = &self.spotify.api;
+        let known = self.known_playables();
+        let web_used = Cell::new(false);
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || {
+                let stored = self
+                    .playlists
+                    .read()
+                    .unwrap()
+                    .iter()
+                    .find(|p| p.id == id)
+                    .cloned();
+                // Not a stored playlist: nothing to verify against, use the Web API.
+                let mut playlist = stored.ok_or(InternalError::NotFound)?;
+                playlist_edit::overwrite(api, &mut playlist, tracks, &known).map_err(|err| {
+                    if let Some(note) = err.note() {
+                        warn!("{note}");
+                    }
+                    InternalError::from(err)
+                })?;
+                self.playlist_update(&playlist);
+                Ok(())
+            },
+            || {
+                web_used.set(true);
+                api.overwrite_playlist(id, tracks);
+                true
+            },
+        );
 
-        if self.fetch_playlists(false).listing_complete {
+        if written && web_used.get() && self.fetch_playlists(false).listing_complete {
             self.save_cache(
                 &config::cache_path(CACHE_PLAYLISTS),
                 &self.playlists.read().unwrap(),
@@ -1020,7 +1052,7 @@ impl Library {
 
     /// Track and episode metadata already known locally, by URI: the saved tracks and
     /// episodes and the tracks of every cached playlist, placeholders left out.
-    fn known_playables(&self) -> HashMap<String, Playable> {
+    pub(crate) fn known_playables(&self) -> HashMap<String, Playable> {
         let mut known = HashMap::new();
         for track in self.tracks.read().unwrap().iter() {
             remember(&mut known, &Playable::Track(track.clone()));
@@ -2374,7 +2406,7 @@ fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
 
 /// One write in `area`: the internal API first, then the Web API per the fallback classes.
 /// True when one of them wrote; the caller updates the store and `.db` only then.
-fn write_through(
+pub(crate) fn write_through(
     api: &WebApi,
     area: Area,
     internal: impl FnOnce() -> Result<(), InternalError>,
@@ -2835,6 +2867,89 @@ mod test {
             || true
         ));
         assert_eq!(api.area_counts(Area::Library).fallback, 3);
+    }
+
+    #[test]
+    fn write_through_follows_the_fallback_classes_for_playlists() {
+        use std::cell::Cell;
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        let web = Cell::new(0);
+        let call = |r: Result<(), InternalError>, web_ok: bool| {
+            write_through(
+                &api,
+                Area::Playlists,
+                || r,
+                || {
+                    web.set(web.get() + 1);
+                    web_ok
+                },
+            )
+        };
+        assert!(call(Ok(()), false));
+        assert_eq!(web.get(), 0);
+        assert!(
+            !call(Err(InternalError::RateLimited), true),
+            "rate limit fails the action"
+        );
+        assert!(!call(Err(InternalError::Transient("x".into())), true));
+        assert_eq!(
+            web.get(),
+            0,
+            "no Web API call for rate limits or transient errors"
+        );
+        assert!(call(Err(InternalError::NoSession), true));
+        assert!(
+            !call(Err(InternalError::Denied), false),
+            "a failed Web call fails the action"
+        );
+        assert_eq!(web.get(), 2);
+        assert!(api.internal_usable(Area::Playlists));
+        assert!(call(
+            Err(InternalError::ProtocolChanged("400".into())),
+            true
+        ));
+        assert!(
+            !api.internal_usable(Area::Playlists),
+            "a protocol change latches the area"
+        );
+        assert_eq!(web.get(), 3);
+        // Latched: straight to the Web API, the internal call never runs.
+        assert!(write_through(
+            &api,
+            Area::Playlists,
+            || panic!("internal ran while latched"),
+            || true
+        ));
+        assert_eq!(api.area_counts(Area::Playlists).fallback, 3);
+    }
+
+    #[test]
+    fn append_with_the_web_api_unreachable_leaves_the_tracks_unchanged() {
+        let library = test_library();
+        let mut list = playlist("p");
+        list.tracks = Some(Vec::new());
+        let spotify = library.spotify.clone();
+        let new = [Playable::Track(Track {
+            id: Some("t".into()),
+            uri: "spotify:track:t".into(),
+            title: "t".into(),
+            track_number: 1,
+            disc_number: 1,
+            duration: 1000,
+            artists: Vec::new(),
+            artist_ids: Vec::new(),
+            album: None,
+            album_id: None,
+            album_artists: Vec::new(),
+            cover_url: None,
+            url: String::new(),
+            added_at: None,
+            list_index: 0,
+            is_local: false,
+            is_playable: Some(true),
+        })];
+        list.append_tracks(&new, &spotify, &library);
+        assert_eq!(list.tracks.as_ref().map(Vec::len), Some(0));
     }
 
     #[test]

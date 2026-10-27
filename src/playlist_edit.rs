@@ -5,11 +5,6 @@
 //! so the head length after the write is the check, and the local copy takes the snapshot of
 //! that head, never the reply's revision.
 
-#![expect(
-    dead_code,
-    reason = "the playlist commands that call these arrive in a later change"
-)]
-
 use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::Instant;
@@ -70,6 +65,18 @@ pub enum EditError {
     Mismatch,
 }
 
+impl EditError {
+    /// The status note for a failure that is not a plain API error.
+    pub fn note(&self) -> Option<&'static str> {
+        match self {
+            Self::Internal(_) => None,
+            Self::Moved => Some("Playlist changed, try again"),
+            Self::Mismatch => Some("Playlist changed elsewhere, reloaded"),
+            Self::Unverified(_) => Some("Could not confirm the change; it may have applied"),
+        }
+    }
+}
+
 impl From<InternalError> for EditError {
     fn from(err: InternalError) -> Self {
         Self::Internal(err)
@@ -123,6 +130,10 @@ fn add_chunks<T>(new: &[T]) -> std::slice::Chunks<'_, T> {
 }
 
 /// Bring `playlist` up to date with the server when stale; returns the base revision.
+#[expect(
+    dead_code,
+    reason = "the pin commands that call this arrive in a later change"
+)]
 pub fn prepare(
     api: &WebApi,
     playlist: &mut Playlist,

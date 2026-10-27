@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::{cmp::Ordering, iter::Iterator};
@@ -10,8 +11,10 @@ use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 
 use crate::internal_api::Area;
 use crate::internal_api::fallback::{Action, decide_after, run_with_fallback};
+use crate::library::write_through;
 use crate::model::playable::Playable;
 use crate::model::track::Track;
+use crate::playlist_edit;
 use crate::queue::Queue;
 use crate::spotify::Spotify;
 use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
@@ -89,46 +92,88 @@ impl Playlist {
         })
     }
 
-    pub fn delete_track(&mut self, index: usize, spotify: Spotify, library: &Library) -> bool {
+    /// Remove the track at `index`. On failure the error is the status note to show.
+    pub fn delete_track(
+        &mut self,
+        index: usize,
+        spotify: Spotify,
+        library: &Library,
+    ) -> Result<(), String> {
         let playable = self.tracks.as_ref().unwrap()[index].clone();
         debug!("deleting track: {index} {playable:?}");
 
         if playable.track().map(|t| t.is_local) == Some(true) {
             warn!("track is a local file, can't delete");
-            return false;
+            return Err("Could not delete track.".to_string());
         }
 
-        match spotify
-            .api
-            .delete_tracks(&self.id, &self.snapshot_id, &[playable])
-            .is_ok()
-        {
-            false => false,
-            true => {
-                if let Some(tracks) = &mut self.tracks {
-                    tracks.remove(index);
-                    library.playlist_update(self);
-                }
-
-                true
+        let api = &spotify.api;
+        let known = library.known_playables();
+        let uri = playable.uri();
+        let note = Cell::new(None);
+        let web_used = Cell::new(false);
+        let id = self.id.clone();
+        let snapshot_id = self.snapshot_id.clone();
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || {
+                playlist_edit::remove_track(api, self, index, &uri, &known).map_err(|err| {
+                    note.set(err.note());
+                    err.into()
+                })
+            },
+            || {
+                web_used.set(true);
+                api.delete_tracks(&id, &snapshot_id, &[playable]).is_ok()
+            },
+        );
+        if !written {
+            if let Some(note) = note.get() {
+                warn!("{note}");
+                return Err(note.to_string());
             }
+            return Err("Could not delete track.".to_string());
         }
+
+        if web_used.get()
+            && let Some(tracks) = &mut self.tracks
+        {
+            tracks.remove(index);
+        }
+        library.playlist_update(self);
+        Ok(())
     }
 
     pub fn append_tracks(&mut self, new_tracks: &[Playable], spotify: &Spotify, library: &Library) {
-        let mut has_modified = false;
+        let api = &spotify.api;
+        let known = library.known_playables();
+        let web_used = Cell::new(false);
+        let id = self.id.clone();
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || {
+                playlist_edit::add_tracks(api, self, new_tracks, &known).map_err(|err| {
+                    if let Some(note) = err.note() {
+                        warn!("{note}");
+                    }
+                    err.into()
+                })
+            },
+            || {
+                web_used.set(true);
+                api.append_tracks(&id, new_tracks, None).is_ok()
+            },
+        );
 
-        if spotify
-            .api
-            .append_tracks(&self.id, new_tracks, None)
-            .is_ok()
-            && let Some(tracks) = &mut self.tracks
-        {
-            tracks.append(&mut new_tracks.to_vec());
-            has_modified = true;
-        }
-
-        if has_modified {
+        if written {
+            if web_used.get() {
+                match &mut self.tracks {
+                    Some(tracks) => tracks.append(&mut new_tracks.to_vec()),
+                    None => return,
+                }
+            }
             library.playlist_update(self);
         }
     }
