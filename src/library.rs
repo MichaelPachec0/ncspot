@@ -657,7 +657,13 @@ impl Library {
         let rootlist = match api.playlist_rootlist() {
             Ok(rootlist) => rootlist,
             Err(err) => {
-                return match decide_after(&err) {
+                let action = decide_after(&err);
+                if action != Action::Fail {
+                    // The Web path runs this sync: the tab is flat for this session. The
+                    // layout file is kept for the next complete internal sync.
+                    self.playlist_layout.write().unwrap().clear();
+                }
+                return match action {
                     Action::LatchThenWeb => {
                         info!("playlists: rootlist failed ({err}), latching to the Web API");
                         api.latch_area(Area::Playlists, &err);
@@ -2610,8 +2616,10 @@ mod test {
     #[test]
     fn internal_playlist_sync_without_a_session_uses_the_web_path() {
         let library = test_library();
+        *library.playlist_layout.write().unwrap() = vec![LayoutEntry::Playlist("p".into())];
         assert!(library.spotify.api.internal_usable(Area::Playlists));
         assert!(library.fetch_playlists_internal().is_none());
+        assert!(library.playlist_layout.read().unwrap().is_empty());
         assert_eq!(library.spotify.api.area_counts(Area::Playlists).fallback, 1);
         assert!(library.spotify.api.internal_usable(Area::Playlists));
     }
