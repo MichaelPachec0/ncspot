@@ -165,6 +165,12 @@ pub fn plan_sync(area_usable: bool, full_due: bool, has_token: bool, cache_valid
 }
 
 impl Membership {
+    /// Whether this is a delta with no additions and no removals, that is the stored items
+    /// are already current. A listing is never taken as unchanged.
+    pub fn is_empty_delta(&self) -> bool {
+        matches!(self, Self::Changes { added, removed } if added.is_empty() && removed.is_empty())
+    }
+
     pub fn only(&self, kind: &str) -> Self {
         let prefix = format!("spotify:{kind}:");
         let keep = |i: &&Item| i.uri.starts_with(&prefix);
@@ -407,6 +413,36 @@ mod tests {
             m.only("album"),
             Membership::Listing(vec![item("spotify:album:2", 2)])
         );
+    }
+
+    #[test]
+    fn empty_delta_is_detected() {
+        let none = Membership::Changes {
+            added: vec![],
+            removed: vec![],
+        };
+        assert!(none.is_empty_delta());
+        assert!(
+            !Membership::Changes {
+                added: vec![item("spotify:track:1", 1)],
+                removed: vec![],
+            }
+            .is_empty_delta()
+        );
+        assert!(
+            !Membership::Changes {
+                added: vec![],
+                removed: vec!["spotify:track:1".into()],
+            }
+            .is_empty_delta()
+        );
+        assert!(!Membership::Listing(vec![]).is_empty_delta());
+        // Another kind's changes filtered away leave this kind's delta empty.
+        let other = Membership::Changes {
+            added: vec![item("spotify:album:2", 2)],
+            removed: vec![],
+        };
+        assert!(other.only("track").is_empty_delta());
     }
 
     struct Fake {

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Playlists load over Spotify's internal API, including Spotify-owned playlists
 - Saving and removing tracks, albums, artists and shows goes through Spotify's internal API
+- Unchanged liked songs and saved albums no longer rewrite their cache files
 
 ### Fixed
 

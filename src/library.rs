@@ -938,7 +938,8 @@ impl Library {
     }
 
     /// Sync liked songs and saved albums, which share the `collection` set and its token.
-    /// Saves both caches; the token is stored only if both writes worked.
+    /// Saves each cache that changed (or was not valid at load); the token is stored only if
+    /// the writes that were needed worked.
     fn fetch_collection(&self, cache_valid: bool) -> bool {
         let api = &self.spotify.api;
         // A token describes its cache only: without a valid cache it must not survive a sync
@@ -955,14 +956,17 @@ impl Library {
         };
         let mode = plan_sync(usable, full_due, token.is_some(), cache_valid);
         // Mode::Web never goes through `outcome`: an area that is simply off must not latch.
+        let mut changes = Changes::default();
         let outcome = if mode == Mode::Web {
             SetOutcome::Web
         } else {
-            outcome(
-                api,
-                SET_COLLECTION,
-                self.collection_internal(mode, token.as_deref()),
-            )
+            let result =
+                self.collection_internal(mode, token.as_deref())
+                    .map(|(token, internal)| {
+                        changes = internal;
+                        token
+                    });
+            outcome(api, SET_COLLECTION, result)
         };
         let fetched = match outcome {
             SetOutcome::Web => {
@@ -972,18 +976,27 @@ impl Library {
                     let albums = scope.spawn(|| self.fetch_albums());
                     (tracks.join().unwrap(), albums.join().unwrap())
                 });
-                tracks && albums
+                changes = Changes {
+                    tracks: tracks == Fetch::Changed,
+                    albums: albums == Fetch::Changed,
+                };
+                tracks != Fetch::Failed && albums != Fetch::Failed
             }
             SetOutcome::Incomplete => false,
             SetOutcome::Synced(_) => true,
         };
-        let saved = self.save_cache(
-            &config::cache_path(CACHE_TRACKS),
-            &self.tracks.read().unwrap(),
-        ) & self.save_cache(
-            &config::cache_path(CACHE_ALBUMS),
-            &self.albums.read().unwrap(),
-        );
+        // A skipped write counts as saved: the file on disk already matches the store.
+        let tracks_saved = !cache_write_needed(cache_valid, changes.tracks)
+            || self.save_cache(
+                &config::cache_path(CACHE_TRACKS),
+                &self.tracks.read().unwrap(),
+            );
+        let albums_saved = !cache_write_needed(cache_valid, changes.albums)
+            || self.save_cache(
+                &config::cache_path(CACHE_ALBUMS),
+                &self.albums.read().unwrap(),
+            );
+        let saved = tracks_saved && albums_saved;
         let synced = matches!(outcome, SetOutcome::Synced(_));
         self.apply_finish(
             SET_COLLECTION,
@@ -994,12 +1007,13 @@ impl Library {
     }
 
     /// Sync the `collection` set over the internal API into the in-memory tracks and albums.
-    /// Returns the new sync token; the caller stores it once the caches are written.
+    /// Returns the new sync token, to store once the caches are written, and which stores
+    /// changed.
     fn collection_internal(
         &self,
         mode: Mode,
         token: Option<&str>,
-    ) -> Result<String, InternalError> {
+    ) -> Result<(String, Changes), InternalError> {
         let api = &self.spotify.api;
         let fetched = fetch_membership(api, SET_COLLECTION, mode, token)?;
         let refetch = mode == Mode::Full;
@@ -1026,7 +1040,12 @@ impl Library {
         );
         *self.tracks.write().unwrap() = tracks;
         *self.albums.write().unwrap() = albums;
-        Ok(fetched.sync_token)
+        // An empty delta leaves a store exactly as it was.
+        let changes = Changes {
+            tracks: !track_members.is_empty_delta(),
+            albums: !album_members.is_empty_delta(),
+        };
+        Ok((fetched.sync_token, changes))
     }
 
     /// Sync the followed artists from the `artist` set into the store. The caller saves
@@ -1187,8 +1206,8 @@ impl Library {
     }
 
     /// Fetch the saved albums from the web API and store them in the local library, unless they
-    /// are unchanged. Returns false, leaving the stored albums unchanged, if a page failed.
-    fn fetch_albums(&self) -> bool {
+    /// are unchanged. On a failed page the stored albums stay as they were.
+    fn fetch_albums(&self) -> Fetch {
         let stored_ids: Vec<Option<String>> = self
             .albums
             .read()
@@ -1222,12 +1241,12 @@ impl Library {
             Synced::Full(albums) => albums,
             Synced::Unchanged => {
                 debug!("albums unchanged");
-                return true;
+                return Fetch::Unchanged;
             }
             Synced::Prepended { .. } => unreachable!("sync_saved never prepends"),
             Synced::Failed => {
                 error!("Failed to fetch albums.");
-                return false;
+                return Fetch::Failed;
             }
         };
 
@@ -1235,13 +1254,13 @@ impl Library {
 
         *self.albums.write().unwrap() = albums;
         self.record_full_fetch(FULL_FETCH_ALBUMS, now);
-        true
+        Fetch::Changed
     }
 
     /// Fetch the liked songs from the web API and save them in the local library. Only new
-    /// likes are downloaded when nothing else changed. Returns false, leaving the stored songs
-    /// unchanged, if a page failed.
-    fn fetch_tracks(&self) -> bool {
+    /// likes are downloaded when nothing else changed. On a failed page the stored songs stay
+    /// as they were.
+    fn fetch_tracks(&self) -> Fetch {
         let cached: Vec<Track> = self.tracks.read().unwrap().clone();
         let (now, force_full) = self.full_fetch_check(FULL_FETCH_TRACKS, "liked songs");
         let synced = sync_liked(
@@ -1274,17 +1293,17 @@ impl Library {
             Synced::Prepended { items, new_count } => {
                 debug!("liked songs: {new_count} new");
                 *self.tracks.write().unwrap() = items;
-                true
+                Fetch::Changed
             }
             Synced::Full(items) => {
                 *self.tracks.write().unwrap() = items;
                 self.record_full_fetch(FULL_FETCH_TRACKS, now);
-                true
+                Fetch::Changed
             }
-            Synced::Unchanged => true,
+            Synced::Unchanged => Fetch::Unchanged,
             Synced::Failed => {
                 error!("Failed to fetch tracks.");
-                false
+                Fetch::Failed
             }
         }
     }
@@ -1958,6 +1977,31 @@ struct ArtistsSync {
     now: i64,
 }
 
+/// What a Web fetcher of a saved list did to its store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fetch {
+    /// A page failed; the store is as it was.
+    Failed,
+    /// The store is current and was not touched.
+    Unchanged,
+    /// The store was replaced or extended.
+    Changed,
+}
+
+/// Which stores of the `collection` set changed during a sync.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Changes {
+    tracks: bool,
+    albums: bool,
+}
+
+/// Whether a store's cache file must be written: when the store changed, or when the file was
+/// not valid at load (for example an older version's), so that it gets replaced. A full fetch
+/// replaces its store and so counts as a change.
+fn cache_write_needed(cache_valid: bool, changed: bool) -> bool {
+    changed || !cache_valid
+}
+
 /// What a set's internal sync did.
 enum SetOutcome {
     /// Synced; the new token, to store once the cache file is written.
@@ -2129,6 +2173,22 @@ mod test {
             snapshot_id: snap.into(),
             ..playlist(id)
         }
+    }
+
+    #[test]
+    fn unchanged_valid_cache_is_not_rewritten() {
+        assert!(!cache_write_needed(true, false));
+    }
+
+    #[test]
+    fn changed_store_is_written() {
+        assert!(cache_write_needed(true, true));
+        assert!(cache_write_needed(false, true));
+    }
+
+    #[test]
+    fn invalid_cache_is_replaced_even_if_unchanged() {
+        assert!(cache_write_needed(false, false));
     }
 
     #[test]
