@@ -1011,7 +1011,7 @@ impl Library {
         let mut items_complete = true;
 
         for (index, (listed_remote, status)) in listed.iter().enumerate() {
-            let remote = &self.with_head_snapshot(listed_remote, *status, force_full, &mut stopped);
+            let remote = &self.with_head_snapshot(listed_remote, *status, &mut stopped);
             // Download without holding the store lock; only the merge locks.
             let current = !needs_download(&self.playlists.read().unwrap(), remote, force_full);
             let mut downloaded = if current {
@@ -1100,17 +1100,11 @@ impl Library {
     }
 
     /// `listed` with the snapshot it is compared and stored with, see [listed_snapshot]. The
-    /// head of a playlist the user does not own is read (not spaced) unless `force_full`, the
-    /// entry is 403 or a rate limit has set `stopped`; a rate limited read sets `stopped`.
-    fn with_head_snapshot(
-        &self,
-        listed: &Playlist,
-        status: i32,
-        force_full: bool,
-        stopped: &mut bool,
-    ) -> Playlist {
+    /// head is read (not spaced) when [reads_head] says so and no rate limit has set `stopped`;
+    /// a rate limited read sets `stopped`.
+    fn with_head_snapshot(&self, listed: &Playlist, status: i32, stopped: &mut bool) -> Playlist {
         let owned = is_owned(&listed.owner_id, self.user_id.as_deref());
-        if owned || force_full || status == FORBIDDEN {
+        if !reads_head(owned, status) {
             return listed.clone();
         }
         let head = if *stopped {
@@ -2192,6 +2186,14 @@ fn listed_snapshot(
     head.or(cached).unwrap_or(rootlist).to_string()
 }
 
+/// Whether the sync reads the head of a listed playlist: only for one the user does not own
+/// (an owned entry's rootlist revision is its head) and that is not 403. A forced full sync
+/// reads it too, so the snapshot it stores is the head and the next sync does not download the
+/// playlist again; the download itself is forced either way.
+fn reads_head(owned: bool, status: i32) -> bool {
+    !owned && status != FORBIDDEN
+}
+
 /// Whether the tracks of `remote` must be downloaded: always with `force_full`, otherwise
 /// unless the store already holds it [is_current].
 fn needs_download(store: &[Playlist], remote: &Playlist, force_full: bool) -> bool {
@@ -2781,6 +2783,16 @@ mod test {
             None
         }));
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn heads_are_read_for_listed_playlists_not_owned_and_not_forbidden() {
+        assert!(reads_head(false, 200));
+        assert!(
+            !reads_head(true, 200),
+            "owned: the rootlist revision is the head"
+        );
+        assert!(!reads_head(false, FORBIDDEN));
     }
 
     #[test]
