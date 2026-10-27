@@ -309,123 +309,28 @@ impl Library {
 
             let t_collection = {
                 let library = library.clone();
-                thread::spawn(move || {
-                    let valid = library.load_cache(
-                        &config::cache_path(CACHE_TRACKS),
-                        library.tracks.write().unwrap().as_mut(),
-                    ) & library.load_cache(
-                        &config::cache_path(CACHE_ALBUMS),
-                        library.albums.write().unwrap().as_mut(),
-                    );
-                    library.fetch_collection(valid)
-                })
+                thread::spawn(move || library.sync_collection())
             };
-
             let t_artists = {
                 let library = library.clone();
-                thread::spawn(move || {
-                    let valid = library.load_cache(
-                        &config::cache_path(CACHE_ARTISTS),
-                        library.artists.write().unwrap().as_mut(),
-                    );
-                    library.fetch_artists_any(valid)
-                })
+                thread::spawn(move || library.sync_artists())
             };
-
             let t_playlists = {
                 let library = library.clone();
-                thread::spawn(move || {
-                    library.load_cache(
-                        &config::cache_path(CACHE_PLAYLISTS),
-                        library.playlists.write().unwrap().as_mut(),
-                    );
-                    // With the area off the layout file is ignored, not deleted.
-                    let internal = library.spotify.api.internal_usable(Area::Playlists);
-                    if internal {
-                        library.load_cache(
-                            &config::cache_path(CACHE_PLAYLIST_LAYOUT),
-                            library.playlist_layout.write().unwrap().as_mut(),
-                        );
-                    }
-                    // The internal sync saves its own caches.
-                    let internal_sync = internal
-                        .then(|| library.fetch_playlists_internal())
-                        .flatten();
-                    let sync = internal_sync.unwrap_or_else(|| {
-                        let sync = library.fetch_playlists();
-                        if sync.listing_complete {
-                            library.save_cache(
-                                &config::cache_path(CACHE_PLAYLISTS),
-                                &library.playlists.read().unwrap(),
-                            );
-                        }
-                        sync
-                    });
-                    if !cfg!(test) {
-                        let urls: Vec<String> = library
-                            .playlists
-                            .read()
-                            .unwrap()
-                            .iter()
-                            .filter_map(|p| p.cover_url.clone())
-                            .collect();
-                        cover_prefetch::spawn_prefetch(cover_prefetch::missing_covers(
-                            &urls,
-                            |p| p.exists(),
-                        ));
-                    }
-                    sync.listing_complete && sync.items_complete
-                })
+                thread::spawn(move || library.sync_playlists())
             };
-
             let t_shows = {
                 let library = library.clone();
-                thread::spawn(move || {
-                    // With the area off nothing is loaded: the Web fetcher runs as before.
-                    let valid = library.spotify.api.internal_enabled(Area::Library)
-                        && library.load_cache(
-                            &config::cache_path(CACHE_SHOWS),
-                            library.shows.write().unwrap().as_mut(),
-                        );
-                    library.fetch_shows_any(valid)
-                })
+                thread::spawn(move || library.sync_shows())
             };
-
             let t_episodes = {
                 let library = library.clone();
-                thread::spawn(move || {
-                    if !library.episodes_enabled {
-                        return true;
-                    }
-                    let valid = library.load_cache(
-                        &config::cache_path(CACHE_EPISODES),
-                        library.episodes.write().unwrap().as_mut(),
-                    );
-                    library.fetch_episodes(valid)
-                })
+                thread::spawn(move || library.sync_episodes())
             };
 
             let collection_complete = t_collection.join().unwrap();
             let artists = t_artists.join().unwrap();
-
-            library.populate_artists();
-            let artists_saved = library.save_cache(
-                &config::cache_path(CACHE_ARTISTS),
-                &library.artists.read().unwrap(),
-            );
-            // The token is stored only once the cache it describes is on disk.
-            let synced = matches!(artists.outcome, SetOutcome::Synced(_));
-            let artists_complete = artists.fetched && (artists_saved || !synced);
-            library.apply_finish(
-                SET_ARTIST,
-                finish_set(
-                    artists.outcome,
-                    artists_saved,
-                    artists.mode,
-                    artists.cache_valid,
-                ),
-                artists.now,
-            );
+            let artists_complete = library.finish_artists(artists);
 
             let playlists_complete = t_playlists.join().unwrap();
             let shows_complete = t_shows.join().unwrap();
@@ -441,6 +346,124 @@ impl Library {
                 && episodes_complete;
             library.schedule_resume(complete, sync_start);
         });
+    }
+
+    /// Load the liked songs and saved albums caches and sync the `collection` set. Returns
+    /// whether the sync was complete.
+    fn sync_collection(&self) -> bool {
+        let valid = self.load_cache(
+            &config::cache_path(CACHE_TRACKS),
+            self.tracks.write().unwrap().as_mut(),
+        ) & self.load_cache(
+            &config::cache_path(CACHE_ALBUMS),
+            self.albums.write().unwrap().as_mut(),
+        );
+        self.fetch_collection(valid)
+    }
+
+    /// Load the artists cache and sync the followed artists. Finish with
+    /// [Library::finish_artists] once the liked songs are in.
+    fn sync_artists(&self) -> ArtistsSync {
+        let valid = self.load_cache(
+            &config::cache_path(CACHE_ARTISTS),
+            self.artists.write().unwrap().as_mut(),
+        );
+        self.fetch_artists_any(valid)
+    }
+
+    /// Rebuild the artists of the liked songs into the artists store and save `artists.db`.
+    /// False (logged) if the save failed.
+    fn save_artists(&self) -> bool {
+        self.populate_artists();
+        self.save_cache(
+            &config::cache_path(CACHE_ARTISTS),
+            &self.artists.read().unwrap(),
+        )
+    }
+
+    /// Save the artists and finish the `artist` set of a [Library::sync_artists]. Returns
+    /// whether the artists sync was complete.
+    fn finish_artists(&self, artists: ArtistsSync) -> bool {
+        let artists_saved = self.save_artists();
+        // The token is stored only once the cache it describes is on disk.
+        let synced = matches!(artists.outcome, SetOutcome::Synced(_));
+        let artists_complete = artists.fetched && (artists_saved || !synced);
+        self.apply_finish(
+            SET_ARTIST,
+            finish_set(
+                artists.outcome,
+                artists_saved,
+                artists.mode,
+                artists.cache_valid,
+            ),
+            artists.now,
+        );
+        artists_complete
+    }
+
+    /// Load the playlists cache (and the layout, over the internal API), sync the playlists
+    /// and prefetch their covers. Returns whether the sync was complete.
+    fn sync_playlists(&self) -> bool {
+        self.load_cache(
+            &config::cache_path(CACHE_PLAYLISTS),
+            self.playlists.write().unwrap().as_mut(),
+        );
+        // With the area off the layout file is ignored, not deleted.
+        let internal = self.spotify.api.internal_usable(Area::Playlists);
+        if internal {
+            self.load_cache(
+                &config::cache_path(CACHE_PLAYLIST_LAYOUT),
+                self.playlist_layout.write().unwrap().as_mut(),
+            );
+        }
+        // The internal sync saves its own caches.
+        let internal_sync = internal.then(|| self.fetch_playlists_internal()).flatten();
+        let sync = internal_sync.unwrap_or_else(|| {
+            let sync = self.fetch_playlists();
+            if sync.listing_complete {
+                self.save_cache(
+                    &config::cache_path(CACHE_PLAYLISTS),
+                    &self.playlists.read().unwrap(),
+                );
+            }
+            sync
+        });
+        if !cfg!(test) {
+            let urls: Vec<String> = self
+                .playlists
+                .read()
+                .unwrap()
+                .iter()
+                .filter_map(|p| p.cover_url.clone())
+                .collect();
+            cover_prefetch::spawn_prefetch(cover_prefetch::missing_covers(&urls, |p| p.exists()));
+        }
+        sync.listing_complete && sync.items_complete
+    }
+
+    /// Load the shows cache (internal API only) and sync the saved shows. Returns whether the
+    /// sync was complete.
+    fn sync_shows(&self) -> bool {
+        // With the area off nothing is loaded: the Web fetcher runs as before.
+        let valid = self.spotify.api.internal_enabled(Area::Library)
+            && self.load_cache(
+                &config::cache_path(CACHE_SHOWS),
+                self.shows.write().unwrap().as_mut(),
+            );
+        self.fetch_shows_any(valid)
+    }
+
+    /// Load the Your Episodes cache and sync it; nothing to do while Your Episodes is off.
+    /// Returns whether the sync was complete.
+    fn sync_episodes(&self) -> bool {
+        if !self.episodes_enabled {
+            return true;
+        }
+        let valid = self.load_cache(
+            &config::cache_path(CACHE_EPISODES),
+            self.episodes.write().unwrap().as_mut(),
+        );
+        self.fetch_episodes(valid)
     }
 
     /// After a sync that started at `sync_start`: reset the resume count if it was complete,
