@@ -676,7 +676,8 @@ def sc_playlists_area_off(inst, args):
     expect(d["playlists"]["stored"] > 4, "more than the 4 stale cached playlists", d["playlists"])
     inst.send("harness open library playlists")
     d = inst.wait_settled(args.settle_timeout)
-    rows = next(t["rows"] for t in d["tabs"] if t["name"] == "Playlists")
+    rows = next((t["rows"] for t in d["tabs"] if t["name"] == "Playlists"), None)
+    expect(rows is not None, "Playlists tab present", [t["name"] for t in d["tabs"]])
     expect(rows == d["playlists"]["stored"], "flat list: one row per stored playlist", (rows, d["playlists"]))
 
 

@@ -265,7 +265,7 @@ class LibraryWriteTest(unittest.TestCase):
 
 class PlaylistsScenarioTest(unittest.TestCase):
     @staticmethod
-    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False):
+    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False, tab=True):
         return {
             "areas": {
                 "playlists": {"internal_ok": 0 if base else 4, "fallback": fallback, "latched": latched}
@@ -273,7 +273,7 @@ class PlaylistsScenarioTest(unittest.TestCase):
             "web": {"shared": 0, "personal": 0},
             "throttled": {},
             "playlists": {"stored": stored, "layout": layout},
-            "tabs": [{"name": "Playlists", "rows": rows}],
+            "tabs": [{"name": "Playlists", "rows": rows}] if tab else [{"name": "Albums", "rows": 3}],
         }
 
     def run_with(self, func, **kw):
@@ -323,6 +323,10 @@ class PlaylistsScenarioTest(unittest.TestCase):
     def test_area_off_row_mismatch_fails(self):
         with self.assertRaises(drive.Fail):
             self.run_with(drive.sc_playlists_area_off, rows=12)
+
+    def test_area_off_missing_tab_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlists_area_off, tab=False)
 
 
 if __name__ == "__main__":
