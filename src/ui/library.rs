@@ -16,7 +16,7 @@ use crate::ui::playlists::PlaylistsView;
 use crate::ui::tabbedview::TabbedView;
 
 /// Status note for `update tab` where it has nothing to update.
-pub const UPDATE_TAB_HINT: &str = "u updates the current library tab";
+pub const UPDATE_TAB_HINT: &str = "update tab works on a library tab";
 
 pub struct LibraryView {
     tabs: TabbedView,
