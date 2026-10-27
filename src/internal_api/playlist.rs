@@ -141,11 +141,23 @@ fn root_playlist(id: &str, meta: &MetaItem) -> RootPlaylist {
 }
 
 /// Add one rootlist page to `list`. Returns the `from` of the next page, or None when the
-/// listing is complete or the page cap is reached.
-pub fn absorb_rootlist(list: &mut Rootlist, page: SelectedListContent) -> Option<usize> {
+/// listing is complete or the page cap is reached. A first page without a length or without
+/// contents (an empty reply parses as one) is [InternalError::Transient]: taken as a complete
+/// empty listing it would prune every stored playlist.
+pub fn absorb_rootlist(
+    list: &mut Rootlist,
+    page: SelectedListContent,
+) -> Result<Option<usize>, InternalError> {
+    if list.pages == 0 && (page.length.is_none() || page.contents.is_none()) {
+        return Err(InternalError::Transient(
+            "rootlist reply without length or contents".into(),
+        ));
+    }
     let total = usize::try_from(page.length.unwrap_or(0)).unwrap_or(0);
     list.length = total;
-    let contents = page.contents.into_option()?;
+    let Some(contents) = page.contents.into_option() else {
+        return Ok(None);
+    };
     let count = contents.items.len();
     list.read += count;
     list.pages += 1;
@@ -165,7 +177,7 @@ pub fn absorb_rootlist(list: &mut Rootlist, page: SelectedListContent) -> Option
             list.entries.push(RootEntry::FolderEnd);
         }
     }
-    (count > 0 && list.read < total && list.pages < MAX_ROOTLIST_PAGES).then_some(list.read)
+    Ok((count > 0 && list.read < total && list.pages < MAX_ROOTLIST_PAGES).then_some(list.read))
 }
 
 /// The items of a playlist page, in order.
@@ -199,7 +211,7 @@ pub async fn rootlist(session: Session) -> Result<Rootlist, InternalError> {
             .get_rootlist(from, Some(ROOTLIST_PAGE))
             .await
             .map_err(|e| classify(&e))?;
-        match absorb_rootlist(&mut list, parse(&bytes)?) {
+        match absorb_rootlist(&mut list, parse(&bytes)?)? {
             Some(next) => from = next,
             None => return Ok(list),
         }
@@ -283,7 +295,7 @@ mod tests {
                 ],
             ),
         );
-        assert_eq!(next, None);
+        assert_eq!(next, Ok(None));
         assert_eq!(list.entries.len(), 4, "the track entry is skipped");
         assert_eq!(
             list.entries[0],
@@ -315,11 +327,47 @@ mod tests {
             vec![pl(1), pl(2)],
             vec![meta(Some("a"), b"r", 200), meta(Some("b"), b"r", 200)],
         );
-        assert_eq!(absorb_rootlist(&mut list, first), Some(2));
+        assert_eq!(absorb_rootlist(&mut list, first), Ok(Some(2)));
         let second = page(3, vec![pl(3)], vec![meta(Some("c"), b"r", 200)]);
-        assert_eq!(absorb_rootlist(&mut list, second), None);
+        assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!(list.length, 3);
+    }
+
+    #[test]
+    fn an_empty_first_rootlist_reply_is_transient() {
+        let mut list = Rootlist::default();
+        assert!(matches!(
+            absorb_rootlist(&mut list, SelectedListContent::default()),
+            Err(InternalError::Transient(_))
+        ));
+        let no_length = SelectedListContent {
+            length: None,
+            ..page(0, vec![], vec![])
+        };
+        assert!(matches!(
+            absorb_rootlist(&mut list, no_length),
+            Err(InternalError::Transient(_))
+        ));
+        let no_contents = SelectedListContent {
+            length: Some(2),
+            ..Default::default()
+        };
+        assert!(matches!(
+            absorb_rootlist(&mut list, no_contents),
+            Err(InternalError::Transient(_))
+        ));
+        assert_eq!(list.pages, 0, "nothing was absorbed");
+    }
+
+    #[test]
+    fn an_empty_rootlist_with_a_length_is_complete() {
+        let mut list = Rootlist::default();
+        assert_eq!(
+            absorb_rootlist(&mut list, page(0, vec![], vec![])),
+            Ok(None)
+        );
+        assert_eq!((list.length, list.read, list.pages), (0, 0, 1));
     }
 
     #[test]
@@ -421,10 +469,10 @@ mod tests {
                 meta(Some("b"), b"r", 200),
             ],
         );
-        assert_eq!(absorb_rootlist(&mut list, first), Some(3));
+        assert_eq!(absorb_rootlist(&mut list, first), Ok(Some(3)));
         assert_eq!(list.entries.len(), 2);
         let second = page(4, vec![pl(3)], vec![meta(Some("c"), b"r", 200)]);
-        assert_eq!(absorb_rootlist(&mut list, second), None);
+        assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!((list.read, list.pages), (4, 2));
     }
