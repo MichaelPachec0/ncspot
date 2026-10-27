@@ -263,6 +263,39 @@ class LibraryWriteTest(unittest.TestCase):
         self.assertIn(f"harness unsave {self.URIS[1]}", sent)
 
 
+class CleanupTest(unittest.TestCase):
+    def test_parses_the_two_subcommands(self):
+        a = drive.parse_cleanup(["test-playlists"])
+        self.assertEqual(a.command, "test-playlists")
+        b = drive.parse_cleanup(["unfollow", "2", "--no-build"])
+        self.assertEqual((b.command, b.n, b.no_build), ("unfollow", 2, True))
+
+    def test_rejects_a_missing_or_bad_number(self):
+        for argv in (["unfollow"], ["unfollow", "x"]):
+            with self.assertRaises(SystemExit):
+                drive.parse_cleanup(argv)
+
+    def test_subcommands_are_not_scenarios(self):
+        for name in drive.CLEANUP_COMMANDS:
+            self.assertNotIn(name, drive.SCENARIOS)
+
+    def test_a_scenario_list_naming_a_subcommand_is_unknown(self):
+        self.assertEqual(drive.main(["album", "test-playlists", "--no-build"]), 2)
+
+    def test_formats_numbered_names_only(self):
+        self.assertEqual(drive.format_test_playlists(["ncspot-test-1"]), ["1 ncspot-test-1"])
+        self.assertEqual(
+            drive.format_test_playlists(["ncspot-test-1", "(unknown)"]),
+            ["1 ncspot-test-1", "2 (unknown)"],
+        )
+        self.assertEqual(drive.format_test_playlists([]), [])
+
+    def test_the_child_gets_the_real_list_path(self):
+        self.assertEqual(
+            drive.TEST_PLAYLISTS_FILE, os.path.join(drive.REAL_CACHE, "test-playlists.txt")
+        )
+
+
 class PlaylistsScenarioTest(unittest.TestCase):
     @staticmethod
     def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False, tab=True):

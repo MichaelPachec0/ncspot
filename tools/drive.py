@@ -28,6 +28,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_CACHE = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "ncspot"
 )
+TEST_PLAYLISTS_FILE = os.path.join(REAL_CACHE, "test-playlists.txt")
 REAL_CONFIG = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ncspot"
 )
@@ -263,6 +264,8 @@ class Instance:
 
     def _start(self, binary):
         env = f"XDG_RUNTIME_DIR={shlex.quote(self.run)}"
+        # The cache is isolated, but playlists a run creates are recorded in the real list.
+        env += f" NCSPOT_TEST_PLAYLISTS_FILE={shlex.quote(TEST_PLAYLISTS_FILE)}"
         pulse = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "pulse", "native")
         if os.environ.get("XDG_RUNTIME_DIR") and os.path.exists(pulse):
             env += f" PULSE_SERVER={shlex.quote('unix:' + pulse)}"
@@ -718,7 +721,72 @@ SCENARIOS = {
 }
 
 
+CLEANUP_COMMANDS = ("test-playlists", "unfollow")
+
+
+def parse_cleanup(argv):
+    """Parse a cleanup subcommand line (`test-playlists` or `unfollow <n>`). These are not
+    scenarios: main() hands them over only when the first argument names one."""
+    p = argparse.ArgumentParser(prog="drive.py", description="Test playlist cleanup")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("test-playlists", help="list the recorded test playlists as '<n> <name>'")
+    unf = sub.add_parser("unfollow", help="unfollow the n-th recorded test playlist")
+    unf.add_argument("n", type=int, help="1-based number from test-playlists")
+    for q in sub.choices.values():
+        q.add_argument("--keep", action="store_true", help="keep the temp dirs")
+        q.add_argument("--no-build", action="store_true", help="skip cargo build")
+        q.add_argument("--settle-timeout", type=float, default=30.0)
+    return p.parse_args(argv)
+
+
+def format_test_playlists(names):
+    """`<n> <name>` lines, 1-based, in file order; no ids."""
+    return [f"{i} {name}" for i, name in enumerate(names, 1)]
+
+
+def run_cleanup(args):
+    """Start a headless instance with the user's login and run one cleanup command. Prints only
+    the result lines. Never part of a scenario run."""
+    if not args.no_build:
+        r = subprocess.run(["cargo", "build", "--features", "harness"], cwd=REPO)
+        if r.returncode != 0:
+            return 2
+    binary = os.path.join(REPO, "target", "debug", "ncspot")
+    inst = None
+    try:
+        inst = Instance(binary, {}, args.keep)
+        inst.start()
+        inst.wait_library(args.settle_timeout * 4)
+        if args.command == "test-playlists":
+            inst.send("harness test-playlists")
+            d = inst.dump()
+            if d.get("error"):
+                print(d["error"])
+                return 1
+            print("\n".join(format_test_playlists(d.get("test_playlists", []))))
+            return 0
+        inst.send(f"harness unfollow-recorded {args.n}")
+        d = inst.wait_settled(args.settle_timeout)
+        if d.get("error"):
+            print(d["error"])
+            return 1
+        print("removed")
+        return 0
+    except SetupError as e:
+        print(f"SETUP: {e}")
+        return 2
+    except Fail as e:
+        print(f"FAIL: {e}")
+        return 1
+    finally:
+        if inst:
+            inst.close()
+
+
 def main(argv=None):
+    raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] in CLEANUP_COMMANDS:
+        return run_cleanup(parse_cleanup(raw))
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("scenarios", nargs="*")
     p.add_argument("--play", action="store_true", help="also run playback scenarios")

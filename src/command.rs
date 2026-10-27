@@ -255,6 +255,12 @@ pub enum HarnessCommand {
     Save(String),
     /// Remove a Spotify URI from the library (refuses one not saved).
     Unsave(String),
+    /// Create the next `ncspot-test-<k>` playlist and record its URI in the test-playlists file.
+    NewPlaylistTest,
+    /// Put the recorded test playlists' names in the next dump.
+    TestPlaylists,
+    /// Unfollow the n-th (1-based) recorded test playlist, then drop it from the file.
+    UnfollowRecorded(usize),
     /// Shut the playback session down so the worker has to reconnect.
     DropSession,
     /// Write a JSON snapshot of the current view to a file.
@@ -360,6 +366,14 @@ impl fmt::Display for Command {
             Self::Harness(HarnessCommand::Save(uri)) => vec!["save".into(), uri.clone()],
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::Unsave(uri)) => vec!["unsave".into(), uri.clone()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::NewPlaylistTest) => vec!["newplaylist-test".into()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::TestPlaylists) => vec!["test-playlists".into()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::UnfollowRecorded(n)) => {
+                vec!["unfollow-recorded".into(), n.to_string()]
+            }
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::DropSession) => vec!["drop-session".into()],
             Self::Goto(mode) => vec![mode.to_string()],
@@ -1078,6 +1092,19 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                         HarnessCommand::OpenLibrary(rest.first().map(|s| (*s).to_string())),
                     )),
                     (Some("drop-session"), []) => Ok(Command::Harness(HarnessCommand::DropSession)),
+                    (Some("newplaylist-test"), []) => {
+                        Ok(Command::Harness(HarnessCommand::NewPlaylistTest))
+                    }
+                    (Some("test-playlists"), []) => {
+                        Ok(Command::Harness(HarnessCommand::TestPlaylists))
+                    }
+                    (Some("unfollow-recorded"), [n]) => n
+                        .parse()
+                        .map(|n| Command::Harness(HarnessCommand::UnfollowRecorded(n)))
+                        .map_err(|_| E::InsufficientArgs {
+                            cmd: format!("{command} unfollow-recorded"),
+                            hint: Some("a recorded playlist number".into()),
+                        }),
                     (Some("save"), [target]) => Ok(Command::Harness(HarnessCommand::Save(
                         (*target).to_string(),
                     ))),
@@ -1090,14 +1117,14 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     (Some("dump"), rest) if !rest.is_empty() => {
                         Ok(Command::Harness(HarnessCommand::Dump(rest.join(" "))))
                     }
-                    (Some(sub @ ("open" | "dump" | "save" | "unsave")), _) => {
+                    (Some(sub @ ("open" | "dump" | "save" | "unsave" | "unfollow-recorded")), _) => {
                         Err(E::InsufficientArgs {
                             cmd: format!("{command} {sub}"),
                             hint: Some(
-                                if sub != "dump" {
-                                    "a Spotify URI or URL"
-                                } else {
-                                    "a file path"
+                                match sub {
+                                    "dump" => "a file path",
+                                    "unfollow-recorded" => "a recorded playlist number",
+                                    _ => "a Spotify URI or URL",
                                 }
                                 .into(),
                             ),
@@ -1111,12 +1138,18 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                             "drop-session".into(),
                             "save".into(),
                             "unsave".into(),
+                            "newplaylist-test".into(),
+                            "test-playlists".into(),
+                            "unfollow-recorded".into(),
                         ],
                         optional: false,
                     }),
                     (None, _) => Err(E::InsufficientArgs {
                         cmd: command.into(),
-                        hint: Some("open|dump|drop-session|save|unsave".into()),
+                        hint: Some(
+                            "open|dump|drop-session|save|unsave|newplaylist-test|test-playlists|unfollow-recorded"
+                                .into(),
+                        ),
                     }),
                 }?,
                 _ => {
@@ -1156,6 +1189,12 @@ mod tests {
                 HarnessCommand::OpenLibrary(Some("episodes".into())),
             ),
             ("harness drop-session", HarnessCommand::DropSession),
+            ("harness newplaylist-test", HarnessCommand::NewPlaylistTest),
+            ("harness test-playlists", HarnessCommand::TestPlaylists),
+            (
+                "harness unfollow-recorded 2",
+                HarnessCommand::UnfollowRecorded(2),
+            ),
             (
                 "harness save spotify:track:4uLU6hMCjMI75M1A2tKUQC",
                 HarnessCommand::Save("spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()),
@@ -1172,6 +1211,9 @@ mod tests {
         assert!(parse("harness").is_err());
         assert!(parse("harness open").is_err());
         assert!(parse("harness fly away").is_err());
+        assert!(parse("harness unfollow-recorded").is_err());
+        assert!(parse("harness unfollow-recorded x").is_err());
+        assert!(parse("harness unfollow-recorded -1").is_err());
     }
 
     #[test]

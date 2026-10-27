@@ -418,6 +418,11 @@ impl CommandManager {
                             .count(),
                     },
                 );
+                let mut dump = dump;
+                if crate::harness::take_test_playlists_request() {
+                    dump.test_playlists =
+                        crate::harness::test_playlist_names(&self.library, &self.spotify)?;
+                }
                 crate::harness::write_dump(std::path::Path::new(path), &dump).map_err(|e| {
                     error!("harness dump to {path} failed: {e}");
                     format!("harness dump failed: {e}")
@@ -441,6 +446,21 @@ impl CommandManager {
                         v.select_tab(&tab)
                     });
                 }
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::NewPlaylistTest) => {
+                crate::harness::new_playlist_test(&self.library)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::TestPlaylists) => {
+                crate::harness::request_test_playlists();
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::UnfollowRecorded(n)) => {
+                crate::harness::unfollow_recorded(&self.library, *n)?;
                 Ok(None)
             }
             #[cfg(feature = "harness")]
