@@ -85,10 +85,13 @@ pub fn local_track(uri: &str) -> Option<Track> {
     })
 }
 
-/// One `Playable` per item, in order: a local file for local URIs, the entry of `known` for
-/// known ones (with the item's add time), a placeholder for the rest. `list_index` is the
-/// item's position.
-pub fn assemble(items: &[PlaylistItem], known: &HashMap<String, Playable>) -> Vec<Playable> {
+/// One `Playable` per item, in order: a local file for local URIs, a copy of what `lookup`
+/// finds for the others (with the item's add time), a placeholder where it finds nothing.
+/// `list_index` is the item's position.
+pub fn assemble<'a>(
+    items: &[PlaylistItem],
+    lookup: impl Fn(&str) -> Option<&'a Playable>,
+) -> Vec<Playable> {
     items
         .iter()
         .enumerate()
@@ -98,8 +101,7 @@ pub fn assemble(items: &[PlaylistItem], known: &HashMap<String, Playable>) -> Ve
                     .map(Playable::Track)
                     .unwrap_or_else(|| placeholder(&item.uri))
             } else {
-                known
-                    .get(&item.uri)
+                lookup(&item.uri)
                     .cloned()
                     .unwrap_or_else(|| placeholder(&item.uri))
             };
@@ -153,7 +155,7 @@ mod tests {
             "spotify:track:A".to_string(),
             track_playable("spotify:track:A"),
         )]);
-        let out = assemble(&items, &known);
+        let out = assemble(&items, |uri| known.get(uri));
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].uri(), "spotify:track:A");
         assert!(
@@ -172,7 +174,7 @@ mod tests {
     #[test]
     fn malformed_local_uri_is_a_placeholder() {
         assert!(local_track("spotify:local:only:three").is_none());
-        let out = assemble(&[item("spotify:local:only:three")], &HashMap::new());
+        let out = assemble(&[item("spotify:local:only:three")], |_| None);
         assert!(!out[0].is_playable());
     }
 

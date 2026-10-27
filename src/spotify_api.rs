@@ -365,14 +365,16 @@ impl WebApi {
         let (episodes, tracks): (Vec<String>, Vec<String>) = wanted
             .into_iter()
             .partition(|uri| uri.starts_with("spotify:episode:"));
-        let mut merged = known.clone();
+        let mut fetched = HashMap::new();
         for track in self.tracks_in(Area::Playlists, &tracks)? {
-            merged.insert(track.uri.clone(), Playable::Track(track));
+            fetched.insert(track.uri.clone(), Playable::Track(track));
         }
         for episode in self.episodes_in(Area::Playlists, &episodes)? {
-            merged.insert(episode.uri.clone(), Playable::Episode(episode));
+            fetched.insert(episode.uri.clone(), Playable::Episode(episode));
         }
-        Ok(playlist_items::assemble(&items, &merged))
+        Ok(playlist_items::assemble(&items, |uri| {
+            fetched.get(uri).or_else(|| known.get(uri))
+        }))
     }
 
     pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
