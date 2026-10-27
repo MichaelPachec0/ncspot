@@ -1124,7 +1124,10 @@ impl Library {
                     None
                 }
                 Err(err) => {
-                    debug!("playlists: a head was not read ({err}), using the cached snapshot");
+                    debug!(
+                        "playlists: a head was not read ({}), using the cached snapshot",
+                        err.class()
+                    );
                     None
                 }
             }
@@ -2652,7 +2655,9 @@ pub(crate) fn write_through(
         || {
             internal().inspect_err(|err| {
                 if decide_after(err) == Action::Fail {
-                    warn!("Could not update the {}: {err}", area.name());
+                    // The class only: error texts (a playlist write's above all) may carry
+                    // endpoint paths with the username.
+                    warn!("Could not update the {} ({})", area.name(), err.class());
                 }
             })
         },

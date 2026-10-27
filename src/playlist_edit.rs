@@ -211,7 +211,10 @@ fn send_verified(
         after.length
     );
     if let Err(err) = reload(api, playlist, known) {
-        warn!("Could not reload the playlist after a write that did not verify: {err}");
+        warn!(
+            "Could not reload the playlist after a write that did not verify ({})",
+            err.class()
+        );
     }
     Err(EditError::Mismatch)
 }
