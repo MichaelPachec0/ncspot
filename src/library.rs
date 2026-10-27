@@ -15,6 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::config::Config;
 use crate::config::{self, CACHE_VERSION};
+use crate::cover_prefetch;
 use crate::events::EventManager;
 use crate::internal_api::Area;
 use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW};
@@ -358,6 +359,19 @@ impl Library {
                         }
                         sync
                     });
+                    if !cfg!(test) {
+                        let urls: Vec<String> = library
+                            .playlists
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|p| p.cover_url.clone())
+                            .collect();
+                        cover_prefetch::spawn_prefetch(cover_prefetch::missing_covers(
+                            &urls,
+                            |p| p.exists(),
+                        ));
+                    }
                     sync.listing_complete && sync.items_complete
                 })
             };

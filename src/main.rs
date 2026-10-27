@@ -18,6 +18,7 @@ mod client_id;
 mod command;
 mod commands;
 mod config;
+mod cover_prefetch;
 mod events;
 mod ext_traits;
 #[cfg(feature = "harness")]
