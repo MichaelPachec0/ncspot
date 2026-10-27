@@ -46,6 +46,10 @@ pub struct Rootlist {
     pub entries: Vec<RootEntry>,
     /// Number of raw items the service reports (folder markers included).
     pub length: usize,
+    /// Raw items consumed over all absorbed pages, skipped ones included.
+    pub read: usize,
+    /// Pages absorbed.
+    pub pages: usize,
 }
 
 /// One item of a playlist.
@@ -87,6 +91,7 @@ fn decode_name(raw: &str) -> String {
             b'+' => out.push(b' '),
             b'%' => match raw
                 .get(i + 1..i + 3)
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
             {
                 Some(b) => {
@@ -141,10 +146,9 @@ pub fn absorb_rootlist(list: &mut Rootlist, page: SelectedListContent) -> Option
     let total = usize::try_from(page.length.unwrap_or(0)).unwrap_or(0);
     list.length = total;
     let contents = page.contents.into_option()?;
-    // Pages are requested back to back, so the entries read so far mark where this one began.
-    // (The service's own `pos` is not relied on.)
-    let from = list.entries.len();
     let count = contents.items.len();
+    list.read += count;
+    list.pages += 1;
     let no_meta = MetaItem::default();
     for (i, item) in contents.items.iter().enumerate() {
         let uri = item.uri.as_deref().unwrap_or_default();
@@ -161,9 +165,7 @@ pub fn absorb_rootlist(list: &mut Rootlist, page: SelectedListContent) -> Option
             list.entries.push(RootEntry::FolderEnd);
         }
     }
-    let next = from + count;
-    let pages_read = next.div_ceil(ROOTLIST_PAGE);
-    (count > 0 && next < total && pages_read < MAX_ROOTLIST_PAGES).then_some(next)
+    (count > 0 && list.read < total && list.pages < MAX_ROOTLIST_PAGES).then_some(list.read)
 }
 
 /// The items of a playlist page, in order.
@@ -402,6 +404,28 @@ mod tests {
         assert_eq!(decode_name("My+Folder%21"), "My Folder!");
         assert_eq!(decode_name("100%"), "100%");
         assert_eq!(decode_name("a%zzb"), "a%zzb");
+        assert_eq!(decode_name("%+1"), "% 1", "a sign is not a hex digit");
         assert_eq!(decode_name("%C3%A9"), "\u{e9}");
+    }
+
+    #[test]
+    fn skipped_items_count_as_read_and_do_not_duplicate() {
+        let pl = |n: u8| item(&format!("spotify:playlist:00000000000000000000{n:02}"));
+        let mut list = Rootlist::default();
+        let first = page(
+            4,
+            vec![pl(1), item("spotify:track:x"), pl(2)],
+            vec![
+                meta(Some("a"), b"r", 200),
+                MetaItem::default(),
+                meta(Some("b"), b"r", 200),
+            ],
+        );
+        assert_eq!(absorb_rootlist(&mut list, first), Some(3));
+        assert_eq!(list.entries.len(), 2);
+        let second = page(4, vec![pl(3)], vec![meta(Some("c"), b"r", 200)]);
+        assert_eq!(absorb_rootlist(&mut list, second), None);
+        assert_eq!(list.entries.len(), 3);
+        assert_eq!((list.read, list.pages), (4, 2));
     }
 }
