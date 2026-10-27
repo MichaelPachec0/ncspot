@@ -310,9 +310,16 @@ class PlaylistsScenarioTest(unittest.TestCase):
             "tabs": [{"name": "Playlists", "rows": rows}] if tab else [{"name": "Albums", "rows": 3}],
         }
 
-    def run_with(self, func, **kw):
+    # The test playlist's length after the create and after each write command.
+    WRITE_LENS = (0, 2, 1, 3)
+
+    def run_with(self, func, lens=None, **kw):
         base = self.d(base=True)
         dump = self.d(**kw)
+        if lens is None and func is drive.sc_playlist_write:
+            lens = self.WRITE_LENS
+        # One dump per settle, in order; past the end (or without lens) the same dump.
+        settled = [self.d(**{**kw, "last_len": n}) for n in lens or ()]
 
         class Inst:
             base_dump = base
@@ -325,7 +332,7 @@ class PlaylistsScenarioTest(unittest.TestCase):
                 return base if func is drive.sc_playlist_write else dump
 
             def wait_settled(self, timeout):
-                return dump
+                return settled.pop(0) if settled else dump
 
         class Args:
             settle_timeout = 1
@@ -375,9 +382,9 @@ class PlaylistsScenarioTest(unittest.TestCase):
             self.run_with(drive.sc_playlist_write, latched=True)
 
     def test_playlist_write_wrong_length_fails(self):
-        for last_len in (2, None):
-            with self.assertRaises(drive.Fail, msg=last_len):
-                self.run_with(drive.sc_playlist_write, last_len=last_len)
+        for lens in ((0, 1, 1, 3), (0, 2, 2, 3), (0, 2, 1, 2), (0, 2, 1, None)):
+            with self.assertRaises(drive.Fail, msg=lens):
+                self.run_with(drive.sc_playlist_write, lens=lens)
 
     def test_playlist_write_throttled_is_blocked(self):
         original = self.d

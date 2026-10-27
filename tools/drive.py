@@ -694,15 +694,21 @@ def sc_playlist_write(inst, args):
     d = inst.wait_settled(args.settle_timeout)
     blocked_if_throttled(d, ["internal"])
     expect(d.get("error") is None, "create without error", d.get("error"))
-    for cmd in ("harness playlist-add-test 2", "harness playlist-remove-test 0", "harness playlist-overwrite-test 3"):
+    # Each command with the test playlist's length after it.
+    steps = (
+        ("harness playlist-add-test 2", 2),
+        ("harness playlist-remove-test 0", 1),
+        ("harness playlist-overwrite-test 3", 3),
+    )
+    for cmd, want in steps:
         inst.send(cmd)
         d = inst.wait_settled(args.settle_timeout)
         blocked_if_throttled(d, ["internal"])
         expect(d.get("error") is None, f"{cmd}: no error", d.get("error"))
+        expect(d["playlists"]["last_test_len"] == want, f"{cmd}: test playlist holds {want}", d["playlists"])
     m = area_delta(inst, d, "playlists")
     expect(m["fallback"] == 0, "no playlists fallback", m)
     expect(not d["areas"]["playlists"]["latched"], "area not latched", d["areas"]["playlists"])
-    expect(d["playlists"]["last_test_len"] == 3, "test playlist holds the overwrite", d["playlists"])
 
 
 def sc_reconnect(inst, args):
