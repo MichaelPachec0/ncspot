@@ -33,6 +33,7 @@ mod model;
 mod panic;
 mod pending_load;
 mod playlist_items;
+mod playlist_layout;
 #[cfg(test)]
 mod probe_tests;
 mod queue;
