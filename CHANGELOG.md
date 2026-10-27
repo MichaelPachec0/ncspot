@@ -20,7 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Albums saved in ncspot are refreshed with their full data on the next library sync
+- Albums saved in ncspot are refreshed with their full data on the next library sync over the Web API
 - Playlist sync keeping only a few playlists after a rate limit
 - Playback dying on `:reconnect` an hour after logging in via the browser
 - Playback stopping when Spotify closes the connection
