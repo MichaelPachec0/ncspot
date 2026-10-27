@@ -51,14 +51,19 @@ pub fn index_still(tracks: &[Playable], index: usize, uri: &str) -> bool {
         .is_some_and(|playable| playable.uri() == uri)
 }
 
-/// A write applied when the head length after it is the expected one.
+/// A write applied when the head length after it is the expected one. Length only: a
+/// concurrent edit that leaves the length unchanged is not detected.
 pub fn verified(expected_len: usize, after: &Head) -> bool {
     after.length == expected_len
 }
 
 #[derive(Debug)]
 pub enum EditError {
+    /// Failed before anything was sent; the class decides the fallback as usual.
     Internal(InternalError),
+    /// Failed after a POST was sent (the POST itself, the verify read or a later batch): the
+    /// write may have applied, so it must never be repeated through the Web API.
+    Unverified(InternalError),
     /// The selected item moved; nothing was sent.
     Moved,
     /// The head after the write does not match; the local copy was reloaded.
@@ -71,15 +76,50 @@ impl From<InternalError> for EditError {
     }
 }
 
-/// A moved index or a mismatch fails the action: `Transient` never falls back to the Web API.
+/// A moved index, a mismatch or an error after a POST fails the action: `Transient` never
+/// falls back to the Web API (which could apply the write twice) and never latches the area.
 impl From<EditError> for InternalError {
     fn from(err: EditError) -> Self {
         match err {
             EditError::Internal(err) => err,
+            EditError::Unverified(err) => {
+                Self::Transient(format!("the write may have applied: {err}"))
+            }
             EditError::Moved => Self::Transient("the selected item moved".into()),
             EditError::Mismatch => Self::Transient("the playlist changed during the write".into()),
         }
     }
+}
+
+/// One change to a playlist, for its expected length afterwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Change {
+    /// Append this many tracks.
+    Add(usize),
+    /// Remove one item.
+    Remove,
+    /// Replace the contents with this many tracks.
+    Overwrite(usize),
+}
+
+/// The head length after `change` on a head of `head_len`; None when there is nothing to
+/// remove.
+fn expected_len(head_len: usize, change: Change) -> Option<usize> {
+    match change {
+        Change::Add(n) => Some(head_len + n),
+        Change::Remove => head_len.checked_sub(1),
+        Change::Overwrite(n) => Some(n),
+    }
+}
+
+/// The part of an overwrite sent in its one atomic POST, and the tail sent as add batches.
+fn overwrite_split<T>(tracks: &[T]) -> (&[T], &[T]) {
+    tracks.split_at(tracks.len().min(OVERWRITE_ATOMIC_MAX))
+}
+
+/// The add batches, one POST each.
+fn add_chunks<T>(new: &[T]) -> std::slice::Chunks<'_, T> {
+    new.chunks(ADD_BATCH)
 }
 
 /// Bring `playlist` up to date with the server when stale; returns the base revision.
@@ -127,7 +167,8 @@ fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, head: &Head) {
 }
 
 /// POST `ops` against `base`, then read the head: the new head when its length is
-/// `expected_len`, else reload the local copy and fail with [EditError::Mismatch].
+/// `expected_len`, else reload the local copy and fail with [EditError::Mismatch]. Every other
+/// error here comes after the POST was sent, so it is [EditError::Unverified].
 fn send_verified(
     api: &WebApi,
     playlist: &mut Playlist,
@@ -136,8 +177,11 @@ fn send_verified(
     ops: Vec<Op>,
     expected_len: usize,
 ) -> Result<Head, EditError> {
-    api.playlist_changes(&playlist.id, list_changes(base, ops))?;
-    let after = api.playlist_head(&playlist.id)?;
+    api.playlist_changes(&playlist.id, list_changes(base, ops))
+        .map_err(EditError::Unverified)?;
+    let after = api
+        .playlist_head(&playlist.id)
+        .map_err(EditError::Unverified)?;
     if verified(expected_len, &after) {
         return Ok(after);
     }
@@ -145,7 +189,9 @@ fn send_verified(
         "Playlist write did not verify: length {} after it, {expected_len} expected",
         after.length
     );
-    reload(api, playlist, known, &after)?;
+    if let Err(err) = reload(api, playlist, known, &after) {
+        warn!("Could not reload the playlist after a write that did not verify: {err}");
+    }
     Err(EditError::Mismatch)
 }
 
@@ -191,9 +237,9 @@ fn add_batches(
     new: &[Playable],
     spacer: &mut Spacer,
 ) -> Result<(), EditError> {
-    for batch in new.chunks(ADD_BATCH) {
+    for batch in add_chunks(new) {
         spaced(spacer);
-        let expected = head.length + batch.len();
+        let expected = expected_len(head.length, Change::Add(batch.len())).unwrap_or_default();
         let ops = vec![add_op(&uris(batch), None)];
         let after = send_verified(api, playlist, known, head.revision, ops, expected)?;
         let mut tracks = playlist.tracks.take().unwrap_or_default();
@@ -217,7 +263,7 @@ pub fn remove_track(
     if !index_still(tracks, index, uri) {
         return Err(EditError::Moved);
     }
-    let expected = head.length.checked_sub(1).ok_or(EditError::Moved)?;
+    let expected = expected_len(head.length, Change::Remove).ok_or(EditError::Moved)?;
     let ops = vec![remove_at_op(index)];
     let after = send_verified(api, playlist, known, head.revision, ops, expected)?;
     let mut tracks = playlist.tracks.take().unwrap_or_default();
@@ -236,14 +282,16 @@ pub fn overwrite(
     known: &HashMap<String, Playable>,
 ) -> Result<(), EditError> {
     let head = prepare_head(api, playlist, known)?;
-    let (first, rest) = tracks.split_at(tracks.len().min(OVERWRITE_ATOMIC_MAX));
+    let (first, rest) = overwrite_split(tracks);
     let ops = overwrite_ops(head.length, &uris(first));
     let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
     let after = if ops.is_empty() {
         head
     } else {
         spaced(&mut spacer);
-        send_verified(api, playlist, known, head.revision, ops, first.len())?
+        let expected =
+            expected_len(head.length, Change::Overwrite(first.len())).unwrap_or_default();
+        send_verified(api, playlist, known, head.revision, ops, expected)?
     };
     set_tracks(playlist, first.to_vec(), &after);
     add_batches(api, playlist, known, after, rest, &mut spacer)
@@ -326,6 +374,69 @@ mod tests {
         for err in [EditError::Moved, EditError::Mismatch] {
             assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
         }
+    }
+
+    #[test]
+    fn unverified_errors_fail_for_every_class() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        for inner in [
+            InternalError::NoSession,
+            InternalError::NotFound,
+            InternalError::Denied,
+            InternalError::ProtocolChanged("412".into()),
+            InternalError::RateLimited,
+            InternalError::Transient("x".into()),
+        ] {
+            let err = InternalError::from(EditError::Unverified(inner.clone()));
+            assert!(matches!(err, InternalError::Transient(_)), "{inner}");
+            assert_eq!(decide_after(&err), Action::Fail, "{inner}");
+        }
+    }
+
+    #[test]
+    fn errors_before_the_post_keep_their_class() {
+        for inner in [
+            InternalError::NoSession,
+            InternalError::NotFound,
+            InternalError::Denied,
+            InternalError::ProtocolChanged("412".into()),
+        ] {
+            assert_eq!(
+                InternalError::from(EditError::Internal(inner.clone())),
+                inner
+            );
+        }
+    }
+
+    #[test]
+    fn expected_length_per_change() {
+        assert_eq!(expected_len(5, Change::Add(3)), Some(8));
+        assert_eq!(expected_len(5, Change::Remove), Some(4));
+        assert_eq!(expected_len(0, Change::Remove), None);
+        assert_eq!(expected_len(5, Change::Overwrite(2)), Some(2));
+        assert_eq!(expected_len(5, Change::Overwrite(0)), Some(0));
+    }
+
+    #[test]
+    fn overwrite_sends_up_to_the_atomic_max_then_add_batches() {
+        let small: Vec<usize> = (0..250).collect();
+        let (first, rest) = overwrite_split(&small);
+        assert_eq!((first.len(), rest.len()), (250, 0));
+
+        let big: Vec<usize> = (0..OVERWRITE_ATOMIC_MAX + 250).collect();
+        let (first, rest) = overwrite_split(&big);
+        assert_eq!(first.len(), OVERWRITE_ATOMIC_MAX);
+        assert_eq!(rest[0], OVERWRITE_ATOMIC_MAX, "the tail continues in order");
+        let sizes: Vec<usize> = add_chunks(rest).map(<[usize]>::len).collect();
+        assert_eq!(sizes, [ADD_BATCH, ADD_BATCH, 50]);
+    }
+
+    #[test]
+    fn add_batches_are_add_batch_sized() {
+        let new: Vec<usize> = (0..ADD_BATCH * 2 + 1).collect();
+        let sizes: Vec<usize> = add_chunks(&new).map(<[usize]>::len).collect();
+        assert_eq!(sizes, [ADD_BATCH, ADD_BATCH, 1]);
+        assert_eq!(add_chunks::<usize>(&[]).count(), 0);
     }
 
     #[test]
