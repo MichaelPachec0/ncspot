@@ -25,6 +25,11 @@ use crate::model::playlist::Playlist;
 use crate::playlist_layout::{PLAYLIST_FETCH_SPACING, Spacer};
 use crate::spotify_api::WebApi;
 
+/// Builds the track and episode metadata already known locally (`Library::known_playables`).
+/// Called only when a stale local copy is reloaded, so a write on a current copy never
+/// builds it.
+pub type Known<'a> = &'a dyn Fn() -> HashMap<String, Playable>;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Freshness {
     Current,
@@ -147,7 +152,7 @@ fn add_chunks<T>(new: &[T]) -> std::slice::Chunks<'_, T> {
 fn prepare_head(
     api: &WebApi,
     playlist: &mut Playlist,
-    known: &HashMap<String, Playable>,
+    known: Known<'_>,
 ) -> Result<Head, EditError> {
     let head = api.playlist_head(&playlist.id)?;
     let reloaded = match freshness(playlist, &head) {
@@ -166,12 +171,8 @@ fn write_base(head: Head, reloaded: Option<Head>) -> Head {
 }
 
 /// Replace the local tracks with a full read and take that read's snapshot; returns its head.
-fn reload(
-    api: &WebApi,
-    playlist: &mut Playlist,
-    known: &HashMap<String, Playable>,
-) -> Result<Head, InternalError> {
-    let (head, tracks) = api.playlist_playables_at(&playlist.id, known)?;
+fn reload(api: &WebApi, playlist: &mut Playlist, known: Known<'_>) -> Result<Head, InternalError> {
+    let (head, tracks) = api.playlist_playables_at(&playlist.id, &known())?;
     set_tracks(playlist, tracks, &head);
     Ok(head)
 }
@@ -192,7 +193,7 @@ fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, head: &Head) {
 fn send_verified(
     api: &WebApi,
     playlist: &mut Playlist,
-    known: &HashMap<String, Playable>,
+    known: Known<'_>,
     base: Vec<u8>,
     ops: Vec<Op>,
     expected_len: usize,
@@ -231,7 +232,7 @@ pub fn add_tracks(
     api: &WebApi,
     playlist: &mut Playlist,
     new: &[Playable],
-    known: &HashMap<String, Playable>,
+    known: Known<'_>,
 ) -> Result<(), EditError> {
     if new.is_empty() {
         return Ok(());
@@ -252,7 +253,7 @@ pub fn add_tracks(
 fn add_batches(
     api: &WebApi,
     playlist: &mut Playlist,
-    known: &HashMap<String, Playable>,
+    known: Known<'_>,
     mut head: Head,
     new: &[Playable],
     spacer: &mut Spacer,
@@ -276,7 +277,7 @@ pub fn remove_track(
     playlist: &mut Playlist,
     index: usize,
     uri: &str,
-    known: &HashMap<String, Playable>,
+    known: Known<'_>,
 ) -> Result<(), EditError> {
     let head = prepare_head(api, playlist, known)?;
     let tracks = playlist.tracks.as_deref().unwrap_or_default();
@@ -299,7 +300,7 @@ pub fn overwrite(
     api: &WebApi,
     playlist: &mut Playlist,
     tracks: &[Playable],
-    known: &HashMap<String, Playable>,
+    known: Known<'_>,
 ) -> Result<(), EditError> {
     let head = prepare_head(api, playlist, known)?;
     let (first, rest) = overwrite_split(tracks);
@@ -879,11 +880,21 @@ mod tests {
         let api = WebApi::new(&crate::config::Config::new_for_test());
         let mut playlist = local("s", 2);
         let new = [track_playable("spotify:track:new")];
-        let result = add_tracks(&api, &mut playlist, &new, &HashMap::new());
+        let built = std::cell::Cell::new(0);
+        let known = || {
+            built.set(built.get() + 1);
+            HashMap::new()
+        };
+        let result = add_tracks(&api, &mut playlist, &new, &known);
         assert!(matches!(
             result,
             Err(EditError::Internal(InternalError::NoSession))
         ));
+        assert_eq!(
+            built.get(),
+            0,
+            "no reload, so the known metadata is never built"
+        );
         assert_eq!(playlist.snapshot_id, "s");
         assert_eq!(playlist.num_tracks, 2);
         let uris: Vec<String> = playlist.tracks.unwrap().iter().map(Playable::uri).collect();

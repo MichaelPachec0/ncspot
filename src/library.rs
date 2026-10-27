@@ -425,7 +425,7 @@ impl Library {
     pub fn overwrite_playlist(&self, id: &str, tracks: &[Playable]) {
         debug!("saving {} tracks to list {}", tracks.len(), id);
         let api = &self.spotify.api;
-        let known = self.known_playables();
+        let known = || self.known_playables();
         let web_used = Cell::new(false);
         let written = write_through(
             api,

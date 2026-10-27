@@ -108,7 +108,7 @@ impl Playlist {
         }
 
         let api = &spotify.api;
-        let known = library.known_playables();
+        let known = || library.known_playables();
         let uri = playable.uri();
         let note = Cell::new(None);
         let web_used = Cell::new(false);
@@ -147,7 +147,7 @@ impl Playlist {
 
     pub fn append_tracks(&mut self, new_tracks: &[Playable], spotify: &Spotify, library: &Library) {
         let api = &spotify.api;
-        let known = library.known_playables();
+        let known = || library.known_playables();
         let web_used = Cell::new(false);
         let id = self.id.clone();
         let written = write_through(
