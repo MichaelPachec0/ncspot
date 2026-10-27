@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -36,6 +37,7 @@ use crate::model::episode::Episode;
 use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::track::Track;
+use crate::playlist_items;
 use crate::rate_limit::{
     Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
@@ -342,6 +344,29 @@ impl WebApi {
         self.run_internal(Area::Playlists, |session| {
             playlist::contents(session, id.clone())
         })
+    }
+
+    /// The items of one playlist as `Playable`s, in playlist order: metadata for URIs not in
+    /// `known` comes from the internal API (tracks and episodes in batches), local files are
+    /// decoded from their URI, and anything without metadata is an unplayable placeholder.
+    pub fn playlist_playables(
+        &self,
+        id: &str,
+        known: &HashMap<String, Playable>,
+    ) -> Result<Vec<Playable>, InternalError> {
+        let items = self.playlist_contents(id)?;
+        let wanted = playlist_items::unknown_uris(&items, known);
+        let (episodes, tracks): (Vec<String>, Vec<String>) = wanted
+            .into_iter()
+            .partition(|uri| uri.starts_with("spotify:episode:"));
+        let mut merged = known.clone();
+        for track in self.library_tracks(&tracks)? {
+            merged.insert(track.uri.clone(), Playable::Track(track));
+        }
+        for episode in self.library_episodes(&episodes)? {
+            merged.insert(episode.uri.clone(), Playable::Episode(episode));
+        }
+        Ok(playlist_items::assemble(&items, &merged))
     }
 
     pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
@@ -1488,6 +1513,15 @@ mod test {
             Err(InternalError::NoSession)
         );
         assert_eq!(api.collection_write("collection", &[], true), Ok(()));
+    }
+
+    #[test]
+    fn playlist_playables_without_a_session_is_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert!(matches!(
+            api.playlist_playables("37i9dQZF1DXcBWIGoYBM5M", &HashMap::new()),
+            Err(InternalError::NoSession)
+        ));
     }
 
     #[test]

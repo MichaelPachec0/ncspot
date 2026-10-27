@@ -32,6 +32,7 @@ mod lyrics;
 mod model;
 mod panic;
 mod pending_load;
+mod playlist_items;
 #[cfg(test)]
 mod probe_tests;
 mod queue;
