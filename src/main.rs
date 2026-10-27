@@ -33,6 +33,7 @@ mod lyrics;
 mod model;
 mod panic;
 mod pending_load;
+mod playlist_edit;
 mod playlist_items;
 mod playlist_layout;
 #[cfg(test)]

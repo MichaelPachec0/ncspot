@@ -1582,6 +1582,7 @@ impl Library {
         let api = &self.spotify.api;
         if !write_through(
             api,
+            Area::Library,
             || api.collection_write(SET_COLLECTION, &uris, false),
             || api.current_user_saved_tracks_add(ids).is_ok(),
         ) {
@@ -1628,6 +1629,7 @@ impl Library {
         let api = &self.spotify.api;
         if !write_through(
             api,
+            Area::Library,
             || api.collection_write(SET_COLLECTION, &uris, true),
             || api.current_user_saved_tracks_delete(ids).is_ok(),
         ) {
@@ -1676,6 +1678,7 @@ impl Library {
             let uris = vec![format!("spotify:album:{album_id}")];
             if !write_through(
                 api,
+                Area::Library,
                 || api.collection_write(SET_COLLECTION, &uris, false),
                 || {
                     api.current_user_saved_albums_add(vec![album_id.as_str()])
@@ -1713,6 +1716,7 @@ impl Library {
             let uris = vec![format!("spotify:album:{album_id}")];
             if !write_through(
                 api,
+                Area::Library,
                 || api.collection_write(SET_COLLECTION, &uris, true),
                 || {
                     api.current_user_saved_albums_delete(vec![album_id.as_str()])
@@ -1755,6 +1759,7 @@ impl Library {
             let uris = vec![format!("spotify:artist:{artist_id}")];
             if !write_through(
                 api,
+                Area::Library,
                 || api.collection_write(SET_ARTIST, &uris, false),
                 || api.user_follow_artists(vec![artist_id.as_str()]).is_ok(),
             ) {
@@ -1792,6 +1797,7 @@ impl Library {
             let uris = vec![format!("spotify:artist:{artist_id}")];
             if !write_through(
                 api,
+                Area::Library,
                 || api.collection_write(SET_ARTIST, &uris, true),
                 || api.user_unfollow_artists(vec![artist_id.as_str()]).is_ok(),
             ) {
@@ -1937,6 +1943,7 @@ impl Library {
         let uris = vec![show.uri.clone()];
         if write_through(
             api,
+            Area::Library,
             || api.collection_write(SET_SHOW, &uris, false),
             || api.save_shows(&[show.id.as_str()]).is_ok(),
         ) {
@@ -1963,6 +1970,7 @@ impl Library {
         let uris = vec![show.uri.clone()];
         if write_through(
             api,
+            Area::Library,
             || api.collection_write(SET_SHOW, &uris, true),
             || api.unsave_shows(&[show.id.as_str()]).is_ok(),
         ) {
@@ -2364,30 +2372,31 @@ fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
     }
 }
 
-/// One library write: the internal API first, then the Web API per the fallback classes.
+/// One write in `area`: the internal API first, then the Web API per the fallback classes.
 /// True when one of them wrote; the caller updates the store and `.db` only then.
 fn write_through(
     api: &WebApi,
+    area: Area,
     internal: impl FnOnce() -> Result<(), InternalError>,
     web: impl FnOnce() -> bool,
 ) -> bool {
-    let skip = !api.internal_usable(Area::Library);
+    let skip = !api.internal_usable(area);
     run_with_fallback(
         skip,
         || {
             internal().inspect_err(|err| {
                 if decide_after(err) == Action::Fail {
-                    warn!("Could not update the library: {err}");
+                    warn!("Could not update the {}: {err}", area.name());
                 }
             })
         },
         || {
             if !skip {
-                api.count_fallback(Area::Library);
+                api.count_fallback(area);
             }
             web().then_some(())
         },
-        |err| api.latch_area(Area::Library, err),
+        |err| api.latch_area(area, err),
     )
     .is_some()
 }
@@ -2782,6 +2791,7 @@ mod test {
         let call = |r: Result<(), InternalError>, web_ok: bool| {
             write_through(
                 &api,
+                Area::Library,
                 || r,
                 || {
                     web.set(web.get() + 1);
@@ -2820,6 +2830,7 @@ mod test {
         // Latched: straight to the Web API, the internal call never runs.
         assert!(write_through(
             &api,
+            Area::Library,
             || panic!("internal ran while latched"),
             || true
         ));
