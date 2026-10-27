@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use cursive::Cursive;
@@ -16,18 +18,12 @@ use crate::traits::ViewExt;
 use crate::ui::listview::ListView;
 use crate::ui::modal::Modal;
 
-/// What the rows are built from: per store playlist its id, snapshot id and whether its
-/// tracks are loaded, and the length of the layout in use.
-#[derive(PartialEq, Eq, Default)]
-struct Fingerprint {
-    playlists: Vec<(String, String, bool)>,
-    layout_len: usize,
-}
-
 pub struct PlaylistsView {
     list: ListView<PlaylistRow>,
     rows: Arc<RwLock<Vec<PlaylistRow>>>,
-    fingerprint: Option<Fingerprint>,
+    /// Hash of what the rows were built from: per store playlist its id, snapshot id and
+    /// whether its tracks are loaded, and the layout in use.
+    fingerprint: Option<u64>,
     library: Arc<Library>,
     spotify: Spotify,
 }
@@ -54,15 +50,17 @@ impl PlaylistsView {
         let usable = self.spotify.api.internal_usable(Area::Playlists);
         let layout = self.library.playlist_layout.read().unwrap();
         let layout: &[_] = if usable { &layout } else { &[] };
-        let fingerprint = Fingerprint {
-            playlists: playlists
-                .iter()
-                .map(|p| (p.id.clone(), p.snapshot_id.clone(), p.tracks.is_some()))
-                .collect(),
-            layout_len: layout.len(),
-        };
-        if self.fingerprint.as_ref() != Some(&fingerprint) {
-            *self.rows.write().unwrap() = rows(&playlists, layout);
+        let mut hasher = DefaultHasher::new();
+        playlists.len().hash(&mut hasher);
+        for p in playlists.iter() {
+            p.id.hash(&mut hasher);
+            p.snapshot_id.hash(&mut hasher);
+            p.tracks.is_some().hash(&mut hasher);
+        }
+        layout.hash(&mut hasher);
+        let fingerprint = hasher.finish();
+        if self.fingerprint != Some(fingerprint) {
+            *self.rows.write().unwrap() = rows(&playlists, layout, &self.library.playlists);
             self.fingerprint = Some(fingerprint);
         }
     }
@@ -83,8 +81,8 @@ impl PlaylistsView {
             .read()
             .unwrap()
             .get(self.list.get_selected_index())
-            .and_then(PlaylistRow::playlist)
-            .map(|p| p.id.clone())?;
+            .and_then(PlaylistRow::playlist_id)
+            .map(str::to_string)?;
         let library = self.library.clone();
         let dialog = Dialog::text("Are you sure you want to delete this playlist?")
             .padding(Margins::lrtb(1, 1, 1, 0))

@@ -1,8 +1,8 @@
 //! The Playlists tab layout from the rootlist (folders, pinned playlists first), and the
 //! spacing between playlist downloads in a sync.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::internal_api::collection::Item;
@@ -21,7 +21,7 @@ pub const PLAYLIST_FETCH_SPACING: Duration = Duration::from_millis(250);
 const PLAYLIST_PREFIX: &str = "spotify:playlist:";
 
 /// One entry of the persisted Playlists tab layout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LayoutEntry {
     /// A pinned playlist id; all pins come first, in pin order.
     Pinned(String),
@@ -71,91 +71,112 @@ pub fn pinned_ids(items: &[Item]) -> Vec<String> {
         .collect()
 }
 
+/// The playlist store the rows look their playlists up in (`Library::playlists`).
+pub type PlaylistStore = Arc<RwLock<Vec<Playlist>>>;
+
 /// One row of the Playlists tab.
 #[derive(Clone)]
 pub enum PlaylistRow {
     /// A folder name; inert, every item command on it does nothing.
     Header { name: String, depth: usize },
-    /// A playlist; `pinned` marks the copies in the pinned block at the top.
-    Playlist { playlist: Playlist, pinned: bool },
+    /// A store playlist by id: `pinned` marks the copies in the pinned block at the top,
+    /// `depth` is the number of folders it is in.
+    Playlist {
+        id: String,
+        pinned: bool,
+        depth: usize,
+        store: PlaylistStore,
+    },
 }
 
 impl PlaylistRow {
-    /// The playlist of this row, `None` for a header.
-    pub fn playlist(&self) -> Option<&Playlist> {
+    /// The playlist id of this row, `None` for a header.
+    pub fn playlist_id(&self) -> Option<&str> {
         match self {
-            Self::Playlist { playlist, .. } => Some(playlist),
+            Self::Playlist { id, .. } => Some(id),
             Self::Header { .. } => None,
         }
     }
 
-    fn playlist_mut(&mut self) -> Option<&mut Playlist> {
-        match self {
-            Self::Playlist { playlist, .. } => Some(playlist),
-            Self::Header { .. } => None,
+    /// `f` on the current store entry of this row; `None` for a header or a playlist no
+    /// longer in the store.
+    fn with<R>(&self, f: impl FnOnce(&Playlist) -> R) -> Option<R> {
+        let Self::Playlist { id, store, .. } = self else {
+            return None;
+        };
+        let store = store.read().unwrap();
+        store.iter().find(|p| &p.id == id).map(f)
+    }
+
+    /// `f` on the store entry under the store write lock, so loaded tracks land in the
+    /// store.
+    fn with_mut(&self, f: impl FnOnce(&mut Playlist)) {
+        if let Self::Playlist { id, store, .. } = self
+            && let Some(p) = store.write().unwrap().iter_mut().find(|p| &p.id == id)
+        {
+            f(p);
         }
+    }
+
+    /// A copy of the store entry, for calls into the library that take the store locks
+    /// themselves (save, delete, follow).
+    fn snapshot(&self) -> Option<Playlist> {
+        self.with(Playlist::clone)
     }
 }
 
 impl ListItem for PlaylistRow {
     fn is_playing(&self, queue: &Queue) -> bool {
-        self.playlist().is_some_and(|p| p.is_playing(queue))
+        self.with(|p| p.is_playing(queue)).unwrap_or(false)
     }
 
     fn display_left(&self, library: &Library) -> String {
         match self {
             Self::Header { name, depth } => format!("{}{name}/", "  ".repeat(*depth)),
-            Self::Playlist { playlist, pinned } => {
-                let name = playlist.display_left(library);
-                if *pinned { format!("* {name}") } else { name }
+            Self::Playlist { pinned, depth, .. } => {
+                let marker = if *pinned { "* " } else { "" };
+                let name = self.with(|p| p.display_left(library)).unwrap_or_default();
+                format!("{}{marker}{name}", "  ".repeat(*depth))
             }
         }
     }
 
     fn display_right(&self, library: &Library) -> String {
-        self.playlist()
-            .map(|p| p.display_right(library))
-            .unwrap_or_default()
+        self.with(|p| p.display_right(library)).unwrap_or_default()
     }
 
     fn play(&mut self, queue: &Queue) {
-        if let Some(p) = self.playlist_mut() {
-            p.play(queue);
-        }
+        self.with_mut(|p| p.play(queue));
     }
 
     fn play_next(&mut self, queue: &Queue) {
-        if let Some(p) = self.playlist_mut() {
-            p.play_next(queue);
-        }
+        self.with_mut(|p| p.play_next(queue));
     }
 
     fn queue(&mut self, queue: &Queue) {
-        if let Some(p) = self.playlist_mut() {
-            p.queue(queue);
-        }
+        self.with_mut(|p| p.queue(queue));
     }
 
     fn toggle_saved(&mut self, library: &Library) {
-        if let Some(p) = self.playlist_mut() {
+        if let Some(mut p) = self.snapshot() {
             p.toggle_saved(library);
         }
     }
 
     fn save(&mut self, library: &Library) {
-        if let Some(p) = self.playlist_mut() {
+        if let Some(mut p) = self.snapshot() {
             p.save(library);
         }
     }
 
     fn unsave(&mut self, library: &Library) {
-        if let Some(p) = self.playlist_mut() {
+        if let Some(mut p) = self.snapshot() {
             p.unsave(library);
         }
     }
 
     fn open(&self, queue: Arc<Queue>, library: Arc<Library>) -> Option<Box<dyn ViewExt>> {
-        self.playlist()?.open(queue, library)
+        self.snapshot()?.open(queue, library)
     }
 
     fn open_recommendations(
@@ -163,31 +184,31 @@ impl ListItem for PlaylistRow {
         queue: Arc<Queue>,
         library: Arc<Library>,
     ) -> Option<Box<dyn ViewExt>> {
-        self.playlist_mut()?.open_recommendations(queue, library)
+        self.snapshot()?.open_recommendations(queue, library)
     }
 
     fn share_url(&self) -> Option<String> {
-        self.playlist()?.share_url()
+        self.with(ListItem::share_url).flatten()
     }
 
     fn album(&self, queue: &Queue) -> Option<Album> {
-        self.playlist()?.album(queue)
+        self.with(|p| p.album(queue)).flatten()
     }
 
     fn artists(&self) -> Option<Vec<Artist>> {
-        self.playlist()?.artists()
+        self.with(ListItem::artists).flatten()
     }
 
     fn track(&self) -> Option<Track> {
-        self.playlist()?.track()
+        self.with(ListItem::track).flatten()
     }
 
     fn is_saved(&self, library: &Library) -> Option<bool> {
-        self.playlist()?.is_saved(library)
+        self.with(|p| p.is_saved(library)).flatten()
     }
 
     fn is_playable(&self) -> bool {
-        self.playlist().is_some_and(ListItem::is_playable)
+        self.with(ListItem::is_playable).unwrap_or(false)
     }
 
     fn as_listitem(&self) -> Box<dyn ListItem> {
@@ -195,48 +216,61 @@ impl ListItem for PlaylistRow {
     }
 }
 
-/// The Playlists tab rows for the store `playlists` and `layout`. An empty layout gives the
-/// flat store list. Otherwise the pinned playlists come first, then the layout with a header
-/// per folder (a pinned playlist appears again at its place), then the store playlists the
-/// layout does not list. Ids missing from the store are skipped.
-pub fn rows(playlists: &[Playlist], layout: &[LayoutEntry]) -> Vec<PlaylistRow> {
-    let row = |playlist: &Playlist, pinned| PlaylistRow::Playlist {
-        playlist: playlist.clone(),
+/// The Playlists tab rows for the store contents `playlists` and `layout`, looking their
+/// playlists up in `store`. An empty layout gives the flat store list. Otherwise the pinned
+/// playlists come first, then the layout with a header per folder (a pinned playlist appears
+/// again at its place, unmarked), then the store playlists the layout does not list. Ids
+/// missing from the store are skipped.
+pub fn rows(
+    playlists: &[Playlist],
+    layout: &[LayoutEntry],
+    store: &PlaylistStore,
+) -> Vec<PlaylistRow> {
+    let row = |id: &str, pinned, depth| PlaylistRow::Playlist {
+        id: id.to_string(),
         pinned,
+        depth,
+        store: store.clone(),
     };
     if layout.is_empty() {
-        return playlists.iter().map(|p| row(p, false)).collect();
+        return playlists.iter().map(|p| row(&p.id, false, 0)).collect();
     }
-    let by_id: HashMap<&str, &Playlist> = playlists.iter().map(|p| (p.id.as_str(), p)).collect();
+    let known: HashSet<&str> = playlists.iter().map(|p| p.id.as_str()).collect();
     let mut out = Vec::new();
-    for entry in layout {
-        if let LayoutEntry::Pinned(id) = entry
-            && let Some(p) = by_id.get(id.as_str())
-        {
-            out.push(row(p, true));
-        }
-    }
     let mut listed = HashSet::new();
     for entry in layout {
+        if let LayoutEntry::Pinned(id) = entry
+            && known.contains(id.as_str())
+        {
+            listed.insert(id.as_str());
+            out.push(row(id, true, 0));
+        }
+    }
+    let mut depth = 0usize;
+    for entry in layout {
         match entry {
-            LayoutEntry::FolderStart { name, depth } => out.push(PlaylistRow::Header {
-                name: name.clone(),
-                depth: *depth,
-            }),
+            LayoutEntry::FolderStart { name, depth: d } => {
+                out.push(PlaylistRow::Header {
+                    name: name.clone(),
+                    depth: *d,
+                });
+                depth = d + 1;
+            }
+            LayoutEntry::FolderEnd => depth = depth.saturating_sub(1),
             LayoutEntry::Playlist(id) => {
                 listed.insert(id.as_str());
-                if let Some(p) = by_id.get(id.as_str()) {
-                    out.push(row(p, false));
+                if known.contains(id.as_str()) {
+                    out.push(row(id, false, depth));
                 }
             }
-            LayoutEntry::Pinned(_) | LayoutEntry::FolderEnd => {}
+            LayoutEntry::Pinned(_) => {}
         }
     }
     out.extend(
         playlists
             .iter()
             .filter(|p| !listed.contains(p.id.as_str()))
-            .map(|p| row(p, false)),
+            .map(|p| row(&p.id, false, 0)),
     );
     out
 }
@@ -299,12 +333,15 @@ mod tests {
             .map(|row| match row {
                 PlaylistRow::Header { name, depth } => format!("header {name} {depth}"),
                 PlaylistRow::Playlist {
-                    playlist,
-                    pinned: true,
-                } => format!("pin {}", playlist.id),
-                PlaylistRow::Playlist { playlist, .. } => playlist.id.clone(),
+                    id, pinned: true, ..
+                } => format!("pin {id}"),
+                PlaylistRow::Playlist { id, .. } => id.clone(),
             })
             .collect()
+    }
+
+    fn build(store: &[Playlist], layout: &[LayoutEntry]) -> Vec<PlaylistRow> {
+        rows(store, layout, &Arc::new(RwLock::new(store.to_vec())))
     }
 
     fn folder(name: &str, depth: usize) -> LayoutEntry {
@@ -317,7 +354,7 @@ mod tests {
     #[test]
     fn no_layout_gives_the_flat_store_list() {
         let store = vec![p("p2"), p("p1")];
-        assert_eq!(describe(&rows(&store, &[])), vec!["p2", "p1"]);
+        assert_eq!(describe(&build(&store, &[])), vec!["p2", "p1"]);
     }
 
     #[test]
@@ -333,7 +370,7 @@ mod tests {
             LayoutEntry::FolderEnd,
             LayoutEntry::Playlist("p1".into()),
         ];
-        let r = rows(&store, &layout);
+        let r = build(&store, &layout);
         assert_eq!(describe(&r), vec!["pin p2", "header A 0", "p2", "p1"]);
     }
 
@@ -349,7 +386,7 @@ mod tests {
             LayoutEntry::FolderEnd,
         ];
         assert_eq!(
-            describe(&rows(&store, &layout)),
+            describe(&build(&store, &layout)),
             vec!["header A 0", "p1", "header B 1", "p2"]
         );
     }
@@ -358,7 +395,7 @@ mod tests {
     fn store_playlists_missing_from_the_layout_are_appended() {
         let store = vec![p("p3"), p("p1"), p("p2")];
         let layout = vec![LayoutEntry::Playlist("p1".into())];
-        assert_eq!(describe(&rows(&store, &layout)), vec!["p1", "p3", "p2"]);
+        assert_eq!(describe(&build(&store, &layout)), vec!["p1", "p3", "p2"]);
     }
 
     #[test]
@@ -369,7 +406,7 @@ mod tests {
             LayoutEntry::Playlist("gone".into()),
             LayoutEntry::Playlist("p1".into()),
         ];
-        assert_eq!(describe(&rows(&store, &layout)), vec!["p1"]);
+        assert_eq!(describe(&build(&store, &layout)), vec!["p1"]);
     }
 
     #[test]
@@ -382,15 +419,53 @@ mod tests {
         assert!(header.share_url().is_none());
         assert!(header.track().is_none());
         assert!(header.artists().is_none());
-        assert!(header.playlist().is_none());
+        assert!(header.playlist_id().is_none());
         assert!(!header.as_listitem().is_playable());
-        assert!(
-            PlaylistRow::Playlist {
-                playlist: p("p1"),
-                pinned: true,
-            }
-            .is_playable()
-        );
+    }
+
+    #[test]
+    fn playlist_rows_resolve_to_the_current_store_entry() {
+        let store: PlaylistStore = Arc::new(RwLock::new(vec![p("p1")]));
+        let r = rows(&store.read().unwrap().clone(), &[], &store);
+        assert!(r[0].is_playable());
+        let url = |r: &PlaylistRow| r.share_url().unwrap();
+        assert!(!url(&r[0]).contains("/user/o/"));
+        store.write().unwrap()[0].owner_id = "o".into();
+        assert!(url(&r[0]).contains("/user/o/"));
+        store.write().unwrap().clear();
+        assert!(!r[0].is_playable());
+        assert!(r[0].share_url().is_none());
+    }
+
+    #[test]
+    fn playlist_rows_carry_their_folder_depth() {
+        let store = vec![p("p1"), p("p2"), p("p3")];
+        let layout = vec![
+            folder("A", 0),
+            folder("B", 1),
+            LayoutEntry::Playlist("p1".into()),
+            LayoutEntry::FolderEnd,
+            LayoutEntry::Playlist("p2".into()),
+            LayoutEntry::FolderEnd,
+            LayoutEntry::Playlist("p3".into()),
+        ];
+        let depths: Vec<usize> = build(&store, &layout)
+            .iter()
+            .map(|row| match row {
+                PlaylistRow::Header { depth, .. } | PlaylistRow::Playlist { depth, .. } => *depth,
+            })
+            .collect();
+        assert_eq!(depths, vec![0, 1, 2, 1, 0]);
+    }
+
+    #[test]
+    fn a_pinned_playlist_outside_the_layout_is_not_appended_again() {
+        let store = vec![p("p1"), p("p2")];
+        let layout = vec![
+            LayoutEntry::Pinned("p2".into()),
+            LayoutEntry::Playlist("p1".into()),
+        ];
+        assert_eq!(describe(&build(&store, &layout)), vec!["pin p2", "p1"]);
     }
 
     #[test]
