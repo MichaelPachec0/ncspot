@@ -142,20 +142,8 @@ fn add_chunks<T>(new: &[T]) -> std::slice::Chunks<'_, T> {
     new.chunks(ADD_BATCH)
 }
 
-/// Bring `playlist` up to date with the server when stale; returns the base revision.
-#[expect(
-    dead_code,
-    reason = "the pin commands that call this arrive in a later change"
-)]
-pub fn prepare(
-    api: &WebApi,
-    playlist: &mut Playlist,
-    known: &HashMap<String, Playable>,
-) -> Result<Vec<u8>, EditError> {
-    Ok(prepare_head(api, playlist, known)?.revision)
-}
-
-/// Like [prepare], returning the whole head (its length is the base for the expected one).
+/// Bring `playlist` up to date with the server when stale; returns the head the write is
+/// based on (its revision is the POST base, its length the base for the expected one).
 fn prepare_head(
     api: &WebApi,
     playlist: &mut Playlist,
