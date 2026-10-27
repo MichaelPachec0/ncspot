@@ -47,7 +47,7 @@ mod spotify;
 mod spotify_api;
 mod spotify_url;
 mod spotify_worker;
-#[cfg(feature = "harness")]
+#[cfg(any(test, feature = "harness"))]
 mod test_playlists;
 mod theme;
 mod traits;

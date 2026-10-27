@@ -379,6 +379,18 @@ class PlaylistsScenarioTest(unittest.TestCase):
             with self.assertRaises(drive.Fail, msg=last_len):
                 self.run_with(drive.sc_playlist_write, last_len=last_len)
 
+    def test_playlist_write_throttled_is_blocked(self):
+        original = self.d
+
+        def throttled(**kw):
+            d = original(**kw)
+            d["throttled"] = {"internal": True}
+            return d
+
+        self.d = throttled
+        with self.assertRaises(drive.Blocked):
+            self.run_with(drive.sc_playlist_write, error="boom")
+
     def test_playlist_write_error_fails(self):
         with self.assertRaises(drive.Fail):
             self.run_with(drive.sc_playlist_write, error="boom")

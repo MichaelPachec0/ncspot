@@ -302,34 +302,6 @@ fn collection_write_saves_and_removes() {
     });
 }
 
-/// The test-playlists file, computed as the harness does (that module only exists with the
-/// `harness` feature): `NCSPOT_TEST_PLAYLISTS_FILE`, else `test-playlists.txt` in the cache dir.
-fn test_playlists_file() -> std::path::PathBuf {
-    match std::env::var_os("NCSPOT_TEST_PLAYLISTS_FILE") {
-        Some(path) if !path.is_empty() => path.into(),
-        _ => crate::config::cache_path("test-playlists.txt"),
-    }
-}
-
-/// Record `uri` as a line of the test-playlists file; returns the number of lines before it.
-fn record_test_playlist(uri: &str) -> usize {
-    use std::io::Write;
-    let path = test_playlists_file();
-    let before = std::fs::read_to_string(&path).unwrap_or_default();
-    let count = before.lines().filter(|l| !l.trim().is_empty()).count();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .expect("open the test-playlists file");
-    if before.as_bytes().last().is_some_and(|b| *b != b'\n') {
-        file.write_all(b"\n").unwrap();
-    }
-    writeln!(file, "{uri}").unwrap();
-    file.sync_all().unwrap();
-    count
-}
-
 #[test]
 #[ignore = "needs cached librespot credentials and network; creates a test playlist (never deleted)"]
 fn playlist_write_round_trip() {
@@ -348,17 +320,25 @@ fn playlist_write_round_trip() {
 
     with_session(|rt, s| {
         // Create and record at once: the playlist is never deleted by a test.
+        let path = crate::test_playlists::file_path();
+        let k = crate::test_playlists::read(&path)
+            .expect("read the test-playlists file")
+            .len()
+            + 1;
         sleep(spacing);
         let created = rt
-            .block_on(write::create(s.clone(), "ncspot-test-pending".into()))
+            .block_on(write::create(s.clone(), format!("ncspot-test-{k}")))
+            .map_err(|e| e.class())
             .expect("create");
-        let k = record_test_playlist(&format!("spotify:playlist:{}", created.id)) + 1;
+        crate::test_playlists::append(&path, &format!("spotify:playlist:{}", created.id))
+            .expect("record the test playlist");
         println!("created ncspot-test-{k}, recorded");
         let id = created.id.clone();
 
         // Rootlist add, with the head read before and after.
         let before = rt
             .block_on(playlist::rootlist_head(s.clone()))
+            .map_err(|e| e.class())
             .expect("rootlist head");
         let has_revision = before.revision.is_some();
         let has_length = before.length.is_some();
@@ -368,6 +348,7 @@ fn playlist_write_round_trip() {
             _ => {
                 let full = rt
                     .block_on(playlist::rootlist(s.clone()))
+                    .map_err(|e| e.class())
                     .expect("rootlist");
                 (full.revision, full.length)
             }
@@ -380,14 +361,17 @@ fn playlist_write_round_trip() {
                 vec![write::rootlist_add_op(&format!("spotify:playlist:{id}"))],
             ),
         ))
+        .map_err(|e| e.class())
         .expect("rootlist add");
         let after = rt
             .block_on(playlist::rootlist_head(s.clone()))
+            .map_err(|e| e.class())
             .expect("rootlist head after");
         let after_len = match after.length {
             Some(len) => len,
             None => {
                 rt.block_on(playlist::rootlist(s.clone()))
+                    .map_err(|e| e.class())
                     .expect("rootlist")
                     .length
             }
@@ -397,6 +381,7 @@ fn playlist_write_round_trip() {
 
         let head = |rt: &tokio::runtime::Runtime| -> Head {
             rt.block_on(playlist::head(s.clone(), id.clone()))
+                .map_err(|e| e.class())
                 .expect("head")
         };
         let post = |rt: &tokio::runtime::Runtime, head: &Head, ops| {
@@ -406,6 +391,7 @@ fn playlist_write_round_trip() {
                 id.clone(),
                 write::list_changes(head.revision.clone(), ops),
             ))
+            .map_err(|e| e.class())
             .expect("changes");
         };
 
@@ -427,6 +413,7 @@ fn playlist_write_round_trip() {
         assert_eq!(h.length, 2, "two tracks after the remove");
         let items = rt
             .block_on(playlist::contents(s.clone(), id.clone()))
+            .map_err(|e| e.class())
             .expect("contents");
         let a_left = items.iter().filter(|i| i.uri == TRACKS[0]).count();
         assert_eq!(a_left, 1, "exactly one copy of A is left");

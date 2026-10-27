@@ -692,12 +692,13 @@ def sc_playlist_write(inst, args):
     inst.base_dump = d
     inst.send("harness newplaylist-test")
     d = inst.wait_settled(args.settle_timeout)
+    blocked_if_throttled(d, ["internal"])
     expect(d.get("error") is None, "create without error", d.get("error"))
     for cmd in ("harness playlist-add-test 2", "harness playlist-remove-test 0", "harness playlist-overwrite-test 3"):
         inst.send(cmd)
         d = inst.wait_settled(args.settle_timeout)
+        blocked_if_throttled(d, ["internal"])
         expect(d.get("error") is None, f"{cmd}: no error", d.get("error"))
-    blocked_if_throttled(d, ["internal"])
     m = area_delta(inst, d, "playlists")
     expect(m["fallback"] == 0, "no playlists fallback", m)
     expect(not d["areas"]["playlists"]["latched"], "area not latched", d["areas"]["playlists"])
