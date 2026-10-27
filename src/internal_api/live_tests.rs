@@ -168,6 +168,52 @@ fn collection_sets_page_completely_and_accept_a_delta() {
     });
 }
 
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn playlist_rootlist_and_contents_load() {
+    use super::collection;
+    use super::playlist::{self, RootEntry};
+    with_session(|rt, session| {
+        let list = rt
+            .block_on(playlist::rootlist(session.clone()))
+            .expect("rootlist");
+        let playlists: Vec<_> = list
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                RootEntry::Playlist(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        println!(
+            "rootlist: {} playlists, {} entries, {} pages",
+            playlists.len(),
+            list.entries.len(),
+            list.pages
+        );
+        assert!(!playlists.is_empty(), "at least one playlist");
+        let username = session.username();
+        let owned = playlists.iter().find(|p| p.owner_id == username);
+        let spotify = playlists.iter().find(|p| p.owner_id == "spotify");
+        for (label, found) in [("owned", owned), ("spotify-owned", spotify)] {
+            match found {
+                Some(p) => {
+                    let items = rt
+                        .block_on(playlist::contents(session.clone(), p.id.clone()))
+                        .expect("contents");
+                    println!("{label}: {} items", items.len());
+                    assert!(!items.is_empty(), "{label}: items");
+                }
+                None => println!("{label}: none in the rootlist"),
+            }
+        }
+        let pins = rt
+            .block_on(collection::page(session.clone(), "ylpin", String::new()))
+            .expect("ylpin page");
+        println!("ylpin: page ok ({} items)", pins.items.len());
+    });
+}
+
 /// Save `uri` to `set`, see it in a delta, remove it, see the removal. Skips (and never
 /// removes) an item already in the set. Prints only the set name and the outcome.
 fn write_round_trip(

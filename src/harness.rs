@@ -84,8 +84,17 @@ pub struct Dump {
     pub throttled: Throttled,
     /// Whether the first library sync finished.
     pub library_done: bool,
+    pub playlists: PlaylistCounts,
     pub player: PlayerState,
     pub session: SessionState,
+}
+
+/// How many playlists the library holds and how many of them the Playlists tab layout lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct PlaylistCounts {
+    pub stored: usize,
+    /// Number of `LayoutEntry::Playlist` entries.
+    pub layout: usize,
 }
 
 /// What the player is doing.
@@ -112,6 +121,7 @@ pub fn build_dump(
     error: Option<String>,
     spotify: &Spotify,
     library_done: bool,
+    playlists: PlaylistCounts,
 ) -> Dump {
     let api = &spotify.api;
     let limited = api.rate_limit_status();
@@ -143,6 +153,7 @@ pub fn build_dump(
             internal: throttled(ClientLabel::Internal),
         },
         library_done,
+        playlists,
         player: PlayerState {
             status: match spotify.get_current_status() {
                 PlayerEvent::Playing(_) => "playing",
@@ -405,6 +416,10 @@ mod tests {
                 internal: false,
             },
             library_done: true,
+            playlists: PlaylistCounts {
+                stored: 9,
+                layout: 8,
+            },
             player: PlayerState {
                 status: "playing".into(),
                 position_ms: 1200,
@@ -421,7 +436,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1}}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1}}"#
         );
     }
 
@@ -448,13 +463,25 @@ mod tests {
     fn build_dump_reads_the_counters_and_bumps_seq() {
         let cfg = crate::config::Config::new_for_test();
         let spotify = Spotify::new_for_test(cfg, crate::events::EventManager::new_for_test());
-        let first = build_dump("x".into(), None, Some("boom".into()), &spotify, false);
-        let second = build_dump("x".into(), None, None, &spotify, false);
+        let counts = PlaylistCounts {
+            stored: 3,
+            layout: 2,
+        };
+        let first = build_dump(
+            "x".into(),
+            None,
+            Some("boom".into()),
+            &spotify,
+            false,
+            counts,
+        );
+        let second = build_dump("x".into(), None, None, &spotify, false, counts);
         assert!(!first.session.valid);
         assert_eq!(first.session.reconnects, 0);
         assert_eq!(first.player.status, "stopped");
         assert!(second.seq > first.seq);
         assert_eq!(first.error.as_deref(), Some("boom"));
+        assert_eq!(first.playlists, counts);
         assert_eq!(first.view, None);
         assert!(first.tabs.is_empty());
         assert_eq!(first.web, WebCalls::default());

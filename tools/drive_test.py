@@ -263,5 +263,67 @@ class LibraryWriteTest(unittest.TestCase):
         self.assertIn(f"harness unsave {self.URIS[1]}", sent)
 
 
+class PlaylistsScenarioTest(unittest.TestCase):
+    @staticmethod
+    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False):
+        return {
+            "areas": {
+                "playlists": {"internal_ok": 0 if base else 4, "fallback": fallback, "latched": latched}
+            },
+            "web": {"shared": 0, "personal": 0},
+            "throttled": {},
+            "playlists": {"stored": stored, "layout": layout},
+            "tabs": [{"name": "Playlists", "rows": rows}],
+        }
+
+    def run_with(self, func, **kw):
+        base = self.d(base=True)
+        dump = self.d(**kw)
+
+        class Inst:
+            base_dump = base
+
+            def send(self, cmd):
+                pass
+
+            def wait_library(self, timeout, blocked_on=()):
+                return dump
+
+            def wait_settled(self, timeout):
+                return dump
+
+        class Args:
+            settle_timeout = 1
+
+        func(Inst(), Args())
+
+    def test_playlists_passes(self):
+        self.run_with(drive.sc_playlists)
+
+    def test_playlists_fallback_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlists, fallback=1)
+
+    def test_playlists_latched_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlists, latched=True)
+
+    def test_playlists_missing_layout_or_unstored_fails(self):
+        for kw in [{"layout": 0}, {"stored": 5, "layout": 8}]:
+            with self.assertRaises(drive.Fail, msg=kw):
+                self.run_with(drive.sc_playlists, **kw)
+
+    def test_area_off_passes(self):
+        self.run_with(drive.sc_playlists_area_off)
+
+    def test_area_off_stale_count_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlists_area_off, stored=4, rows=4)
+
+    def test_area_off_row_mismatch_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlists_area_off, rows=12)
+
+
 if __name__ == "__main__":
     unittest.main()
