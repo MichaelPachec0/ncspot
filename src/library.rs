@@ -26,7 +26,9 @@ use crate::library_collection::{
     Membership, Mode, fetch_membership, merge_followed, plan_sync, rebuild, sort_albums,
     sort_newest_first, with_artist,
 };
-use crate::library_sync::{SavedItem, SavedPage, Synced, full_fetch_due, sync_liked, sync_saved};
+use crate::library_sync::{
+    SavedItem, SavedPage, Synced, any_added_at_missing, full_fetch_due, sync_liked, sync_saved,
+};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
 use crate::model::episode::Episode;
@@ -1208,15 +1210,20 @@ impl Library {
     /// Fetch the saved albums from the web API and store them in the local library, unless they
     /// are unchanged. On a failed page the stored albums stay as they were.
     fn fetch_albums(&self) -> Fetch {
-        let stored_ids: Vec<Option<String>> = self
-            .albums
-            .read()
-            .unwrap()
-            .iter()
-            .map(|album| album.id.clone())
-            .collect();
+        let (stored_ids, incomplete) = {
+            let albums = self.albums.read().unwrap();
+            (
+                albums
+                    .iter()
+                    .map(|album| album.id.clone())
+                    .collect::<Vec<_>>(),
+                // An album saved in ncspot has no `added_at` and no API data (its tracks);
+                // download the list once so it gets them.
+                any_added_at_missing(albums.iter().map(|album| album.added_at)),
+            )
+        };
         let (now, force_full) = self.full_fetch_check(FULL_FETCH_ALBUMS, "albums");
-        let synced = sync_saved(&stored_ids, force_full, |offset| {
+        let synced = sync_saved(&stored_ids, force_full || incomplete, |offset| {
             debug!("albums page at offset {offset}");
             let page = self
                 .spotify
