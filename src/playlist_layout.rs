@@ -118,6 +118,26 @@ impl PlaylistRow {
         }
     }
 
+    /// `f` on a copy of the store entry without its tracks (`num_tracks` set to the loaded
+    /// count), run after the store guard is dropped. Every call that takes the `Library`
+    /// goes through here or [Self::snapshot]: the library takes the store lock itself, and a
+    /// second read lock on the writer-preferring store lock can deadlock behind a waiting
+    /// writer.
+    fn outside_store<R>(&self, f: impl FnOnce(&Playlist) -> R) -> Option<R> {
+        let summary = self.with(|p| Playlist {
+            id: p.id.clone(),
+            name: p.name.clone(),
+            owner_id: p.owner_id.clone(),
+            owner_name: p.owner_name.clone(),
+            snapshot_id: p.snapshot_id.clone(),
+            num_tracks: p.tracks.as_ref().map_or(p.num_tracks, Vec::len),
+            tracks: None,
+            collaborative: p.collaborative,
+            cover_url: p.cover_url.clone(),
+        })?;
+        Some(f(&summary))
+    }
+
     /// A copy of the store entry, for calls into the library that take the store locks
     /// themselves (save, delete, follow).
     fn snapshot(&self) -> Option<Playlist> {
@@ -135,14 +155,17 @@ impl ListItem for PlaylistRow {
             Self::Header { name, depth } => format!("{}{name}/", "  ".repeat(*depth)),
             Self::Playlist { pinned, depth, .. } => {
                 let marker = if *pinned { "* " } else { "" };
-                let name = self.with(|p| p.display_left(library)).unwrap_or_default();
+                let name = self
+                    .outside_store(|p| p.display_left(library))
+                    .unwrap_or_default();
                 format!("{}{marker}{name}", "  ".repeat(*depth))
             }
         }
     }
 
     fn display_right(&self, library: &Library) -> String {
-        self.with(|p| p.display_right(library)).unwrap_or_default()
+        self.outside_store(|p| p.display_right(library))
+            .unwrap_or_default()
     }
 
     fn play(&mut self, queue: &Queue) {
@@ -204,7 +227,7 @@ impl ListItem for PlaylistRow {
     }
 
     fn is_saved(&self, library: &Library) -> Option<bool> {
-        self.with(|p| p.is_saved(library)).flatten()
+        self.outside_store(|p| p.is_saved(library)).flatten()
     }
 
     fn is_playable(&self) -> bool {
@@ -435,6 +458,22 @@ mod tests {
         store.write().unwrap().clear();
         assert!(!r[0].is_playable());
         assert!(r[0].share_url().is_none());
+    }
+
+    #[test]
+    fn library_calls_run_outside_the_store_guard() {
+        let mut loaded = p("p1");
+        loaded.num_tracks = 9;
+        loaded.tracks = Some(vec![crate::playlist_items::placeholder("spotify:track:a")]);
+        let store: PlaylistStore = Arc::new(RwLock::new(vec![loaded]));
+        let r = rows(&store.read().unwrap().clone(), &[], &store);
+        let seen = r[0].outside_store(|p| {
+            assert!(store.try_write().is_ok(), "the store guard is dropped");
+            (p.id.clone(), p.num_tracks, p.tracks.is_none())
+        });
+        assert_eq!(seen, Some(("p1".to_string(), 1, true)));
+        store.write().unwrap().clear();
+        assert_eq!(r[0].outside_store(|_| ()), None);
     }
 
     #[test]
