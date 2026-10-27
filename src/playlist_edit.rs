@@ -13,8 +13,9 @@ use std::time::Instant;
 use librespot_protocol::playlist4_external::Op;
 use log::{debug, warn};
 
+use crate::internal_api::Area;
 use crate::internal_api::error::InternalError;
-use crate::internal_api::playlist::{Head, RootEntry, Rootlist, base64_encode};
+use crate::internal_api::playlist::{Head, RootEntry, RootHead, Rootlist, base64_encode};
 use crate::internal_api::playlist_write::{
     ADD_BATCH, Created, OVERWRITE_ATOMIC_MAX, add_op, list_changes, overwrite_ops, remove_at_op,
     rootlist_add_op, rootlist_remove_op,
@@ -68,6 +69,16 @@ pub enum EditError {
 }
 
 impl EditError {
+    /// A fixed name of the failure class, for log lines (error texts may carry endpoint paths).
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::Internal(err) => err.class(),
+            Self::Unverified(_) => "unverified",
+            Self::Moved => "moved",
+            Self::Mismatch => "mismatch",
+        }
+    }
+
     /// The status note for a failure that is not a plain API error.
     pub fn note(&self) -> Option<&'static str> {
         match self {
@@ -353,22 +364,43 @@ fn root_base(rootlist: &Rootlist) -> Result<RootBase, InternalError> {
     })
 }
 
-/// The base from the rootlist head; when the head carries no revision, from a full rootlist
-/// read instead.
+/// The base a rootlist head gives: only when it carries both a revision and a length.
+fn head_base(head: RootHead) -> Option<RootBase> {
+    Some(RootBase {
+        revision: head.revision?,
+        length: head.length?,
+    })
+}
+
+/// The base from the rootlist head; when the head lacks its revision or its length, from a
+/// full rootlist read instead.
 fn rootlist_base(api: &WebApi) -> Result<RootBase, InternalError> {
-    let head = api.rootlist_head()?;
-    if !head.revision.is_empty() {
-        return Ok(RootBase {
-            revision: head.revision,
-            length: head.length,
-        });
+    if let Some(base) = head_base(api.rootlist_head()?) {
+        return Ok(base);
     }
-    debug!("rootlist head without a revision, reading the whole rootlist for the base");
+    debug!("rootlist head without a revision or length, reading the whole rootlist for the base");
     root_base(&api.playlist_rootlist()?)
 }
 
-/// POST `op` against the rootlist `base`, then confirm the rootlist head length is
-/// `expected_len`. Every error here comes after the POST was sent ([EditError::Unverified]).
+/// The verify rule for a rootlist write: the head after it carries a length and it is
+/// `expected_len`. A head without a length proves nothing ([EditError::Unverified]).
+fn rootlist_verify(after: &RootHead, expected_len: usize) -> Result<(), EditError> {
+    match after.length {
+        Some(length) if length == expected_len => Ok(()),
+        Some(length) => {
+            warn!(
+                "Rootlist write did not verify: length {length} after it, {expected_len} expected"
+            );
+            Err(EditError::Mismatch)
+        }
+        None => Err(EditError::Unverified(InternalError::Transient(
+            "rootlist head without a length".into(),
+        ))),
+    }
+}
+
+/// POST `op` against the rootlist `base`, then confirm it with [rootlist_verify]. Every error
+/// here comes after the POST was sent ([EditError::Unverified]).
 fn send_rootlist_verified(
     api: &WebApi,
     base: RootBase,
@@ -378,21 +410,47 @@ fn send_rootlist_verified(
     api.rootlist_changes(list_changes(base.revision, vec![op]))
         .map_err(EditError::Unverified)?;
     let after = api.rootlist_head().map_err(EditError::Unverified)?;
-    if after.length == expected_len {
-        return Ok(());
-    }
-    warn!(
-        "Rootlist write did not verify: length {} after it, {expected_len} expected",
-        after.length
-    );
-    Err(EditError::Mismatch)
+    rootlist_verify(&after, expected_len)
+}
+
+/// Add `spotify:playlist:<id>` on top of `base`, verified.
+fn rootlist_add_on(api: &WebApi, base: RootBase, id: &str) -> Result<(), EditError> {
+    let expected = expected_len(base.length, Change::Add(1)).unwrap_or_default();
+    send_rootlist_verified(api, base, rootlist_add_op(&playlist_uri(id)), expected)
 }
 
 /// Add `spotify:playlist:<id>` at the top of the rootlist, verified.
 fn rootlist_add(api: &WebApi, id: &str) -> Result<(), EditError> {
-    let base = rootlist_base(api)?;
-    let expected = expected_len(base.length, Change::Add(1)).unwrap_or_default();
-    send_rootlist_verified(api, base, rootlist_add_op(&playlist_uri(id)), expected)
+    rootlist_add_on(api, rootlist_base(api)?, id)
+}
+
+/// The second rootlist add of a create: a full rootlist read first, so an earlier add that
+/// applied without being confirmed is not repeated; the read is also the base.
+fn rootlist_add_again(api: &WebApi, id: &str) -> Result<(), EditError> {
+    let rootlist = api.playlist_rootlist()?;
+    if rootlist_index(&rootlist, id).is_some() {
+        debug!("the new playlist is in the rootlist already");
+        return Ok(());
+    }
+    rootlist_add_on(api, root_base(&rootlist)?, id)
+}
+
+/// The class of a failed create POST. A protocol change there may be a 2xx reply that does not
+/// parse, so the playlist may exist: [EditError::Unverified], never a Web create (the caller
+/// latches the area). Other classes keep their meaning: a refusal (not found, denied) may use
+/// the Web API once, a transient error or rate limit fails.
+fn create_error(err: InternalError) -> EditError {
+    match err {
+        InternalError::ProtocolChanged(_) => EditError::Unverified(err),
+        err => EditError::Internal(err),
+    }
+}
+
+/// Latch the playlists area on a protocol change found before a rootlist POST.
+fn latch_on_protocol_change(api: &WebApi, err: &EditError) {
+    if let EditError::Internal(err @ InternalError::ProtocolChanged(_)) = err {
+        api.latch_area(Area::Playlists, err);
+    }
 }
 
 /// The stored copy of a playlist just created: empty, owned by `owner`, at the create
@@ -427,17 +485,31 @@ fn after_create(err: EditError) -> EditError {
 pub fn create(api: &WebApi, name: &str) -> Result<Playlist, EditError> {
     let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
     spaced(&mut spacer);
-    let created = api.playlist_create(name)?;
+    let created = api.playlist_create(name).map_err(|err| {
+        if let InternalError::ProtocolChanged(_) = err {
+            api.latch_area(Area::Playlists, &err);
+        }
+        create_error(err)
+    })?;
     let playlist = created_playlist(&created, name, api.user_id());
     spaced(&mut spacer);
     let added = rootlist_add(api, &created.id)
         .or_else(|err| {
-            warn!("Could not add the new playlist to the rootlist ({err:?}), trying again");
+            latch_on_protocol_change(api, &err);
+            warn!(
+                "Could not add the new playlist to the rootlist ({}), trying again",
+                err.class()
+            );
             spaced(&mut spacer);
-            rootlist_add(api, &created.id)
+            rootlist_add_again(api, &created.id)
         })
         .or_else(|err| {
-            warn!("Could not add the new playlist to the rootlist ({err:?}), following it");
+            latch_on_protocol_change(api, &err);
+            warn!(
+                "Could not add the new playlist to the rootlist ({}), following it over the Web API",
+                err.class()
+            );
+            api.count_fallback(Area::Playlists);
             api.user_playlist_follow_playlist(&created.id)
                 .map_err(|()| err)
         });
@@ -731,6 +803,65 @@ mod tests {
         assert_eq!(playlist.name, "ncspot-test-1");
         assert_eq!(playlist.num_tracks, 0);
         assert_eq!(playlist.tracks.as_deref().map(<[Playable]>::len), Some(0));
+    }
+
+    #[test]
+    fn a_protocol_change_on_create_never_creates_again() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        let class = |err| decide_after(&InternalError::from(create_error(err)));
+        assert_eq!(
+            class(InternalError::ProtocolChanged("reply".into())),
+            Action::Fail
+        );
+        assert_eq!(class(InternalError::NotFound), Action::WebOnce);
+        assert_eq!(class(InternalError::Denied), Action::WebOnce);
+        assert_eq!(class(InternalError::NoSession), Action::WebOnce);
+        assert_eq!(
+            class(InternalError::Transient("timeout".into())),
+            Action::Fail
+        );
+        assert_eq!(class(InternalError::RateLimited), Action::Fail);
+    }
+
+    #[test]
+    fn a_rootlist_head_is_a_base_only_with_revision_and_length() {
+        let head = |revision: Option<&[u8]>, length| RootHead {
+            revision: revision.map(<[u8]>::to_vec),
+            length,
+        };
+        let base = head_base(head(Some(b"r"), Some(4))).expect("both fields");
+        assert_eq!((base.revision, base.length), (b"r".to_vec(), 4));
+        assert!(head_base(head(None, Some(4))).is_none());
+        assert!(head_base(head(Some(b"r"), None)).is_none());
+    }
+
+    #[test]
+    fn a_rootlist_head_without_length_does_not_verify_or_mismatch() {
+        let after = |length| RootHead {
+            revision: Some(b"r".to_vec()),
+            length,
+        };
+        assert!(rootlist_verify(&after(Some(5)), 5).is_ok());
+        assert!(matches!(
+            rootlist_verify(&after(Some(4)), 5),
+            Err(EditError::Mismatch)
+        ));
+        assert!(matches!(
+            rootlist_verify(&after(None), 0),
+            Err(EditError::Unverified(_))
+        ));
+    }
+
+    #[test]
+    fn error_classes_log_fixed_names() {
+        assert_eq!(
+            EditError::Internal(InternalError::Transient("/user/x".into())).class(),
+            "transient"
+        );
+        assert_eq!(
+            EditError::Unverified(InternalError::Transient("/user/x".into())).class(),
+            "unverified"
+        );
     }
 
     #[test]

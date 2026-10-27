@@ -68,6 +68,14 @@ pub struct Head {
     pub name: Option<String>,
 }
 
+/// The rootlist head: each field only when the reply carried it (a missing length is not 0).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RootHead {
+    /// Non-empty when present.
+    pub revision: Option<Vec<u8>>,
+    pub length: Option<usize>,
+}
+
 /// One item of a playlist.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistItem {
@@ -228,6 +236,14 @@ pub fn parse_head(content: &SelectedListContent) -> Head {
     }
 }
 
+/// The rootlist head fields of a reply, without defaults for missing ones.
+pub fn parse_root_head(content: &SelectedListContent) -> RootHead {
+    RootHead {
+        revision: content.revision.clone().filter(|r| !r.is_empty()),
+        length: content.length.and_then(|n| usize::try_from(n).ok()),
+    }
+}
+
 fn parse(bytes: &[u8]) -> Result<SelectedListContent, InternalError> {
     SelectedListContent::parse_from_bytes(bytes)
         .map_err(|e| InternalError::ProtocolChanged(format!("playlist parse: {e}")))
@@ -277,14 +293,14 @@ pub async fn head(session: Session, id: String) -> Result<Head, InternalError> {
 }
 
 /// The rootlist revision and length, without entries.
-pub async fn rootlist_head(session: Session) -> Result<Head, InternalError> {
+pub async fn rootlist_head(session: Session) -> Result<RootHead, InternalError> {
     debug!("rootlist head");
     let bytes = session
         .spclient()
         .get_rootlist(0, Some(0))
         .await
         .map_err(|e| classify(&e))?;
-    Ok(parse_head(&parse(&bytes)?))
+    Ok(parse_root_head(&parse(&bytes)?))
 }
 
 #[cfg(test)]
@@ -562,6 +578,38 @@ mod tests {
         assert_eq!(head.snapshot_id, "cmV2MQ==");
         assert_eq!(head.length, 5272);
         assert_eq!(head.name.as_deref(), Some("ncspot-test-1"));
+    }
+
+    #[test]
+    fn root_head_keeps_missing_fields_missing() {
+        assert_eq!(
+            parse_root_head(&SelectedListContent::default()),
+            RootHead::default()
+        );
+        let empty_revision = SelectedListContent {
+            revision: Some(Vec::new()),
+            length: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_root_head(&empty_revision),
+            RootHead {
+                revision: None,
+                length: Some(0)
+            }
+        );
+        let full = SelectedListContent {
+            revision: Some(b"r".to_vec()),
+            length: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_root_head(&full),
+            RootHead {
+                revision: Some(b"r".to_vec()),
+                length: Some(7)
+            }
+        );
     }
 
     #[test]
