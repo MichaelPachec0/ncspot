@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::error::Error;
 use std::path::Path;
 use std::rc::Rc;
@@ -16,6 +17,7 @@ use crate::config::{Config, PlaybackState};
 use crate::events::{Event, EventManager};
 use crate::ext_traits::CursiveExt;
 use crate::library::Library;
+use crate::log_redact::redact_secrets;
 use crate::queue::Queue;
 use crate::spotify::{PlayerEvent, Spotify};
 use crate::ui::create_cursive;
@@ -28,17 +30,25 @@ use crate::mpris::MprisManager;
 #[cfg(unix)]
 use crate::ipc::{self, IpcSocket};
 
-/// Set up the global logger to log to `filename`.
-pub fn setup_logging(filename: &Path) -> Result<(), fern::InitError> {
+/// Set up the global logger to log to `filename`. Tokens are redacted from every line unless
+/// `log_secrets` is set.
+pub fn setup_logging(filename: &Path, log_secrets: bool) -> Result<(), fern::InitError> {
     fern::Dispatch::new()
-        // Perform allocation-free log formatting
-        .format(|out, message, record| {
-            out.finish(format_args!(
+        .format(move |out, message, record| {
+            let line = format!(
                 "{} [{}] [{}] {}",
                 chrono::Local::now().format("[%Y-%m-%d][%H:%M:%S]"),
                 record.target(),
                 record.level(),
                 message
+            );
+            out.finish(format_args!(
+                "{}",
+                if log_secrets {
+                    Cow::Borrowed(line.as_str())
+                } else {
+                    redact_secrets(&line)
+                }
             ))
         })
         // Add blanket level filter -
@@ -49,6 +59,9 @@ pub fn setup_logging(filename: &Path) -> Result<(), fern::InitError> {
         .chain(fern::log_file(filename)?)
         // Apply globally
         .apply()?;
+    if log_secrets {
+        log::warn!("--log-secrets: tokens are written to this log unredacted");
+    }
     Ok(())
 }
 

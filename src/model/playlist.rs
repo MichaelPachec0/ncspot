@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::{cmp::Ordering, iter::Iterator};
 
@@ -8,6 +8,8 @@ use log::{debug, warn};
 use rspotify::model::Id;
 use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 
+use crate::internal_api::Area;
+use crate::internal_api::fallback::{Action, decide_after, run_with_fallback};
 use crate::model::playable::Playable;
 use crate::model::track::Track;
 use crate::queue::Queue;
@@ -39,8 +41,33 @@ impl Playlist {
             return true;
         }
 
-        self.tracks = self.get_all_tracks(spotify);
+        self.tracks = self.load_all_tracks(spotify);
         self.tracks.is_some()
+    }
+
+    /// The internal API first when the playlists area is usable, then the Web API per the
+    /// fallback classes (rate limits and transient errors fail without a Web call).
+    fn load_all_tracks(&self, spotify: &Spotify) -> Option<Vec<Playable>> {
+        let api = &spotify.api;
+        let skip = !api.internal_usable(Area::Playlists);
+        run_with_fallback(
+            skip,
+            || {
+                api.playlist_playables(&self.id, &HashMap::new())
+                    .inspect_err(|err| {
+                        if decide_after(err) == Action::Fail {
+                            warn!("Could not load a playlist: {err}");
+                        }
+                    })
+            },
+            || {
+                if !skip {
+                    api.count_fallback(Area::Playlists);
+                }
+                self.get_all_tracks(spotify)
+            },
+            |err| api.latch_area(Area::Playlists, err),
+        )
     }
 
     fn get_all_tracks(&self, spotify: &Spotify) -> Option<Vec<Playable>> {

@@ -129,6 +129,8 @@ pub struct InternalApiAreas {
     pub metadata: Option<bool>,
     /// Liked songs, saved albums, followed artists, saved shows, Your Episodes.
     pub library: Option<bool>,
+    /// The playlist list and playlist contents.
+    pub playlists: Option<bool>,
 }
 
 /// Configuration for the lyrics feature.

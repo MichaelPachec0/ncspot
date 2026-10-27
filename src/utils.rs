@@ -49,14 +49,39 @@ pub fn cache_path_for_url(url: String) -> std::path::PathBuf {
     path
 }
 
+/// Download `url` to `path`. An HTTP error status is an error, and the body is streamed into
+/// a `<path>.part` sibling that only replaces `path` once complete, so a failed download never
+/// leaves a file at `path` for the cache to keep. Errors do not carry the URL.
 pub fn download(url: String, path: std::path::PathBuf) -> Result<(), std::io::Error> {
-    let mut resp = reqwest::blocking::get(url).map_err(std::io::Error::other)?;
+    let mut resp = reqwest::blocking::get(url)
+        .and_then(reqwest::blocking::Response::error_for_status)
+        .map_err(|e| std::io::Error::other(e.without_url()))?;
 
     std::fs::create_dir_all(path.parent().unwrap())?;
-    let mut file = std::fs::File::create(path)?;
+    write_via_part(&path, |file| std::io::copy(&mut resp, file).map(|_| ()))
+}
 
-    std::io::copy(&mut resp, &mut file)?;
-    Ok(())
+/// The `<path>.part` sibling a download is written to before it is complete.
+fn part_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// Run `write` on a fresh `<path>.part` file and rename it to `path` when it succeeds; on any
+/// failure the part file is removed and `path` is left as it was.
+fn write_via_part(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    let part = part_path(path);
+    let result = std::fs::File::create(&part)
+        .and_then(|mut file| write(&mut file))
+        .and_then(|()| std::fs::rename(&part, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+    }
+    result
 }
 
 /// Create the application specific runtime directory and return the path to it.
@@ -114,4 +139,49 @@ pub fn user_runtime_directory() -> Option<PathBuf> {
 #[cfg(unix)]
 fn xdg_runtime_directory() -> Option<PathBuf> {
     std::env::var("XDG_RUNTIME_DIR").ok().map(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ncspot-utils-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn part_path_appends_to_the_file_name() {
+        assert_eq!(
+            part_path(std::path::Path::new("/c/covers/ab12")),
+            PathBuf::from("/c/covers/ab12.part")
+        );
+    }
+
+    #[test]
+    fn write_via_part_renames_a_complete_write() {
+        let dir = scratch("ok");
+        let path = dir.join("cover");
+        write_via_part(&path, |file| file.write_all(b"image")).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"image");
+        assert!(!part_path(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_via_part_leaves_nothing_behind_on_failure() {
+        let dir = scratch("fail");
+        let path = dir.join("cover");
+        let result = write_via_part(&path, |file| {
+            file.write_all(b"half")?;
+            Err(std::io::Error::other("connection reset"))
+        });
+        assert!(result.is_err());
+        assert!(!path.exists(), "a failed download is not cached");
+        assert!(!part_path(&path).exists(), "the part file is removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

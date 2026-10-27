@@ -29,6 +29,12 @@ pub fn program_arguments() -> clap::Command {
                 .help("Enable debug logging to the specified file"),
         )
         .arg(
+            clap::Arg::new("log-secrets")
+                .long("log-secrets")
+                .action(clap::ArgAction::SetTrue)
+                .help("With --debug, write tokens to the log unredacted"),
+        )
+        .arg(
             clap::Arg::new("basepath")
                 .short('b')
                 .long("basepath")

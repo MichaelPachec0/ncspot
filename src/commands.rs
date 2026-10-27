@@ -401,6 +401,19 @@ impl CommandManager {
                     error,
                     &self.spotify,
                     *self.library.is_done.read().unwrap(),
+                    crate::harness::PlaylistCounts {
+                        stored: self.library.playlists.read().unwrap().len(),
+                        layout: self
+                            .library
+                            .playlist_layout
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .filter(|e| {
+                                matches!(e, crate::playlist_layout::LayoutEntry::Playlist(_))
+                            })
+                            .count(),
+                    },
                 );
                 crate::harness::write_dump(std::path::Path::new(path), &dump).map_err(|e| {
                     error!("harness dump to {path} failed: {e}");

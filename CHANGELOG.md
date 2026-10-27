@@ -9,16 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Playlist folders and pinned playlists in the Playlists tab
 - Save episodes to Your Episodes from their context menu
 
 ### Changed
 
+- Playlists load over Spotify's internal API, including Spotify-owned playlists
 - Saving and removing tracks, albums, artists and shows goes through Spotify's internal API
+- Unchanged liked songs and saved albums no longer rewrite their cache files
 
 ### Fixed
 
+- Albums saved in ncspot are refreshed with their full data on the next library sync over the Web API
+- Playlist sync keeping only a few playlists after a rate limit
 - Playback dying on `:reconnect` an hour after logging in via the browser
 - Playback stopping when Spotify closes the connection
+- Debug logs containing Web API tokens; pass `--log-secrets` to keep them
 
 ## [1.5.0]
 

@@ -119,6 +119,15 @@ pub(crate) fn added_at_descending(dates: &[DateTime<Utc>]) -> bool {
     dates.windows(2).all(|pair| pair[0] >= pair[1])
 }
 
+/// Whether any stored item has no `added_at`. Such an item was saved inside ncspot and lacks
+/// the data of a fetched one, so the list must be downloaded again instead of being taken as
+/// unchanged from its first page.
+pub(crate) fn any_added_at_missing(
+    stored: impl IntoIterator<Item = Option<DateTime<Utc>>>,
+) -> bool {
+    stored.into_iter().any(|added_at| added_at.is_none())
+}
+
 /// Whether every fetched item has an `added_at` and they are newest first.
 fn ordered<T>(items: &[SavedItem<T>]) -> bool {
     let dates: Option<Vec<DateTime<Utc>>> = items.iter().map(|item| item.added_at).collect();
@@ -608,6 +617,37 @@ mod test {
         let calls = Cell::new(0);
         assert_eq!(
             sync_saved(&stored, false, source(&list, &calls)),
+            Synced::Unchanged
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn missing_added_at_is_detected() {
+        assert!(!any_added_at_missing([]));
+        assert!(!any_added_at_missing([Some(at(1)), Some(at(2))]));
+        assert!(any_added_at_missing([Some(at(1)), None]));
+    }
+
+    #[test]
+    fn saved_with_an_album_lacking_added_at_is_a_full_fetch() {
+        let ids = names("a", 120);
+        let list = remote(&ids);
+        let stored: Vec<Option<String>> = ids.iter().cloned().map(Some).collect();
+        // The same ids as the remote, one saved inside ncspot (no added_at): the caller
+        // passes that as `force_full`, so the first page is not taken as unchanged.
+        let incomplete = any_added_at_missing([Some(at(5)), None]);
+        let calls = Cell::new(0);
+        assert_eq!(
+            sync_saved(&stored, incomplete, source(&list, &calls)),
+            Synced::Full(ids)
+        );
+        assert_eq!(calls.get(), 3);
+        // Once every album has an added_at the shortcut applies again.
+        let complete = any_added_at_missing([Some(at(5)), Some(at(4))]);
+        let calls = Cell::new(0);
+        assert_eq!(
+            sync_saved(&stored, complete, source(&list, &calls)),
             Synced::Unchanged
         );
         assert_eq!(calls.get(), 1);

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -27,6 +28,7 @@ use crate::internal_api::AreaCounts;
 use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
 use crate::internal_api::metadata::Missing;
+use crate::internal_api::playlist::{self, PlaylistItem, Rootlist};
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -35,6 +37,7 @@ use crate::model::episode::Episode;
 use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::track::Track;
+use crate::playlist_items;
 use crate::rate_limit::{
     Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
@@ -315,12 +318,18 @@ impl WebApi {
         self.internal.settings().area_enabled(area)
     }
 
-    /// Every item of a collection set, page by page (each page is one internal call).
-    pub fn collection_page_all(&self, set: &'static str) -> Result<Listing, InternalError> {
+    /// Every item of a collection set, page by page (each page is one internal call in
+    /// `area`, so a set read for the playlists, such as the pins, follows the Playlists switch
+    /// and latch and counts there).
+    pub fn collection_page_all(
+        &self,
+        area: Area,
+        set: &'static str,
+    ) -> Result<Listing, InternalError> {
         let mut listing = Listing::default();
         let mut token = String::new();
         loop {
-            let page = self.run_internal(Area::Library, |session| {
+            let page = self.run_internal(area, |session| {
                 collection::page(session, set, token.clone())
             })?;
             match collection::absorb(&mut listing, page) {
@@ -328,6 +337,44 @@ impl WebApi {
                 None => return Ok(listing),
             }
         }
+    }
+
+    /// The whole rootlist (playlists and folder markers): one internal call per page.
+    pub fn playlist_rootlist(&self) -> Result<Rootlist, InternalError> {
+        self.run_internal(Area::Playlists, playlist::rootlist)
+    }
+
+    /// The items of one playlist, by base62 id.
+    pub fn playlist_contents(&self, id: &str) -> Result<Vec<PlaylistItem>, InternalError> {
+        let id = id.to_string();
+        self.run_internal(Area::Playlists, |session| {
+            playlist::contents(session, id.clone())
+        })
+    }
+
+    /// The items of one playlist as `Playable`s, in playlist order: metadata for URIs not in
+    /// `known` comes from the internal API (tracks and episodes in batches), local files are
+    /// decoded from their URI, and anything without metadata is an unplayable placeholder.
+    pub fn playlist_playables(
+        &self,
+        id: &str,
+        known: &HashMap<String, Playable>,
+    ) -> Result<Vec<Playable>, InternalError> {
+        let items = self.playlist_contents(id)?;
+        let wanted = playlist_items::unknown_uris(&items, known);
+        let (episodes, tracks): (Vec<String>, Vec<String>) = wanted
+            .into_iter()
+            .partition(|uri| uri.starts_with("spotify:episode:"));
+        let mut fetched = HashMap::new();
+        for track in self.tracks_in(Area::Playlists, &tracks)? {
+            fetched.insert(track.uri.clone(), Playable::Track(track));
+        }
+        for episode in self.episodes_in(Area::Playlists, &episodes)? {
+            fetched.insert(episode.uri.clone(), Playable::Episode(episode));
+        }
+        Ok(playlist_items::assemble(&items, |uri| {
+            fetched.get(uri).or_else(|| known.get(uri))
+        }))
     }
 
     pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
@@ -361,6 +408,7 @@ impl WebApi {
     /// longer has; with nothing left to ask for, no session is needed.
     fn library_items<M, T, Fut>(
         &self,
+        area: Area,
         uris: &[String],
         fetch: impl Fn(Session, Vec<SpotifyUri>) -> Fut,
     ) -> Result<Vec<T>, InternalError>
@@ -374,34 +422,42 @@ impl WebApi {
         }
         let uris = parse_uris(uris);
         in_batches(&uris, metadata::BATCH_SIZE, |batch| {
-            self.run_internal(Area::Library, |session| fetch(session, batch.clone()))
+            self.run_internal(area, |session| fetch(session, batch.clone()))
                 .map(|items| items.iter().map(T::from).collect())
         })
     }
 
     pub fn library_tracks(&self, uris: &[String]) -> Result<Vec<Track>, InternalError> {
-        self.library_items(uris, metadata::tracks_by_uri)
+        self.tracks_in(Area::Library, uris)
+    }
+
+    fn tracks_in(&self, area: Area, uris: &[String]) -> Result<Vec<Track>, InternalError> {
+        self.library_items(area, uris, metadata::tracks_by_uri)
     }
 
     pub fn library_albums(&self, uris: &[String]) -> Result<Vec<Album>, InternalError> {
-        self.library_items(uris, |session, uris| {
+        self.library_items(Area::Library, uris, |session, uris| {
             metadata::albums_by_uri(session, uris, Missing::Skip)
         })
     }
 
     pub fn library_artists(&self, uris: &[String]) -> Result<Vec<Artist>, InternalError> {
-        self.library_items(uris, metadata::artists_by_uri)
+        self.library_items(Area::Library, uris, metadata::artists_by_uri)
     }
 
     pub fn library_shows(
         &self,
         uris: &[String],
     ) -> Result<Vec<crate::model::show::Show>, InternalError> {
-        self.library_items(uris, metadata::shows_by_uri)
+        self.library_items(Area::Library, uris, metadata::shows_by_uri)
     }
 
     pub fn library_episodes(&self, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
-        self.library_items(uris, |session, uris| {
+        self.episodes_in(Area::Library, uris)
+    }
+
+    fn episodes_in(&self, area: Area, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
+        self.library_items(area, uris, |session, uris| {
             metadata::episodes_by_uri(session, uris, Missing::Skip)
         })
     }
@@ -1474,6 +1530,49 @@ mod test {
             Err(InternalError::NoSession)
         );
         assert_eq!(api.collection_write("collection", &[], true), Ok(()));
+    }
+
+    #[test]
+    fn playlist_metadata_is_fetched_under_the_playlists_area() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Library, &InternalError::ProtocolChanged("x".into()));
+        let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert!(matches!(
+            api.library_tracks(&uris),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+        assert!(matches!(
+            api.tracks_in(Area::Playlists, &uris),
+            Err(InternalError::NoSession)
+        ));
+        let episodes = vec!["spotify:episode:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert!(matches!(
+            api.episodes_in(Area::Playlists, &episodes),
+            Err(InternalError::NoSession)
+        ));
+    }
+
+    #[test]
+    fn pins_are_read_under_the_playlists_area() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Library, &InternalError::ProtocolChanged("x".into()));
+        assert!(matches!(
+            api.collection_page_all(Area::Library, "ylpin"),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+        assert!(matches!(
+            api.collection_page_all(Area::Playlists, "ylpin"),
+            Err(InternalError::NoSession)
+        ));
+    }
+
+    #[test]
+    fn playlist_playables_without_a_session_is_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert!(matches!(
+            api.playlist_playables("37i9dQZF1DXcBWIGoYBM5M", &HashMap::new()),
+            Err(InternalError::NoSession)
+        ));
     }
 
     #[test]

@@ -657,6 +657,30 @@ def sc_library_write(inst, args):
     expect(m["internal_ok"] >= wrote, "one internal call per write", m)
 
 
+def sc_playlists(inst, args):
+    """Every rootlist playlist is stored, over the internal API, with no fallback."""
+    d = inst.wait_library(args.settle_timeout * 4, blocked_on=["internal"])
+    blocked_if_throttled(d, ["internal"])
+    m = area_delta(inst, d, "playlists")
+    expect(m["fallback"] == 0, "no playlists fallback", m)
+    expect(d["playlists"]["layout"] > 0, "a layout", d["playlists"])
+    expect(d["playlists"]["stored"] >= d["playlists"]["layout"], "every layout playlist stored", d["playlists"])
+    expect(not d["areas"]["playlists"]["latched"], "area not latched", d["areas"]["playlists"])
+
+
+def sc_playlists_area_off(inst, args):
+    """The fixed Web path lists every playlist and saves the cache."""
+    client = library_client(os.environ)
+    d = inst.wait_library(args.settle_timeout * 4, blocked_on=[client])
+    blocked_if_throttled(d, [client])
+    expect(d["playlists"]["stored"] > 4, "more than the 4 stale cached playlists", d["playlists"])
+    inst.send("harness open library playlists")
+    d = inst.wait_settled(args.settle_timeout)
+    rows = next((t["rows"] for t in d["tabs"] if t["name"] == "Playlists"), None)
+    expect(rows is not None, "Playlists tab present", [t["name"] for t in d["tabs"]])
+    expect(rows == d["playlists"]["stored"], "flat list: one row per stored playlist", (rows, d["playlists"]))
+
+
 def sc_reconnect(inst, args):
     sc_play_start(inst, args)
     before = inst.dump()["player"]["position_ms"]
@@ -688,6 +712,8 @@ SCENARIOS = {
     "library_delta": ({}, sc_library_delta, False),
     "library_area_off": ({"internal_api_areas": {"library": False}}, sc_library_area_off, False),
     "library_write": ({}, sc_library_write, False),
+    "playlists": ({}, sc_playlists, False),
+    "playlists_area_off": ({"internal_api_areas": {"playlists": False}}, sc_playlists_area_off, False),
     "reconnect": ({}, sc_reconnect, True),
 }
 

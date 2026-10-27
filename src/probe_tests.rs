@@ -175,7 +175,9 @@ fn probe_library_liked_songs_resolve_through_the_library_area() {
     use crate::library_collection::Membership;
 
     with_api(|api| {
-        let listing = api.collection_page_all(SET_COLLECTION).expect("collection");
+        let listing = api
+            .collection_page_all(Area::Library, SET_COLLECTION)
+            .expect("collection");
         let Membership::Listing(tracks) = Membership::Listing(listing.items).only("track") else {
             unreachable!("only keeps the variant");
         };
