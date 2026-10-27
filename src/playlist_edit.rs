@@ -162,22 +162,30 @@ fn prepare_head(
     known: &HashMap<String, Playable>,
 ) -> Result<Head, EditError> {
     let head = api.playlist_head(&playlist.id)?;
-    if freshness(playlist, &head) == Freshness::Stale {
-        reload(api, playlist, known, &head)?;
-    }
-    Ok(head)
+    let reloaded = match freshness(playlist, &head) {
+        Freshness::Current => None,
+        Freshness::Stale => Some(reload(api, playlist, known)?),
+    };
+    Ok(write_base(head, reloaded))
 }
 
-/// Replace the local tracks with a full read and take the snapshot of `head`.
+/// The head a write is based on: the head read when the local copy was current, else the
+/// head of the full read that reloaded it. The change is checked against the reloaded items,
+/// and the playlist may have changed between the head read and that full read, so the POST
+/// must name the revision of those items, never the older head's.
+fn write_base(head: Head, reloaded: Option<Head>) -> Head {
+    reloaded.unwrap_or(head)
+}
+
+/// Replace the local tracks with a full read and take that read's snapshot; returns its head.
 fn reload(
     api: &WebApi,
     playlist: &mut Playlist,
     known: &HashMap<String, Playable>,
-    head: &Head,
-) -> Result<(), InternalError> {
-    let tracks = api.playlist_playables(&playlist.id, known)?;
-    set_tracks(playlist, tracks, head);
-    Ok(())
+) -> Result<Head, InternalError> {
+    let (head, tracks) = api.playlist_playables_at(&playlist.id, known)?;
+    set_tracks(playlist, tracks, &head);
+    Ok(head)
 }
 
 /// Store `tracks` (renumbered by position) with the snapshot of `head`.
@@ -213,7 +221,7 @@ fn send_verified(
         "Playlist write did not verify: length {} after it, {expected_len} expected",
         after.length
     );
-    if let Err(err) = reload(api, playlist, known, &after) {
+    if let Err(err) = reload(api, playlist, known) {
         warn!("Could not reload the playlist after a write that did not verify: {err}");
     }
     Err(EditError::Mismatch)
@@ -597,6 +605,20 @@ mod tests {
             ..local("s", 0)
         };
         assert_eq!(freshness(&unloaded, &head("s", 0)), Freshness::Stale);
+    }
+
+    #[test]
+    fn a_write_is_based_on_the_head_when_current_else_on_the_reload() {
+        let read = Head {
+            revision: b"head".to_vec(),
+            ..head("h", 2)
+        };
+        let reloaded = Head {
+            revision: b"reload".to_vec(),
+            ..head("r", 3)
+        };
+        assert_eq!(write_base(read.clone(), None), read);
+        assert_eq!(write_base(read, Some(reloaded.clone())), reloaded);
     }
 
     #[test]

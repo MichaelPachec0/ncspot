@@ -198,7 +198,7 @@ fn playlist_rootlist_and_contents_load() {
         for (label, found) in [("owned", owned), ("spotify-owned", spotify)] {
             match found {
                 Some(p) => {
-                    let items = rt
+                    let (_, items) = rt
                         .block_on(playlist::contents(session.clone(), p.id.clone()))
                         .expect("contents");
                     println!("{label}: {} items", items.len());
@@ -411,7 +411,7 @@ fn playlist_write_round_trip() {
         post(rt, &h, vec![write::remove_at_op(2)]);
         let h = head(rt);
         assert_eq!(h.length, 2, "two tracks after the remove");
-        let items = rt
+        let (_, items) = rt
             .block_on(playlist::contents(s.clone(), id.clone()))
             .map_err(|e| e.class())
             .expect("contents");

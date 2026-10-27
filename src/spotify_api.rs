@@ -413,8 +413,8 @@ impl WebApi {
         })
     }
 
-    /// The items of one playlist, by base62 id.
-    pub fn playlist_contents(&self, id: &str) -> Result<Vec<PlaylistItem>, InternalError> {
+    /// The items of one playlist, by base62 id, with the head they were read at.
+    pub fn playlist_contents(&self, id: &str) -> Result<(Head, Vec<PlaylistItem>), InternalError> {
         let id = id.to_string();
         self.run_internal(Area::Playlists, |session| {
             playlist::contents(session, id.clone())
@@ -429,7 +429,18 @@ impl WebApi {
         id: &str,
         known: &HashMap<String, Playable>,
     ) -> Result<Vec<Playable>, InternalError> {
-        let items = self.playlist_contents(id)?;
+        self.playlist_playables_at(id, known)
+            .map(|(_, playables)| playables)
+    }
+
+    /// Like [WebApi::playlist_playables], with the head of the read the items come from (a
+    /// write checked against these items must be based on its revision).
+    pub fn playlist_playables_at(
+        &self,
+        id: &str,
+        known: &HashMap<String, Playable>,
+    ) -> Result<(Head, Vec<Playable>), InternalError> {
+        let (head, items) = self.playlist_contents(id)?;
         let wanted = playlist_items::unknown_uris(&items, known);
         let (episodes, tracks): (Vec<String>, Vec<String>) = wanted
             .into_iter()
@@ -441,9 +452,9 @@ impl WebApi {
         for episode in self.episodes_in(Area::Playlists, &episodes)? {
             fetched.insert(episode.uri.clone(), Playable::Episode(episode));
         }
-        Ok(playlist_items::assemble(&items, |uri| {
-            fetched.get(uri).or_else(|| known.get(uri))
-        }))
+        let playables =
+            playlist_items::assemble(&items, |uri| fetched.get(uri).or_else(|| known.get(uri)));
+        Ok((head, playables))
     }
 
     pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {

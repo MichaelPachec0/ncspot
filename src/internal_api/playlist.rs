@@ -267,8 +267,19 @@ pub async fn rootlist(session: Session) -> Result<Rootlist, InternalError> {
     }
 }
 
-/// The items of one playlist. An id that does not parse does not exist.
-pub async fn contents(session: Session, id: String) -> Result<Vec<PlaylistItem>, InternalError> {
+/// The head of a full read with its items: the revision, length and name are those of the
+/// items read, which a later head read may not be.
+pub fn parse_listing(content: SelectedListContent) -> (Head, Vec<PlaylistItem>) {
+    let head = parse_head(&content);
+    (head, parse_contents(content))
+}
+
+/// The items of one playlist with the head they were read at. An id that does not parse does
+/// not exist.
+pub async fn contents(
+    session: Session,
+    id: String,
+) -> Result<(Head, Vec<PlaylistItem>), InternalError> {
     debug!("playlist contents");
     let id = SpotifyId::from_base62(&id).map_err(|_| InternalError::NotFound)?;
     let bytes = session
@@ -276,7 +287,7 @@ pub async fn contents(session: Session, id: String) -> Result<Vec<PlaylistItem>,
         .get_playlist(&id)
         .await
         .map_err(|e| classify(&e))?;
-    Ok(parse_contents(parse(&bytes)?))
+    Ok(parse_listing(parse(&bytes)?))
 }
 
 /// The head of one playlist (`?length=0`: no items). An id that does not parse does not exist.
@@ -492,6 +503,23 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_full_read_carries_the_revision_of_its_items() {
+        let content = SelectedListContent {
+            revision: Some(b"read".to_vec()),
+            ..page(
+                2,
+                vec![item("spotify:track:a"), item("spotify:track:b")],
+                vec![],
+            )
+        };
+        let (head, items) = parse_listing(content);
+        assert_eq!(head.revision, b"read".to_vec());
+        assert_eq!(head.snapshot_id, base64_encode(b"read"));
+        assert_eq!(head.length, 2);
+        assert_eq!(items.len(), 2);
     }
 
     #[test]
