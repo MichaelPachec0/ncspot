@@ -9,6 +9,7 @@ use crate::activity::ACTIVITY;
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use librespot_core::{Session, SpotifyUri};
+use librespot_protocol::playlist4_external::ListChanges;
 use log::{debug, error, info, warn};
 use rspotify::http::HttpError;
 use rspotify::model::{
@@ -29,6 +30,7 @@ use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
 use crate::internal_api::metadata::Missing;
 use crate::internal_api::playlist::{self, Head, PlaylistItem, Rootlist};
+use crate::internal_api::playlist_write::{self, Created};
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -267,13 +269,39 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
+        self.run_internal_with(area, true, internal)
+    }
+
+    /// Like [Self::run_internal] but the request is sent at most once on our side: no transient
+    /// retry and no waiting for a rate-limit window. For writes, which a retry could apply twice.
+    pub fn run_internal_once<T, F, Fut>(&self, area: Area, internal: F) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_internal_with(area, false, internal)
+    }
+
+    fn run_internal_with<T, F, Fut>(
+        &self,
+        area: Area,
+        may_retry: bool,
+        internal: F,
+    ) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
         if self.internal.skip(area) {
             return Err(InternalError::ProtocolChanged("area off or latched".into()));
         }
         let session = self.internal.session().ok_or(InternalError::NoSession)?;
         // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
         // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
-        let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
+        let no_waits =
+            !may_retry || is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
         // Held across retries so backoff sleeps and throttle waits count as loading.
         let _call = ACTIVITY.begin();
         let result = run_attempts(
@@ -355,6 +383,29 @@ impl WebApi {
     /// The rootlist revision and length, without entries.
     pub fn rootlist_head(&self) -> Result<Head, InternalError> {
         self.run_internal(Area::Playlists, playlist::rootlist_head)
+    }
+
+    /// Create a playlist named `name`. Sent once: a retried create would make a second playlist.
+    pub fn playlist_create(&self, name: &str) -> Result<Created, InternalError> {
+        let name = name.to_string();
+        self.run_internal_once(Area::Playlists, |session| {
+            playlist_write::create(session, name.clone())
+        })
+    }
+
+    /// Apply a change set to one playlist, by base62 id. Sent once, never retried.
+    pub fn playlist_changes(&self, id: &str, body: ListChanges) -> Result<(), InternalError> {
+        let id = id.to_string();
+        self.run_internal_once(Area::Playlists, |session| {
+            playlist_write::changes(session, id.clone(), body.clone())
+        })
+    }
+
+    /// Apply a change set to the rootlist. Sent once, never retried.
+    pub fn rootlist_changes(&self, body: ListChanges) -> Result<(), InternalError> {
+        self.run_internal_once(Area::Playlists, |session| {
+            playlist_write::rootlist_changes(session, body.clone())
+        })
     }
 
     /// The items of one playlist, by base62 id.
@@ -1586,6 +1637,18 @@ mod test {
             api.playlist_playables("37i9dQZF1DXcBWIGoYBM5M", &HashMap::new()),
             Err(InternalError::NoSession)
         ));
+    }
+
+    #[test]
+    fn playlist_writes_without_a_session_are_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert_eq!(api.playlist_create("x"), Err(InternalError::NoSession));
+        let body = playlist_write::list_changes(Vec::new(), Vec::new());
+        assert_eq!(
+            api.playlist_changes("37i9dQZF1DXcBWIGoYBM5M", body.clone()),
+            Err(InternalError::NoSession)
+        );
+        assert_eq!(api.rootlist_changes(body), Err(InternalError::NoSession));
     }
 
     #[test]
