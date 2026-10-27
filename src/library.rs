@@ -217,32 +217,6 @@ impl Library {
         });
     }
 
-    /// Check whether the `remote` [Playlist] is newer than its locally saved version. Returns
-    /// `true` if it is or if a local version isn't found.
-    fn needs_download(&self, remote: &Playlist) -> bool {
-        self.playlists
-            .read()
-            .unwrap()
-            .iter()
-            .find(|local| local.id == remote.id)
-            .map(|local| local.snapshot_id != remote.snapshot_id)
-            .unwrap_or(true)
-    }
-
-    /// Append `updated` to the local playlists or update the local version if it exists. Return the
-    /// index of the appended/updated playlist.
-    fn append_or_update(&self, updated: Playlist) -> usize {
-        let mut store = self.playlists.write().unwrap();
-        for (index, local) in store.iter_mut().enumerate() {
-            if local.id == updated.id {
-                *local = updated;
-                return index;
-            }
-        }
-        store.push(updated);
-        store.len() - 1
-    }
-
     /// Delete the playlist with the given `id` if it exists.
     pub fn delete_playlist(&self, id: &str) {
         if !*self.is_done.read().unwrap() {
@@ -576,45 +550,44 @@ impl Library {
             .iter()
             .map(|p| p.id.clone())
             .collect();
-        let mut list_order = Vec::new();
-        let mut items_complete = true;
-
+        // Read every listing page first, so a rate limit during the track
+        // downloads below can never leave the listing incomplete.
+        let mut listed: Vec<Playlist> = Vec::new();
         let lists_page = self.spotify.api.current_user_playlist();
         let mut lists_batch = Some(lists_page.items.read().unwrap().clone());
         while let Some(lists) = lists_batch {
-            for (index, remote) in lists.iter().enumerate() {
-                list_order.push(remote.id.clone());
-
-                if self.needs_download(remote) {
-                    info!("updating playlist {} (index: {})", remote.name, index);
-                    let mut playlist: Playlist = remote.clone();
-                    playlist.tracks = None;
-                    if playlist.load_tracks(&self.spotify) {
-                        self.append_or_update(playlist);
-                        // trigger redraw
-                        self.trigger_redraw();
-                    } else {
-                        items_complete = false;
-                        warn!(
-                            "failed to load tracks for playlist {}, keeping cached copy",
-                            remote.name
-                        );
-                    }
-                } else {
-                    // Snapshot unchanged, so the cached tracks are current and we
-                    // skip the costly reload. But a cache written before the
-                    // cover_url field existed stores it as None; backfill it from
-                    // the freshly-fetched list metadata so playlist art appears
-                    // without forcing a full re-download.
-                    let mut store = self.playlists.write().unwrap();
-                    if let Some(local) = store.iter_mut().find(|p| p.id == remote.id)
-                        && local.cover_url != remote.cover_url
-                    {
-                        local.cover_url = remote.cover_url.clone();
-                    }
-                }
-            }
+            listed.extend(lists);
             lists_batch = lists_page.next();
+        }
+        let list_order: Vec<String> = listed.iter().map(|p| p.id.clone()).collect();
+
+        let mut items_complete = true;
+        for (index, remote) in listed.iter().enumerate() {
+            // Download without holding the store lock; only the merge locks.
+            let mut downloaded = if is_current(&self.playlists.read().unwrap(), remote) {
+                None
+            } else {
+                info!("updating playlist {} (index: {})", remote.name, index);
+                let mut playlist = remote.clone();
+                playlist.tracks = None;
+                let tracks = playlist
+                    .load_tracks(&self.spotify)
+                    .then(|| playlist.tracks.unwrap_or_default());
+                if tracks.is_none() {
+                    warn!(
+                        "failed to load tracks for playlist {}, keeping cached copy",
+                        remote.name
+                    );
+                }
+                tracks
+            };
+            items_complete &= merge_listed(
+                &mut self.playlists.write().unwrap(),
+                std::slice::from_ref(remote),
+                |_| downloaded.take(),
+            );
+            // trigger redraw
+            self.trigger_redraw();
         }
 
         let listing_complete = !lists_page.failed();
@@ -1563,6 +1536,57 @@ impl Library {
     }
 }
 
+/// Whether the store already holds `remote` at the same snapshot with its tracks loaded, so
+/// no track download is needed.
+fn is_current(store: &[Playlist], remote: &Playlist) -> bool {
+    store
+        .iter()
+        .any(|p| p.id == remote.id && p.snapshot_id == remote.snapshot_id && p.tracks.is_some())
+}
+
+/// Merge the `listed` playlists into `store`, in order. An unchanged, loaded playlist only
+/// refreshes its cover, name and track count; otherwise `download` fetches the tracks. A failed
+/// download keeps an existing copy untouched (old snapshot, so the next sync retries) or stores
+/// the listed playlist unloaded. Returns false if any download failed.
+fn merge_listed(
+    store: &mut Vec<Playlist>,
+    listed: &[Playlist],
+    mut download: impl FnMut(&Playlist) -> Option<Vec<Playable>>,
+) -> bool {
+    let mut items_complete = true;
+    for remote in listed {
+        let pos = store.iter().position(|p| p.id == remote.id);
+        if let Some(i) = pos
+            && is_current(std::slice::from_ref(&store[i]), remote)
+        {
+            let local = &mut store[i];
+            local.cover_url = remote.cover_url.clone();
+            local.name = remote.name.clone();
+            local.num_tracks = remote.num_tracks;
+            continue;
+        }
+        match download(remote) {
+            Some(tracks) => {
+                let mut updated = remote.clone();
+                updated.tracks = Some(tracks);
+                match pos {
+                    Some(i) => store[i] = updated,
+                    None => store.push(updated),
+                }
+            }
+            None => {
+                items_complete = false;
+                if pos.is_none() {
+                    let mut unloaded = remote.clone();
+                    unloaded.tracks = None;
+                    store.push(unloaded);
+                }
+            }
+        }
+    }
+    items_complete
+}
+
 /// Remove local playlists that existed when the sync started (`known_at_start`) but are missing
 /// from `remote_ids`, and sort the rest in remote order. Only done when the remote listing was
 /// complete; a partial listing must never delete cached playlists, and a playlist created while
@@ -1777,6 +1801,52 @@ mod test {
             collaborative: false,
             cover_url: None,
         }
+    }
+
+    fn listed(id: &str, snap: &str) -> Playlist {
+        Playlist {
+            snapshot_id: snap.into(),
+            ..playlist(id)
+        }
+    }
+
+    #[test]
+    fn merge_listed_stores_failed_downloads_unloaded() {
+        let mut store = vec![Playlist {
+            tracks: Some(vec![]),
+            ..listed("a", "1")
+        }];
+        let complete = merge_listed(
+            &mut store,
+            &[listed("a", "2"), listed("b", "1"), listed("c", "1")],
+            |p| (p.id == "c").then(Vec::new),
+        );
+        assert!(!complete);
+        let a = store.iter().find(|p| p.id == "a").unwrap();
+        assert_eq!(
+            a.snapshot_id, "1",
+            "failed download keeps the cached copy and its snapshot"
+        );
+        let b = store.iter().find(|p| p.id == "b").unwrap();
+        assert!(
+            b.tracks.is_none(),
+            "listed but not downloaded is still stored"
+        );
+        assert!(store.iter().find(|p| p.id == "c").unwrap().tracks.is_some());
+    }
+
+    #[test]
+    fn merge_listed_skips_unchanged_loaded_playlists() {
+        let mut store = vec![Playlist {
+            tracks: Some(vec![]),
+            ..listed("a", "1")
+        }];
+        let mut calls = 0;
+        assert!(merge_listed(&mut store, &[listed("a", "1")], |_| {
+            calls += 1;
+            None
+        }));
+        assert_eq!(calls, 0);
     }
 
     fn ids(list: &[Playlist]) -> Vec<&str> {
