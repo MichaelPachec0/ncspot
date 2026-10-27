@@ -8,6 +8,7 @@ pub mod convert;
 pub mod error;
 pub mod fallback;
 pub mod metadata;
+pub mod playlist;
 
 #[cfg(test)]
 mod live_tests;
