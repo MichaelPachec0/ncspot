@@ -464,9 +464,9 @@ impl WebApi {
         })
     }
 
-    /// Add or remove `uris` in a collection set (calls count in `area`): one internal call per [collection::WRITE_BATCH]
-    /// items. A failed batch stops the write; batches before it stay written, and the next
-    /// delta sync brings them into the store.
+    /// Add or remove `uris` in a collection set (calls count in `area`): one internal call per
+    /// [collection::WRITE_BATCH] items. A failed batch stops the write; batches before it stay
+    /// written, and the next delta sync brings them into the store.
     pub fn collection_write(
         &self,
         area: Area,
