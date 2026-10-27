@@ -11,12 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Playlist folders and pinned playlists in the Playlists tab
 - Save episodes to Your Episodes from their context menu
+- `u` updates only the current library tab
 
 ### Changed
 
 - Playlists load over Spotify's internal API, including Spotify-owned playlists
 - Saving and removing tracks, albums, artists and shows goes through Spotify's internal API
 - Unchanged liked songs and saved albums no longer rewrite their cache files
+- `Shift+u` and `:update` now refetch the whole library instead of syncing changes
 
 ### Fixed
 

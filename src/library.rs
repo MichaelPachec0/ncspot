@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::config::Config;
-use crate::config::{self, CACHE_VERSION};
+use crate::config::{self, CACHE_VERSION, LibraryTab};
 use crate::cover_prefetch;
 use crate::events::EventManager;
 use crate::internal_api::Area;
@@ -293,15 +293,9 @@ impl Library {
     /// running. If the sync is left incomplete by a rate limit, a resume (not forced) is
     /// scheduled for when the limit has passed.
     pub fn update_library(&self, force_full: bool) {
-        if self
-            .syncing
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            info!("library sync already running, skipped");
+        if !self.start_sync() {
             return;
         }
-        *self.is_done.write().unwrap() = false;
 
         let library = self.clone();
         thread::spawn(move || {
@@ -347,6 +341,62 @@ impl Library {
                 && episodes_complete;
             library.schedule_resume(complete, sync_start);
         });
+    }
+
+    /// Sync only what the library tab `tab` shows, from its changes, on a background thread.
+    /// Like [Library::update_library] it takes the one sync slot and clears `is_done` while it
+    /// runs, but it schedules no resume.
+    pub fn update_tab(&self, tab: &LibraryTab) -> TabUpdate {
+        let Some(set) = tab_set(tab, self.episodes_enabled) else {
+            return TabUpdate::NoSet;
+        };
+        if !self.start_sync() {
+            return TabUpdate::Busy;
+        }
+        info!("library tab update: {set:?}");
+
+        let library = self.clone();
+        thread::spawn(move || {
+            let _guard = SyncGuard(library.syncing.clone());
+            match set {
+                SyncSet::Collection => {
+                    library.sync_collection(false);
+                    // The artists of the liked songs follow the collection.
+                    library.save_artists();
+                }
+                SyncSet::Artists => {
+                    let artists = library.sync_artists(false);
+                    library.finish_artists(artists);
+                }
+                SyncSet::Playlists => {
+                    library.sync_playlists(false);
+                }
+                SyncSet::Shows => {
+                    library.sync_shows(false);
+                }
+                SyncSet::Episodes => {
+                    library.sync_episodes(false);
+                }
+            }
+            *library.is_done.write().unwrap() = true;
+            library.ev.trigger();
+        });
+        TabUpdate::Started
+    }
+
+    /// Take the one sync slot and clear `is_done`; false (logged) if a sync already runs.
+    /// The sync thread releases the slot with a [SyncGuard].
+    fn start_sync(&self) -> bool {
+        if self
+            .syncing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            info!("library sync already running, skipped");
+            return false;
+        }
+        *self.is_done.write().unwrap() = false;
+        true
     }
 
     /// Load the liked songs and saved albums caches and sync the `collection` set. Returns
@@ -2002,6 +2052,41 @@ fn reconcile_playlists(
     local.sort_by_key(|p| remote_ids.iter().position(|x| x == &p.id));
 }
 
+/// One part of the library sync, as a library tab updates it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncSet {
+    /// Liked songs and saved albums (one `collection` set), then the artists of the songs.
+    Collection,
+    Artists,
+    Playlists,
+    Shows,
+    Episodes,
+}
+
+/// What [Library::update_tab] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabUpdate {
+    /// The tab's sync runs in the background.
+    Started,
+    /// Another sync runs; nothing was started.
+    Busy,
+    /// The tab has nothing to sync.
+    NoSet,
+}
+
+/// The part of the library sync that updates `tab`; None for Browse, and for Your Episodes
+/// while it is off.
+fn tab_set(tab: &LibraryTab, episodes_enabled: bool) -> Option<SyncSet> {
+    match tab {
+        LibraryTab::Tracks | LibraryTab::Albums => Some(SyncSet::Collection),
+        LibraryTab::Artists => Some(SyncSet::Artists),
+        LibraryTab::Playlists => Some(SyncSet::Playlists),
+        LibraryTab::Podcasts => Some(SyncSet::Shows),
+        LibraryTab::Episodes => episodes_enabled.then_some(SyncSet::Episodes),
+        LibraryTab::Browse => None,
+    }
+}
+
 /// Clears a library's `syncing` flag when dropped, so the flag is released even if the sync
 /// thread panics.
 struct SyncGuard(Arc<AtomicBool>);
@@ -2676,6 +2761,51 @@ mod test {
 
         assert!(*library.is_done.read().unwrap());
         assert!(library.syncing.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn each_tab_updates_its_own_set() {
+        let all = [
+            (LibraryTab::Tracks, Some(SyncSet::Collection)),
+            (LibraryTab::Albums, Some(SyncSet::Collection)),
+            (LibraryTab::Artists, Some(SyncSet::Artists)),
+            (LibraryTab::Playlists, Some(SyncSet::Playlists)),
+            (LibraryTab::Podcasts, Some(SyncSet::Shows)),
+            (LibraryTab::Episodes, Some(SyncSet::Episodes)),
+            (LibraryTab::Browse, None),
+        ];
+        for (tab, set) in all {
+            assert_eq!(tab_set(&tab, true), set, "{tab:?}");
+        }
+        assert_eq!(tab_set(&LibraryTab::Episodes, false), None);
+        assert_eq!(
+            tab_set(&LibraryTab::Tracks, false),
+            Some(SyncSet::Collection)
+        );
+    }
+
+    #[test]
+    fn a_tab_update_is_skipped_while_a_sync_runs() {
+        let library = test_library();
+        library.syncing.store(true, Ordering::SeqCst);
+        *library.is_done.write().unwrap() = true;
+
+        assert_eq!(library.update_tab(&LibraryTab::Tracks), TabUpdate::Busy);
+
+        assert!(*library.is_done.read().unwrap());
+        assert!(library.syncing.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_tab_without_a_set_starts_nothing() {
+        let library = test_library();
+        *library.is_done.write().unwrap() = true;
+
+        assert_eq!(library.update_tab(&LibraryTab::Browse), TabUpdate::NoSet);
+        assert_eq!(library.update_tab(&LibraryTab::Episodes), TabUpdate::NoSet);
+
+        assert!(*library.is_done.read().unwrap());
+        assert!(!library.syncing.load(Ordering::SeqCst));
     }
 
     fn synced(t: &str) -> SetOutcome {

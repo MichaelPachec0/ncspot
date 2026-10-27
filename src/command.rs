@@ -16,6 +16,7 @@ const QUEUE_CMD: &str = "queue";
 const PLAY_NEXT_CMD: &str = "playnext";
 const PLAY: &str = "play";
 const UPDATE_LIBRARY_CMD: &str = "update";
+const UPDATE_TAB_CMD: &str = "update tab";
 const SAVE_CMD: &str = "save";
 const SAVE_CURRENT_CMD: &str = "save current";
 const SAVE_QUEUE_CMD: &str = "save queue";
@@ -79,6 +80,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     PLAY_NEXT_CMD,
     PLAY,
     UPDATE_LIBRARY_CMD,
+    UPDATE_TAB_CMD,
     SAVE_CMD,
     SAVE_CURRENT_CMD,
     SAVE_QUEUE_CMD,
@@ -267,6 +269,7 @@ pub enum Command {
     PlayNext,
     Play,
     UpdateLibrary,
+    UpdateTab,
     Save,
     SaveCurrent,
     SaveQueue,
@@ -385,6 +388,7 @@ impl fmt::Display for Command {
             | Self::PlayNext
             | Self::Play
             | Self::UpdateLibrary
+            | Self::UpdateTab
             | Self::Save
             | Self::SaveCurrent
             | Self::SaveQueue
@@ -431,6 +435,7 @@ impl Command {
             Self::PlayNext => PLAY_NEXT_CMD,
             Self::Play => PLAY,
             Self::UpdateLibrary => UPDATE_LIBRARY_CMD,
+            Self::UpdateTab => UPDATE_TAB_CMD,
             Self::Save => SAVE_CMD,
             Self::SaveCurrent => SAVE_CURRENT_CMD,
             Self::SaveQueue => SAVE_QUEUE_CMD,
@@ -652,7 +657,15 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 QUEUE_CMD => Command::Queue,
                 PLAY_NEXT_CMD => Command::PlayNext,
                 PLAY => Command::Play,
-                UPDATE_LIBRARY_CMD => Command::UpdateLibrary,
+                UPDATE_LIBRARY_CMD => match args.first().cloned() {
+                    Some("tab") => Ok(Command::UpdateTab),
+                    Some(arg) => Err(E::BadEnumArg {
+                        arg: arg.into(),
+                        accept: vec!["tab".into()],
+                        optional: true,
+                    }),
+                    None => Ok(Command::UpdateLibrary),
+                }?,
                 ADD => match args.first().cloned() {
                     Some("current") => Ok(Command::AddCurrent),
                     Some(arg) => Err(E::BadEnumArg {
@@ -1147,6 +1160,21 @@ mod tests {
         assert!(parse("harness").is_err());
         assert!(parse("harness open").is_err());
         assert!(parse("harness fly away").is_err());
+    }
+
+    #[test]
+    fn parses_update_and_update_tab() {
+        let update = parse("update").unwrap();
+        assert!(matches!(update.as_slice(), [Command::UpdateLibrary]));
+        assert_eq!(update[0].to_string(), "update");
+        let tab = parse("update tab").unwrap();
+        assert!(matches!(tab.as_slice(), [Command::UpdateTab]));
+        assert_eq!(tab[0].to_string(), "update tab");
+        assert!(matches!(
+            parse(&tab[0].to_string()).as_deref(),
+            Ok([Command::UpdateTab])
+        ));
+        assert!(parse("update all").is_err());
     }
 
     #[test]

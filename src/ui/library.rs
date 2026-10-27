@@ -7,7 +7,7 @@ use strum::IntoEnumIterator;
 use crate::command::Command;
 use crate::commands::CommandResult;
 use crate::config::LibraryTab;
-use crate::library::Library;
+use crate::library::{Library, TabUpdate};
 use crate::queue::Queue;
 use crate::traits::ViewExt;
 use crate::ui::browse::BrowseView;
@@ -15,12 +15,15 @@ use crate::ui::listview::ListView;
 use crate::ui::playlists::PlaylistsView;
 use crate::ui::tabbedview::TabbedView;
 
+/// Status note for `update tab` where it has nothing to update.
+pub const UPDATE_TAB_HINT: &str = "u updates the current library tab";
+
 pub struct LibraryView {
     tabs: TabbedView,
     /// The tabs added to `tabs`, in order.
-    #[cfg(feature = "harness")]
     added: Vec<LibraryTab>,
     display_name: Option<String>,
+    library: Arc<Library>,
 }
 
 impl LibraryView {
@@ -33,10 +36,8 @@ impl LibraryView {
             .clone()
             .unwrap_or_else(|| Vec::from_iter(LibraryTab::iter()));
 
-        #[cfg(feature = "harness")]
         let mut added = Vec::new();
         for tab in selected_tabs {
-            #[cfg(feature = "harness")]
             if tab != LibraryTab::Episodes || library.episodes_enabled {
                 added.push(tab.clone());
             }
@@ -77,7 +78,6 @@ impl LibraryView {
 
         Self {
             tabs: tabview,
-            #[cfg(feature = "harness")]
             added,
             display_name: {
                 let hide_username = library.cfg.values().hide_display_names.unwrap_or(false);
@@ -87,6 +87,20 @@ impl LibraryView {
                     library.display_name.clone()
                 }
             },
+            library,
+        }
+    }
+
+    /// Sync the visible tab's part of the library; a status note when nothing was started.
+    fn update_tab(&self) -> Option<String> {
+        let update = match self.added.get(self.tabs.selected()) {
+            Some(tab) => self.library.update_tab(tab),
+            None => TabUpdate::NoSet,
+        };
+        match update {
+            TabUpdate::Started => None,
+            TabUpdate::Busy => Some("library update already running".to_string()),
+            TabUpdate::NoSet => Some(UPDATE_TAB_HINT.to_string()),
         }
     }
 
@@ -122,6 +136,9 @@ impl ViewExt for LibraryView {
     }
 
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
+        if let Command::UpdateTab = cmd {
+            return Ok(CommandResult::Consumed(self.update_tab()));
+        }
         self.tabs.on_command(s, cmd)
     }
 }

@@ -212,6 +212,8 @@ impl CommandManager {
                 self.library.update_library(true);
                 Ok(None)
             }
+            // The library view handles it while on screen.
+            Command::UpdateTab => Ok(Some(crate::ui::library::UPDATE_TAB_HINT.to_string())),
             Command::TogglePlay => {
                 self.queue.toggleplayback();
                 Ok(None)
@@ -604,6 +606,7 @@ impl CommandManager {
         kb.insert("q".into(), vec![Command::Quit]);
         kb.insert("Ctrl+l".into(), vec![Command::Redraw]);
         kb.insert("Shift+p".into(), vec![Command::TogglePlay]);
+        kb.insert("u".into(), vec![Command::UpdateTab]);
         kb.insert("Shift+u".into(), vec![Command::UpdateLibrary]);
         kb.insert("Shift+s".into(), vec![Command::Stop]);
         kb.insert("<".into(), vec![Command::Previous]);
@@ -845,7 +848,21 @@ impl CommandManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_COUNT, accumulate_count};
+    use super::{CommandManager, MAX_COUNT, accumulate_count};
+    use crate::command::Command;
+
+    #[test]
+    fn u_updates_the_tab_and_shift_u_the_whole_library() {
+        let kb = CommandManager::default_keybindings();
+        assert!(matches!(
+            kb.get("u").map(Vec::as_slice),
+            Some([Command::UpdateTab])
+        ));
+        assert!(matches!(
+            kb.get("Shift+u").map(Vec::as_slice),
+            Some([Command::UpdateLibrary])
+        ));
+    }
 
     #[test]
     fn accumulates_digits() {
