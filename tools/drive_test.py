@@ -298,14 +298,15 @@ class CleanupTest(unittest.TestCase):
 
 class PlaylistsScenarioTest(unittest.TestCase):
     @staticmethod
-    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False, tab=True):
+    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False, tab=True, last_len=3, error=None):
         return {
             "areas": {
                 "playlists": {"internal_ok": 0 if base else 4, "fallback": fallback, "latched": latched}
             },
             "web": {"shared": 0, "personal": 0},
             "throttled": {},
-            "playlists": {"stored": stored, "layout": layout},
+            "playlists": {"stored": stored, "layout": layout, "last_test_len": last_len},
+            "error": error,
             "tabs": [{"name": "Playlists", "rows": rows}] if tab else [{"name": "Albums", "rows": 3}],
         }
 
@@ -320,7 +321,8 @@ class PlaylistsScenarioTest(unittest.TestCase):
                 pass
 
             def wait_library(self, timeout, blocked_on=()):
-                return dump
+                # The write scenario measures from the dump taken when the library is done.
+                return base if func is drive.sc_playlist_write else dump
 
             def wait_settled(self, timeout):
                 return dump
@@ -360,6 +362,26 @@ class PlaylistsScenarioTest(unittest.TestCase):
     def test_area_off_missing_tab_fails(self):
         with self.assertRaises(drive.Fail):
             self.run_with(drive.sc_playlists_area_off, tab=False)
+
+    def test_playlist_write_passes(self):
+        self.run_with(drive.sc_playlist_write)
+
+    def test_playlist_write_fallback_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlist_write, fallback=1)
+
+    def test_playlist_write_latched_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlist_write, latched=True)
+
+    def test_playlist_write_wrong_length_fails(self):
+        for last_len in (2, None):
+            with self.assertRaises(drive.Fail, msg=last_len):
+                self.run_with(drive.sc_playlist_write, last_len=last_len)
+
+    def test_playlist_write_error_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlist_write, error="boom")
 
 
 if __name__ == "__main__":

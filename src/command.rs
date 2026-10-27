@@ -261,6 +261,12 @@ pub enum HarnessCommand {
     TestPlaylists,
     /// Unfollow the n-th (1-based) recorded test playlist, then drop it from the file.
     UnfollowRecorded(usize),
+    /// Append the first n public test tracks to the most recent test playlist.
+    PlaylistAddTest(usize),
+    /// Remove the track at an index from the most recent test playlist.
+    PlaylistRemoveTest(usize),
+    /// Replace the most recent test playlist's contents with the first n public test tracks.
+    PlaylistOverwriteTest(usize),
     /// Shut the playback session down so the worker has to reconnect.
     DropSession,
     /// Write a JSON snapshot of the current view to a file.
@@ -373,6 +379,18 @@ impl fmt::Display for Command {
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::UnfollowRecorded(n)) => {
                 vec!["unfollow-recorded".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::PlaylistAddTest(n)) => {
+                vec!["playlist-add-test".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::PlaylistRemoveTest(n)) => {
+                vec!["playlist-remove-test".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::PlaylistOverwriteTest(n)) => {
+                vec!["playlist-overwrite-test".into(), n.to_string()]
             }
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::DropSession) => vec!["drop-session".into()],
@@ -1105,6 +1123,19 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                             cmd: format!("{command} unfollow-recorded"),
                             hint: Some("a recorded playlist number".into()),
                         }),
+                    (Some(sub @ ("playlist-add-test" | "playlist-remove-test" | "playlist-overwrite-test")), [n]) => n
+                        .parse()
+                        .map(|n| {
+                            Command::Harness(match sub {
+                                "playlist-add-test" => HarnessCommand::PlaylistAddTest(n),
+                                "playlist-remove-test" => HarnessCommand::PlaylistRemoveTest(n),
+                                _ => HarnessCommand::PlaylistOverwriteTest(n),
+                            })
+                        })
+                        .map_err(|_| E::InsufficientArgs {
+                            cmd: format!("{command} {sub}"),
+                            hint: Some("a number".into()),
+                        }),
                     (Some("save"), [target]) => Ok(Command::Harness(HarnessCommand::Save(
                         (*target).to_string(),
                     ))),
@@ -1117,13 +1148,22 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     (Some("dump"), rest) if !rest.is_empty() => {
                         Ok(Command::Harness(HarnessCommand::Dump(rest.join(" "))))
                     }
-                    (Some(sub @ ("open" | "dump" | "save" | "unsave" | "unfollow-recorded")), _) => {
+                    (
+                        Some(
+                            sub @ ("open" | "dump" | "save" | "unsave" | "unfollow-recorded"
+                            | "playlist-add-test" | "playlist-remove-test"
+                            | "playlist-overwrite-test"),
+                        ),
+                        _,
+                    ) => {
                         Err(E::InsufficientArgs {
                             cmd: format!("{command} {sub}"),
                             hint: Some(
                                 match sub {
                                     "dump" => "a file path",
                                     "unfollow-recorded" => "a recorded playlist number",
+                                    "playlist-add-test" | "playlist-remove-test"
+                                    | "playlist-overwrite-test" => "a number",
                                     _ => "a Spotify URI or URL",
                                 }
                                 .into(),
@@ -1141,13 +1181,16 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                             "newplaylist-test".into(),
                             "test-playlists".into(),
                             "unfollow-recorded".into(),
+                            "playlist-add-test".into(),
+                            "playlist-remove-test".into(),
+                            "playlist-overwrite-test".into(),
                         ],
                         optional: false,
                     }),
                     (None, _) => Err(E::InsufficientArgs {
                         cmd: command.into(),
                         hint: Some(
-                            "open|dump|drop-session|save|unsave|newplaylist-test|test-playlists|unfollow-recorded"
+                            "open|dump|drop-session|save|unsave|newplaylist-test|test-playlists|unfollow-recorded|playlist-add-test|playlist-remove-test|playlist-overwrite-test"
                                 .into(),
                         ),
                     }),
@@ -1196,6 +1239,18 @@ mod tests {
                 HarnessCommand::UnfollowRecorded(2),
             ),
             (
+                "harness playlist-add-test 2",
+                HarnessCommand::PlaylistAddTest(2),
+            ),
+            (
+                "harness playlist-remove-test 0",
+                HarnessCommand::PlaylistRemoveTest(0),
+            ),
+            (
+                "harness playlist-overwrite-test 3",
+                HarnessCommand::PlaylistOverwriteTest(3),
+            ),
+            (
                 "harness save spotify:track:4uLU6hMCjMI75M1A2tKUQC",
                 HarnessCommand::Save("spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()),
             ),
@@ -1214,6 +1269,9 @@ mod tests {
         assert!(parse("harness unfollow-recorded").is_err());
         assert!(parse("harness unfollow-recorded x").is_err());
         assert!(parse("harness unfollow-recorded -1").is_err());
+        assert!(parse("harness playlist-add-test").is_err());
+        assert!(parse("harness playlist-remove-test x").is_err());
+        assert!(parse("harness playlist-overwrite-test -1").is_err());
     }
 
     #[test]

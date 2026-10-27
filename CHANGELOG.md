@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Playlist folders and pinned playlists in the Playlists tab
 - Save episodes to Your Episodes from their context menu
 - `u` updates only the current library tab
+- Pin and unpin playlists (`pin`, `unpin`, the context menu)
 
 ### Changed
 
@@ -20,9 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unchanged liked songs and saved albums no longer rewrite their cache files
 - `Shift+u` and `:update` now refetch the whole library instead of syncing changes
 - `update` with an argument other than `tab` is now an error
+- Playlist edits go over Spotify's internal API, with the Web API as fallback
 
 ### Fixed
 
+- Spotify-generated playlists not refreshing when they change
 - Albums saved in ncspot are refreshed with their full data on the next library sync over the Web API
 - Playlist sync keeping only a few playlists after a rate limit
 - Playback dying on `:reconnect` an hour after logging in via the browser

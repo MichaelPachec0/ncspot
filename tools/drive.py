@@ -684,6 +684,26 @@ def sc_playlists_area_off(inst, args):
     expect(rows == d["playlists"]["stored"], "flat list: one row per stored playlist", (rows, d["playlists"]))
 
 
+def sc_playlist_write(inst, args):
+    """Create a test playlist, add, remove and overwrite over the internal API, no fallback.
+    The playlist is recorded for the user to remove; nothing is deleted here."""
+    d = inst.wait_library(args.settle_timeout * 4, blocked_on=["internal"])
+    blocked_if_throttled(d, ["internal"])
+    inst.base_dump = d
+    inst.send("harness newplaylist-test")
+    d = inst.wait_settled(args.settle_timeout)
+    expect(d.get("error") is None, "create without error", d.get("error"))
+    for cmd in ("harness playlist-add-test 2", "harness playlist-remove-test 0", "harness playlist-overwrite-test 3"):
+        inst.send(cmd)
+        d = inst.wait_settled(args.settle_timeout)
+        expect(d.get("error") is None, f"{cmd}: no error", d.get("error"))
+    blocked_if_throttled(d, ["internal"])
+    m = area_delta(inst, d, "playlists")
+    expect(m["fallback"] == 0, "no playlists fallback", m)
+    expect(not d["areas"]["playlists"]["latched"], "area not latched", d["areas"]["playlists"])
+    expect(d["playlists"]["last_test_len"] == 3, "test playlist holds the overwrite", d["playlists"])
+
+
 def sc_reconnect(inst, args):
     sc_play_start(inst, args)
     before = inst.dump()["player"]["position_ms"]
@@ -717,6 +737,7 @@ SCENARIOS = {
     "library_write": ({}, sc_library_write, False),
     "playlists": ({}, sc_playlists, False),
     "playlists_area_off": ({"internal_api_areas": {"playlists": False}}, sc_playlists_area_off, False),
+    "playlist_write": ({}, sc_playlist_write, False),
     "reconnect": ({}, sc_reconnect, True),
 }
 

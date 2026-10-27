@@ -20,6 +20,7 @@ use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
 use crate::playlist_edit;
+use crate::playlist_items;
 use crate::queue::Queue;
 use crate::rate_limit::{ClientLabel, Stamp};
 use crate::spotify::{PlayerEvent, Spotify, UriType};
@@ -101,6 +102,9 @@ pub struct PlaylistCounts {
     pub stored: usize,
     /// Number of `LayoutEntry::Playlist` entries.
     pub layout: usize,
+    /// Track count of the most recently recorded test playlist in the store; `None` when there
+    /// is none (or it is not stored).
+    pub last_test_len: Option<usize>,
 }
 
 /// What the player is doing.
@@ -213,6 +217,79 @@ pub fn new_playlist_test(library: &Library) -> Result<(), String> {
         error!("recording a test playlist failed: {e}");
         format!("harness newplaylist-test: created {name} but could not record it: {e}")
     })
+}
+
+/// The most recently recorded test playlist as stored in the library.
+fn last_test_playlist(library: &Library, verb: &str) -> Result<Playlist, String> {
+    let recorded = test_playlists::read(&test_playlists::file_path())
+        .map_err(|e| format!("harness {verb}: cannot read the list: {e}"))?;
+    let id = recorded
+        .last()
+        .and_then(|uri| recorded_id(uri))
+        .ok_or_else(|| format!("harness {verb}: no recorded test playlist"))?;
+    library
+        .playlists
+        .read()
+        .unwrap()
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .ok_or_else(|| format!("harness {verb}: the last test playlist is not in the library"))
+}
+
+/// Track count of the most recently recorded test playlist in the store, for the dump.
+pub fn last_test_len(library: &Library) -> Option<usize> {
+    let playlist = last_test_playlist(library, "dump").ok()?;
+    Some(
+        playlist
+            .tracks
+            .as_ref()
+            .map_or(playlist.num_tracks, Vec::len),
+    )
+}
+
+/// The public catalog tracks the playlist-write verbs use.
+const PUBLIC_TEST_TRACKS: [&str; 3] = [
+    "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+    "spotify:track:7ouMYWpwJ422jRcDASZB7P",
+    "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+];
+
+/// The first `n` public test tracks, repeating from the first when `n` is above three.
+fn public_test_tracks(n: usize) -> Vec<Playable> {
+    (0..n)
+        .map(|i| playlist_items::placeholder(PUBLIC_TEST_TRACKS[i % PUBLIC_TEST_TRACKS.len()]))
+        .collect()
+}
+
+/// Append the first `n` public test tracks to the most recent test playlist.
+pub fn playlist_add_test(library: &Library, spotify: &Spotify, n: usize) -> Result<(), String> {
+    let mut playlist = last_test_playlist(library, "playlist-add-test")?;
+    playlist.append_tracks(&public_test_tracks(n), spotify, library);
+    Ok(())
+}
+
+/// Remove the track at `index` from the most recent test playlist.
+pub fn playlist_remove_test(
+    library: &Library,
+    spotify: &Spotify,
+    index: usize,
+) -> Result<(), String> {
+    let mut playlist = last_test_playlist(library, "playlist-remove-test")?;
+    let len = playlist.tracks.as_ref().map_or(0, Vec::len);
+    if index >= len {
+        return Err(format!(
+            "harness playlist-remove-test: no track {index} ({len} loaded)"
+        ));
+    }
+    playlist.delete_track(index, spotify.clone(), library)
+}
+
+/// Replace the contents of the most recent test playlist with the first `n` public test tracks.
+pub fn playlist_overwrite_test(library: &Library, n: usize) -> Result<(), String> {
+    let playlist = last_test_playlist(library, "playlist-overwrite-test")?;
+    library.overwrite_playlist(&playlist.id, &public_test_tracks(n));
+    Ok(())
 }
 
 /// Names of the recorded test playlists, in file order: from the store, else the internal head
@@ -628,6 +705,7 @@ mod tests {
             playlists: PlaylistCounts {
                 stored: 9,
                 layout: 8,
+                last_test_len: Some(3),
             },
             player: PlayerState {
                 status: "playing".into(),
@@ -646,7 +724,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"test_playlists":[]}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8,"last_test_len":3},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"test_playlists":[]}"#
         );
     }
 
@@ -676,6 +754,7 @@ mod tests {
         let counts = PlaylistCounts {
             stored: 3,
             layout: 2,
+            last_test_len: None,
         };
         let first = build_dump(
             "x".into(),

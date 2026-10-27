@@ -416,6 +416,7 @@ impl CommandManager {
                                 matches!(e, crate::playlist_layout::LayoutEntry::Playlist(_))
                             })
                             .count(),
+                        last_test_len: crate::harness::last_test_len(&self.library),
                     },
                 );
                 let mut dump = dump;
@@ -456,6 +457,21 @@ impl CommandManager {
             #[cfg(feature = "harness")]
             Command::Harness(crate::command::HarnessCommand::TestPlaylists) => {
                 crate::harness::request_test_playlists();
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::PlaylistAddTest(n)) => {
+                crate::harness::playlist_add_test(&self.library, &self.spotify, *n)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::PlaylistRemoveTest(index)) => {
+                crate::harness::playlist_remove_test(&self.library, &self.spotify, *index)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::PlaylistOverwriteTest(n)) => {
+                crate::harness::playlist_overwrite_test(&self.library, *n)?;
                 Ok(None)
             }
             #[cfg(feature = "harness")]
