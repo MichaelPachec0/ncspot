@@ -54,6 +54,7 @@ pub struct HarnessState {
 pub struct Areas {
     pub metadata: AreaCounts,
     pub library: AreaCounts,
+    pub playlists: AreaCounts,
 }
 
 /// Which clients are inside a rate-limit window.
@@ -133,6 +134,7 @@ pub fn build_dump(
         areas: Areas {
             metadata: api.area_counts(Area::Metadata),
             library: api.area_counts(Area::Library),
+            playlists: api.area_counts(Area::Playlists),
         },
         web: api.web_calls(),
         throttled: Throttled {
@@ -387,6 +389,11 @@ mod tests {
                     fallback: 0,
                     latched: false,
                 },
+                playlists: AreaCounts {
+                    internal_ok: 5,
+                    fallback: 1,
+                    latched: false,
+                },
             },
             web: WebCalls {
                 shared: 0,
@@ -414,7 +421,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1}}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1}}"#
         );
     }
 

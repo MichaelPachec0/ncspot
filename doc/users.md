@@ -349,6 +349,7 @@ Possible configuration values are:
 | `client_id`                     | Personal Spotify Web API client ID                             | 32 hex characters, see [personal client ID](#personal-web-api-client-id)              |                     |
 | `internal_api`                  | Use Spotify's internal API for metadata, Web API as fallback   | `true`, `false`                                                                       | `true`              |
 | `internal_api_areas.metadata`   | Tracks, albums, artists, shows, episodes and your profile      | `true`, `false`                                                                       | `true`              |
+| `internal_api_areas.playlists`  | Your playlist list and playlist contents                       | `true`, `false`                                                                       | `true`              |
 
 1. If built with the `cover` feature.
 2. By default the statusbar will show a play icon when a track is playing and

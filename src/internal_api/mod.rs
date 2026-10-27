@@ -41,6 +41,8 @@ pub struct Settings {
     pub metadata: bool,
     /// `[internal_api_areas] library`.
     pub library: bool,
+    /// `[internal_api_areas] playlists`.
+    pub playlists: bool,
 }
 
 impl Settings {
@@ -51,6 +53,7 @@ impl Settings {
             from_config: values.internal_api.is_some(),
             metadata: areas.metadata.unwrap_or(true),
             library: areas.library.unwrap_or(true),
+            playlists: areas.playlists.unwrap_or(true),
         }
     }
 
@@ -60,6 +63,7 @@ impl Settings {
             && match area {
                 Area::Metadata => self.metadata,
                 Area::Library => self.library,
+                Area::Playlists => self.playlists,
             }
     }
 
@@ -82,6 +86,8 @@ pub enum Area {
     Metadata,
     /// The library lists (collection sets).
     Library,
+    /// The playlist list (rootlist) and playlist contents.
+    Playlists,
 }
 
 impl Area {
@@ -90,6 +96,7 @@ impl Area {
         match self {
             Self::Metadata => "metadata",
             Self::Library => "library",
+            Self::Playlists => "playlists",
         }
     }
 }
@@ -122,6 +129,8 @@ pub struct InternalApi {
     metadata_stats: Arc<AreaStats>,
     latched_library: Arc<AtomicBool>,
     library_stats: Arc<AreaStats>,
+    latched_playlists: Arc<AtomicBool>,
+    playlists_stats: Arc<AreaStats>,
 }
 
 impl InternalApi {
@@ -134,6 +143,8 @@ impl InternalApi {
             metadata_stats: Arc::new(AreaStats::default()),
             latched_library: Arc::new(AtomicBool::new(false)),
             library_stats: Arc::new(AreaStats::default()),
+            latched_playlists: Arc::new(AtomicBool::new(false)),
+            playlists_stats: Arc::new(AreaStats::default()),
         }
     }
 
@@ -160,6 +171,7 @@ impl InternalApi {
         match area {
             Area::Metadata => &self.latched_metadata,
             Area::Library => &self.latched_library,
+            Area::Playlists => &self.latched_playlists,
         }
     }
 
@@ -172,6 +184,7 @@ impl InternalApi {
         match area {
             Area::Metadata => &self.metadata_stats,
             Area::Library => &self.library_stats,
+            Area::Playlists => &self.playlists_stats,
         }
     }
 
@@ -395,6 +408,7 @@ mod tests {
             from_config: true,
             metadata: true,
             library: true,
+            playlists: true,
         };
         let api = InternalApi::new(on);
         assert!(!api.skip(Area::Metadata));
@@ -437,6 +451,20 @@ mod tests {
     }
 
     #[test]
+    fn playlists_area_follows_its_switch_and_the_master_switch() {
+        let mut values = crate::config::ConfigValues::default();
+        assert!(Settings::from_values(&values).area_enabled(Area::Playlists));
+        values.internal_api_areas = Some(crate::config::InternalApiAreas {
+            playlists: Some(false),
+            ..Default::default()
+        });
+        let s = Settings::from_values(&values);
+        assert!(!s.area_enabled(Area::Playlists));
+        assert!(s.area_enabled(Area::Library));
+        assert_eq!(Area::Playlists.name(), "playlists");
+    }
+
+    #[test]
     fn library_latch_is_separate_from_metadata() {
         let api = InternalApi::new(Settings::from_values(&Default::default()));
         assert!(api.latch(Area::Library));
@@ -452,6 +480,7 @@ mod tests {
             from_config: true,
             metadata: true,
             library: true,
+            playlists: true,
         });
         assert!(api.session().is_none());
     }
