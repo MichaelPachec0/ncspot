@@ -27,7 +27,7 @@ use crate::library_collection::{
     sort_newest_first, with_artist,
 };
 use crate::library_sync::{
-    SavedItem, SavedPage, Synced, any_added_at_missing, full_fetch_due, sync_liked, sync_saved,
+    SavedItem, SavedPage, Synced, any_added_at_missing, full_fetch_needed, sync_liked, sync_saved,
 };
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -162,7 +162,7 @@ impl Library {
             cfg,
         };
 
-        library.update_library();
+        library.update_library(false);
         library
     }
 
@@ -271,7 +271,7 @@ impl Library {
         debug!("saving {} tracks to list {}", tracks.len(), id);
         self.spotify.api.overwrite_playlist(id, tracks);
 
-        if self.fetch_playlists().listing_complete {
+        if self.fetch_playlists(false).listing_complete {
             self.save_cache(
                 &config::cache_path(CACHE_PLAYLISTS),
                 &self.playlists.read().unwrap(),
@@ -288,10 +288,11 @@ impl Library {
         }
     }
 
-    /// Update the local library and its cache on disk. Does nothing if a sync is already
-    /// running. If the sync is left incomplete by a rate limit, a resume is scheduled for when
-    /// the limit has passed.
-    pub fn update_library(&self) {
+    /// Update the local library and its cache on disk; with `force_full` every set is
+    /// downloaded again instead of synced from its changes. Does nothing if a sync is already
+    /// running. If the sync is left incomplete by a rate limit, a resume (not forced) is
+    /// scheduled for when the limit has passed.
+    pub fn update_library(&self, force_full: bool) {
         if self
             .syncing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -309,23 +310,23 @@ impl Library {
 
             let t_collection = {
                 let library = library.clone();
-                thread::spawn(move || library.sync_collection())
+                thread::spawn(move || library.sync_collection(force_full))
             };
             let t_artists = {
                 let library = library.clone();
-                thread::spawn(move || library.sync_artists())
+                thread::spawn(move || library.sync_artists(force_full))
             };
             let t_playlists = {
                 let library = library.clone();
-                thread::spawn(move || library.sync_playlists())
+                thread::spawn(move || library.sync_playlists(force_full))
             };
             let t_shows = {
                 let library = library.clone();
-                thread::spawn(move || library.sync_shows())
+                thread::spawn(move || library.sync_shows(force_full))
             };
             let t_episodes = {
                 let library = library.clone();
-                thread::spawn(move || library.sync_episodes())
+                thread::spawn(move || library.sync_episodes(force_full))
             };
 
             let collection_complete = t_collection.join().unwrap();
@@ -350,7 +351,7 @@ impl Library {
 
     /// Load the liked songs and saved albums caches and sync the `collection` set. Returns
     /// whether the sync was complete.
-    fn sync_collection(&self) -> bool {
+    fn sync_collection(&self, force_full: bool) -> bool {
         let valid = self.load_cache(
             &config::cache_path(CACHE_TRACKS),
             self.tracks.write().unwrap().as_mut(),
@@ -358,17 +359,17 @@ impl Library {
             &config::cache_path(CACHE_ALBUMS),
             self.albums.write().unwrap().as_mut(),
         );
-        self.fetch_collection(valid)
+        self.fetch_collection(valid, force_full)
     }
 
     /// Load the artists cache and sync the followed artists. Finish with
     /// [Library::finish_artists] once the liked songs are in.
-    fn sync_artists(&self) -> ArtistsSync {
+    fn sync_artists(&self, force_full: bool) -> ArtistsSync {
         let valid = self.load_cache(
             &config::cache_path(CACHE_ARTISTS),
             self.artists.write().unwrap().as_mut(),
         );
-        self.fetch_artists_any(valid)
+        self.fetch_artists_any(valid, force_full)
     }
 
     /// Rebuild the artists of the liked songs into the artists store and save `artists.db`.
@@ -403,7 +404,7 @@ impl Library {
 
     /// Load the playlists cache (and the layout, over the internal API), sync the playlists
     /// and prefetch their covers. Returns whether the sync was complete.
-    fn sync_playlists(&self) -> bool {
+    fn sync_playlists(&self, force_full: bool) -> bool {
         self.load_cache(
             &config::cache_path(CACHE_PLAYLISTS),
             self.playlists.write().unwrap().as_mut(),
@@ -417,9 +418,11 @@ impl Library {
             );
         }
         // The internal sync saves its own caches.
-        let internal_sync = internal.then(|| self.fetch_playlists_internal()).flatten();
+        let internal_sync = internal
+            .then(|| self.fetch_playlists_internal(force_full))
+            .flatten();
         let sync = internal_sync.unwrap_or_else(|| {
-            let sync = self.fetch_playlists();
+            let sync = self.fetch_playlists(force_full);
             if sync.listing_complete {
                 self.save_cache(
                     &config::cache_path(CACHE_PLAYLISTS),
@@ -443,19 +446,19 @@ impl Library {
 
     /// Load the shows cache (internal API only) and sync the saved shows. Returns whether the
     /// sync was complete.
-    fn sync_shows(&self) -> bool {
+    fn sync_shows(&self, force_full: bool) -> bool {
         // With the area off nothing is loaded: the Web fetcher runs as before.
         let valid = self.spotify.api.internal_enabled(Area::Library)
             && self.load_cache(
                 &config::cache_path(CACHE_SHOWS),
                 self.shows.write().unwrap().as_mut(),
             );
-        self.fetch_shows_any(valid)
+        self.fetch_shows_any(valid, force_full)
     }
 
     /// Load the Your Episodes cache and sync it; nothing to do while Your Episodes is off.
     /// Returns whether the sync was complete.
-    fn sync_episodes(&self) -> bool {
+    fn sync_episodes(&self, force_full: bool) -> bool {
         if !self.episodes_enabled {
             return true;
         }
@@ -463,7 +466,7 @@ impl Library {
             &config::cache_path(CACHE_EPISODES),
             self.episodes.write().unwrap().as_mut(),
         );
-        self.fetch_episodes(valid)
+        self.fetch_episodes(valid, force_full)
     }
 
     /// After a sync that started at `sync_start`: reset the resume count if it was complete,
@@ -518,20 +521,23 @@ impl Library {
             thread::sleep(delay);
             library.resume_pending.store(false, Ordering::SeqCst);
             library.resume_count.fetch_add(1, Ordering::SeqCst);
-            library.update_library();
+            library.update_library(false);
         });
     }
 
     /// Returns the current Unix time and whether the list stored under `key` needs a full
-    /// fetch now, logging when it does. The state lock is released before returning.
-    fn full_fetch_check(&self, key: &str, what: &str) -> (i64, bool) {
+    /// fetch now (always when `forced`), logging when it does. The state lock is released
+    /// before returning.
+    fn full_fetch_check(&self, key: &str, what: &str, forced: bool) -> (i64, bool) {
         let now = chrono::Utc::now().timestamp();
         let last = self.cfg.state().library_full_fetch.get(key).copied();
-        let force_full = full_fetch_due(last, now);
-        if force_full {
+        let full = full_fetch_needed(forced, last, now);
+        if forced {
+            debug!("{what}: full refresh (requested)");
+        } else if full {
             debug!("{what}: full refresh (cache older than 24h)");
         }
-        (now, force_full)
+        (now, full)
     }
 
     /// Record that the list stored under `key` was fully fetched at `now` (Unix seconds).
@@ -558,8 +564,9 @@ impl Library {
     }
 
     /// Fetch the saved shows from the web API and save them to the local library, unless they
-    /// are unchanged. Returns false, leaving the stored shows unchanged, if a page failed.
-    fn fetch_shows(&self) -> bool {
+    /// are unchanged (always with `force_full`). Returns false, leaving the stored shows
+    /// unchanged, if a page failed.
+    fn fetch_shows(&self, force_full: bool) -> bool {
         debug!("loading shows");
         let stored_ids: Vec<Option<String>> = self
             .shows
@@ -568,8 +575,8 @@ impl Library {
             .iter()
             .map(|show| Some(show.id.clone()))
             .collect();
-        let (now, force_full) = self.full_fetch_check(FULL_FETCH_SHOWS, "shows");
-        let synced = sync_saved(&stored_ids, force_full, |offset| {
+        let (now, full) = self.full_fetch_check(FULL_FETCH_SHOWS, "shows", force_full);
+        let synced = sync_saved(&stored_ids, full, |offset| {
             debug!("shows page at offset {offset}");
             let page = self.spotify.api.get_saved_shows(offset as u32).ok()?;
             Some(SavedPage {
@@ -610,8 +617,9 @@ impl Library {
     /// the local version with the remote, pruning removed playlists in the process. Reports
     /// whether the remote listing was complete (if not, the cache must not be saved as
     /// authoritative) and whether every playlist that needed it had its tracks loaded (if not,
-    /// the cached copies were kept and the sync is incomplete).
-    fn fetch_playlists(&self) -> PlaylistSync {
+    /// the cached copies were kept and the sync is incomplete). With `force_full` every listed
+    /// playlist is downloaded again, unchanged ones too.
+    fn fetch_playlists(&self, force_full: bool) -> PlaylistSync {
         debug!("loading playlists");
         let known_at_start: Vec<String> = self
             .playlists
@@ -634,7 +642,8 @@ impl Library {
         let mut items_complete = true;
         for (index, remote) in listed.iter().enumerate() {
             // Download without holding the store lock; only the merge locks.
-            let mut downloaded = if is_current(&self.playlists.read().unwrap(), remote) {
+            let current = !needs_download(&self.playlists.read().unwrap(), remote, force_full);
+            let mut downloaded = if current {
                 None
             } else {
                 info!("updating playlist {} (index: {})", remote.name, index);
@@ -654,6 +663,7 @@ impl Library {
             items_complete &= merge_listed(
                 &mut self.playlists.write().unwrap(),
                 std::slice::from_ref(remote),
+                force_full,
                 |_| downloaded.take(),
             );
             // trigger redraw
@@ -689,8 +699,9 @@ impl Library {
     /// Sync the playlists from the internal API rootlist: changed playlists are downloaded
     /// [PLAYLIST_FETCH_SPACING] apart and a rate limit stops the remaining downloads. On a
     /// complete rootlist the store is pruned and sorted, and `playlists.db` and
-    /// `playlist_layout.db` are saved together. `None` means: use the Web path for this sync.
-    fn fetch_playlists_internal(&self) -> Option<PlaylistSync> {
+    /// `playlist_layout.db` are saved together. With `force_full` every listed playlist is
+    /// downloaded again, unchanged ones too. `None` means: use the Web path for this sync.
+    fn fetch_playlists_internal(&self, force_full: bool) -> Option<PlaylistSync> {
         let api = &self.spotify.api;
         debug!("loading playlists over the internal API");
         let rootlist = match api.playlist_rootlist() {
@@ -749,7 +760,7 @@ impl Library {
 
         for (index, (remote, status)) in listed.iter().enumerate() {
             // Download without holding the store lock; only the merge locks.
-            let current = is_current(&self.playlists.read().unwrap(), remote);
+            let current = !needs_download(&self.playlists.read().unwrap(), remote, force_full);
             let mut downloaded = if current {
                 None
             } else {
@@ -768,9 +779,10 @@ impl Library {
                     .iter()
                     .find(|p| p.id == remote.id)
                     .map(|p| (p.name.clone(), p.cover_url.clone(), p.num_tracks));
-                let merged = merge_listed(&mut store, std::slice::from_ref(remote), |_| {
-                    downloaded.take()
-                });
+                let merged =
+                    merge_listed(&mut store, std::slice::from_ref(remote), force_full, |_| {
+                        downloaded.take()
+                    });
                 // A 403 playlist can never be downloaded; it does not make the sync incomplete.
                 if *status != FORBIDDEN {
                     items_complete &= merged;
@@ -964,8 +976,8 @@ impl Library {
 
     /// Sync liked songs and saved albums, which share the `collection` set and its token.
     /// Saves each cache that changed (or was not valid at load); the token is stored only if
-    /// the writes that were needed worked.
-    fn fetch_collection(&self, cache_valid: bool) -> bool {
+    /// the writes that were needed worked. `force_full` downloads both lists again.
+    fn fetch_collection(&self, cache_valid: bool, force_full: bool) -> bool {
         let api = &self.spotify.api;
         // A token describes its cache only: without a valid cache it must not survive a sync
         // that ends without a new one.
@@ -975,7 +987,7 @@ impl Library {
         let token = self.sync_token(SET_COLLECTION);
         let usable = api.internal_usable(Area::Library);
         let (now, full_due) = if usable {
-            self.full_fetch_check(SET_COLLECTION, "collection")
+            self.full_fetch_check(SET_COLLECTION, "collection", force_full)
         } else {
             (0, false)
         };
@@ -997,8 +1009,8 @@ impl Library {
             SetOutcome::Web => {
                 // Two Web fetchers, both always run, in parallel.
                 let (tracks, albums) = thread::scope(|scope| {
-                    let tracks = scope.spawn(|| self.fetch_tracks());
-                    let albums = scope.spawn(|| self.fetch_albums());
+                    let tracks = scope.spawn(|| self.fetch_tracks(force_full));
+                    let albums = scope.spawn(|| self.fetch_albums(force_full));
                     (tracks.join().unwrap(), albums.join().unwrap())
                 });
                 changes = Changes {
@@ -1074,8 +1086,9 @@ impl Library {
     }
 
     /// Sync the followed artists from the `artist` set into the store. The caller saves
-    /// `artists.db` and then finishes the set with the returned [ArtistsSync].
-    fn fetch_artists_any(&self, cache_valid: bool) -> ArtistsSync {
+    /// `artists.db` and then finishes the set with the returned [ArtistsSync]. `force_full`
+    /// downloads the set again.
+    fn fetch_artists_any(&self, cache_valid: bool, force_full: bool) -> ArtistsSync {
         let api = &self.spotify.api;
         if !cache_valid {
             self.clear_sync_token(SET_ARTIST);
@@ -1083,7 +1096,7 @@ impl Library {
         let token = self.sync_token(SET_ARTIST);
         let usable = api.internal_usable(Area::Library);
         let (now, full_due) = if usable {
-            self.full_fetch_check(SET_ARTIST, "artists")
+            self.full_fetch_check(SET_ARTIST, "artists", force_full)
         } else {
             (0, false)
         };
@@ -1130,8 +1143,8 @@ impl Library {
     }
 
     /// Sync the saved shows from the `show` set, caching them in `shows.db`. Returns whether
-    /// the sync was complete.
-    fn fetch_shows_any(&self, cache_valid: bool) -> bool {
+    /// the sync was complete. `force_full` downloads the set again.
+    fn fetch_shows_any(&self, cache_valid: bool, force_full: bool) -> bool {
         let api = &self.spotify.api;
         if !cache_valid {
             self.clear_sync_token(SET_SHOW);
@@ -1139,7 +1152,7 @@ impl Library {
         let token = self.sync_token(SET_SHOW);
         let usable = api.internal_usable(Area::Library);
         let (now, full_due) = if usable {
-            self.full_fetch_check(SET_SHOW, "shows")
+            self.full_fetch_check(SET_SHOW, "shows", force_full)
         } else {
             (0, false)
         };
@@ -1174,7 +1187,7 @@ impl Library {
                 (saved, saved)
             }
             SetOutcome::Incomplete => (false, false),
-            SetOutcome::Web => (self.fetch_shows(), false),
+            SetOutcome::Web => (self.fetch_shows(force_full), false),
         };
         self.apply_finish(SET_SHOW, finish_set(outcome, saved, mode, cache_valid), now);
         complete
@@ -1182,8 +1195,9 @@ impl Library {
 
     /// Sync Your Episodes from the `listenlater` set, caching them in `episodes.db`. There is
     /// no Web fetcher: with the area unusable or the session falling back to the Web API the
-    /// cache stays as it is. Returns whether the sync was complete.
-    fn fetch_episodes(&self, cache_valid: bool) -> bool {
+    /// cache stays as it is. Returns whether the sync was complete. `force_full` downloads the
+    /// set again.
+    fn fetch_episodes(&self, cache_valid: bool, force_full: bool) -> bool {
         let api = &self.spotify.api;
         if !api.internal_usable(Area::Library) {
             return true;
@@ -1192,7 +1206,7 @@ impl Library {
             self.clear_sync_token(SET_LISTEN_LATER);
         }
         let token = self.sync_token(SET_LISTEN_LATER);
-        let (now, full_due) = self.full_fetch_check(SET_LISTEN_LATER, "episodes");
+        let (now, full_due) = self.full_fetch_check(SET_LISTEN_LATER, "episodes", force_full);
         let mode = plan_sync(true, full_due, token.is_some(), cache_valid);
         let result = (|| {
             let fetched = fetch_membership(api, SET_LISTEN_LATER, mode, token.as_deref())?;
@@ -1231,8 +1245,9 @@ impl Library {
     }
 
     /// Fetch the saved albums from the web API and store them in the local library, unless they
-    /// are unchanged. On a failed page the stored albums stay as they were.
-    fn fetch_albums(&self) -> Fetch {
+    /// are unchanged (always with `force_full`). On a failed page the stored albums stay as they
+    /// were.
+    fn fetch_albums(&self, force_full: bool) -> Fetch {
         let (stored_ids, incomplete) = {
             let albums = self.albums.read().unwrap();
             (
@@ -1245,8 +1260,8 @@ impl Library {
                 any_added_at_missing(albums.iter().map(|album| album.added_at)),
             )
         };
-        let (now, force_full) = self.full_fetch_check(FULL_FETCH_ALBUMS, "albums");
-        let synced = sync_saved(&stored_ids, force_full || incomplete, |offset| {
+        let (now, full) = self.full_fetch_check(FULL_FETCH_ALBUMS, "albums", force_full);
+        let synced = sync_saved(&stored_ids, full || incomplete, |offset| {
             debug!("albums page at offset {offset}");
             let page = self
                 .spotify
@@ -1288,14 +1303,14 @@ impl Library {
     }
 
     /// Fetch the liked songs from the web API and save them in the local library. Only new
-    /// likes are downloaded when nothing else changed. On a failed page the stored songs stay
-    /// as they were.
-    fn fetch_tracks(&self) -> Fetch {
+    /// likes are downloaded when nothing else changed, unless `force_full`. On a failed page the
+    /// stored songs stay as they were.
+    fn fetch_tracks(&self, force_full: bool) -> Fetch {
         let cached: Vec<Track> = self.tracks.read().unwrap().clone();
-        let (now, force_full) = self.full_fetch_check(FULL_FETCH_TRACKS, "liked songs");
+        let (now, full) = self.full_fetch_check(FULL_FETCH_TRACKS, "liked songs", force_full);
         let synced = sync_liked(
             &cached,
-            force_full,
+            full,
             |track: &Track| track.id.clone(),
             |offset| {
                 debug!("tracks page at offset {offset}");
@@ -1857,25 +1872,36 @@ fn is_current(store: &[Playlist], remote: &Playlist) -> bool {
         .any(|p| p.id == remote.id && p.snapshot_id == remote.snapshot_id && p.tracks.is_some())
 }
 
+/// Whether the tracks of `remote` must be downloaded: always with `force_full`, otherwise
+/// unless the store already holds it [is_current].
+fn needs_download(store: &[Playlist], remote: &Playlist, force_full: bool) -> bool {
+    force_full || !is_current(store, remote)
+}
+
 /// Merge the `listed` playlists into `store`, in order. An unchanged, loaded playlist only
-/// refreshes its cover, name and track count; otherwise `download` fetches the tracks. A failed
-/// download keeps an existing copy untouched (old snapshot, so the next sync retries) or stores
-/// the listed playlist unloaded. Returns false if any download failed.
+/// refreshes its cover, name and track count, unless `force_full`; otherwise `download` fetches
+/// the tracks. A failed download keeps an existing copy's tracks (old snapshot, so the next sync
+/// retries; an unchanged copy still gets the refresh) or stores the listed playlist unloaded.
+/// Returns false if any download failed.
 fn merge_listed(
     store: &mut Vec<Playlist>,
     listed: &[Playlist],
+    force_full: bool,
     mut download: impl FnMut(&Playlist) -> Option<Vec<Playable>>,
 ) -> bool {
+    let refresh = |local: &mut Playlist, remote: &Playlist| {
+        local.cover_url = remote.cover_url.clone();
+        local.name = remote.name.clone();
+        local.num_tracks = remote.num_tracks;
+    };
     let mut items_complete = true;
     for remote in listed {
         let pos = store.iter().position(|p| p.id == remote.id);
-        if let Some(i) = pos
-            && is_current(std::slice::from_ref(&store[i]), remote)
+        let current = pos.filter(|&i| is_current(std::slice::from_ref(&store[i]), remote));
+        if let Some(i) = current
+            && !force_full
         {
-            let local = &mut store[i];
-            local.cover_url = remote.cover_url.clone();
-            local.name = remote.name.clone();
-            local.num_tracks = remote.num_tracks;
+            refresh(&mut store[i], remote);
             continue;
         }
         match download(remote) {
@@ -1889,7 +1915,9 @@ fn merge_listed(
             }
             None => {
                 items_complete = false;
-                if pos.is_none() {
+                if let Some(i) = current {
+                    refresh(&mut store[i], remote);
+                } else if pos.is_none() {
                     let mut unloaded = remote.clone();
                     unloaded.tracks = None;
                     store.push(unloaded);
@@ -2230,6 +2258,7 @@ mod test {
         let complete = merge_listed(
             &mut store,
             &[listed("a", "2"), listed("b", "1"), listed("c", "1")],
+            false,
             |p| (p.id == "c").then(Vec::new),
         );
         assert!(!complete);
@@ -2253,11 +2282,83 @@ mod test {
             ..listed("a", "1")
         }];
         let mut calls = 0;
-        assert!(merge_listed(&mut store, &[listed("a", "1")], |_| {
+        assert!(merge_listed(&mut store, &[listed("a", "1")], false, |_| {
             calls += 1;
             None
         }));
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn a_forced_full_downloads_an_unchanged_loaded_playlist() {
+        let mut store = vec![Playlist {
+            tracks: Some(vec![]),
+            ..listed("a", "1")
+        }];
+        let remote = listed("a", "1");
+        assert!(!needs_download(&store, &remote, false));
+        assert!(needs_download(&store, &remote, true));
+        let mut calls = 0;
+        let fresh = crate::playlist_items::placeholder("spotify:track:x");
+        assert!(merge_listed(
+            &mut store,
+            std::slice::from_ref(&remote),
+            true,
+            |_| {
+                calls += 1;
+                Some(vec![fresh.clone()])
+            }
+        ));
+        assert_eq!(calls, 1);
+        assert_eq!(store[0].tracks.as_ref().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn a_failed_forced_download_keeps_the_copy_and_refreshes_its_listing() {
+        let mut store = vec![Playlist {
+            tracks: Some(vec![]),
+            ..listed("a", "1")
+        }];
+        let remote = Playlist {
+            name: "renamed".into(),
+            num_tracks: 7,
+            ..listed("a", "1")
+        };
+        assert!(!merge_listed(
+            &mut store,
+            std::slice::from_ref(&remote),
+            true,
+            |_| None
+        ));
+        assert_eq!(store[0].tracks.as_ref().map(Vec::len), Some(0));
+        assert_eq!(store[0].name, "renamed");
+        assert_eq!(store[0].num_tracks, 7);
+    }
+
+    #[test]
+    fn a_forced_full_is_due_right_after_a_full_fetch() {
+        let library = test_library();
+        let now = chrono::Utc::now().timestamp();
+        library.record_full_fetch(SET_COLLECTION, now);
+        assert!(
+            !library
+                .full_fetch_check(SET_COLLECTION, "collection", false)
+                .1
+        );
+        assert!(
+            library
+                .full_fetch_check(SET_COLLECTION, "collection", true)
+                .1
+        );
+    }
+
+    #[test]
+    fn a_forced_full_plans_a_full_sync_over_a_token_and_a_valid_cache() {
+        let now = 1_000_000;
+        let due = full_fetch_needed(true, Some(now), now);
+        assert_eq!(plan_sync(true, due, true, true), Mode::Full);
+        let due = full_fetch_needed(false, Some(now), now);
+        assert_eq!(plan_sync(true, due, true, true), Mode::Delta);
     }
 
     fn ids(list: &[Playlist]) -> Vec<&str> {
@@ -2571,7 +2672,7 @@ mod test {
         library.syncing.store(true, Ordering::SeqCst);
         *library.is_done.write().unwrap() = true;
 
-        library.update_library();
+        library.update_library(true);
 
         assert!(*library.is_done.read().unwrap());
         assert!(library.syncing.load(Ordering::SeqCst));
@@ -2722,7 +2823,7 @@ mod test {
         let library = test_library();
         *library.playlist_layout.write().unwrap() = vec![LayoutEntry::Playlist("p".into())];
         assert!(library.spotify.api.internal_usable(Area::Playlists));
-        assert!(library.fetch_playlists_internal().is_none());
+        assert!(library.fetch_playlists_internal(false).is_none());
         assert!(library.playlist_layout.read().unwrap().is_empty());
         assert_eq!(library.spotify.api.area_counts(Area::Playlists).fallback, 1);
         assert!(library.spotify.api.internal_usable(Area::Playlists));
