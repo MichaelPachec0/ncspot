@@ -763,7 +763,7 @@ impl Library {
         }
 
         if listing_complete {
-            let pinned = match api.collection_page_all(SET_PIN) {
+            let pinned = match api.collection_page_all(Area::Playlists, SET_PIN) {
                 Ok(listing) => pinned_ids(&listing.items),
                 Err(err) => {
                     debug!("playlists: pins not read ({err}), keeping the previous pins");

@@ -318,12 +318,18 @@ impl WebApi {
         self.internal.settings().area_enabled(area)
     }
 
-    /// Every item of a collection set, page by page (each page is one internal call).
-    pub fn collection_page_all(&self, set: &'static str) -> Result<Listing, InternalError> {
+    /// Every item of a collection set, page by page (each page is one internal call in
+    /// `area`, so a set read for the playlists, such as the pins, follows the Playlists switch
+    /// and latch and counts there).
+    pub fn collection_page_all(
+        &self,
+        area: Area,
+        set: &'static str,
+    ) -> Result<Listing, InternalError> {
         let mut listing = Listing::default();
         let mut token = String::new();
         loop {
-            let page = self.run_internal(Area::Library, |session| {
+            let page = self.run_internal(area, |session| {
                 collection::page(session, set, token.clone())
             })?;
             match collection::absorb(&mut listing, page) {
@@ -1540,6 +1546,20 @@ mod test {
         let episodes = vec!["spotify:episode:4uLU6hMCjMI75M1A2tKUQC".to_string()];
         assert!(matches!(
             api.episodes_in(Area::Playlists, &episodes),
+            Err(InternalError::NoSession)
+        ));
+    }
+
+    #[test]
+    fn pins_are_read_under_the_playlists_area() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Library, &InternalError::ProtocolChanged("x".into()));
+        assert!(matches!(
+            api.collection_page_all(Area::Library, "ylpin"),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+        assert!(matches!(
+            api.collection_page_all(Area::Playlists, "ylpin"),
             Err(InternalError::NoSession)
         ));
     }

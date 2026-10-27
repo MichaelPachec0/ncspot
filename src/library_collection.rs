@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use log::debug;
 
+use crate::internal_api::Area;
 use crate::internal_api::collection::{Delta, Item, Listing};
 use crate::internal_api::error::InternalError;
 use crate::model::album::Album;
@@ -48,7 +49,7 @@ pub trait CollectionSource {
 
 impl CollectionSource for crate::spotify_api::WebApi {
     fn page_all(&self, set: &'static str) -> Result<Listing, InternalError> {
-        self.collection_page_all(set)
+        self.collection_page_all(Area::Library, set)
     }
 
     fn delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
