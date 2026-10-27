@@ -212,6 +212,8 @@ impl CommandManager {
                 self.library.update_library(true);
                 Ok(None)
             }
+            // The Playlists tab and the playlist view handle these while on screen.
+            Command::Pin | Command::Unpin => Ok(Some(crate::ui::playlists::PIN_HINT.to_string())),
             // The library view handles it while on screen.
             Command::UpdateTab => Ok(Some(crate::ui::library::UPDATE_TAB_HINT.to_string())),
             Command::TogglePlay => {

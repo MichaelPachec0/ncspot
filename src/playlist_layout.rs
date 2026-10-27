@@ -71,6 +71,27 @@ pub fn insert_after_pins(layout: &mut Vec<LayoutEntry>, id: &str) {
     layout.insert(at, LayoutEntry::Playlist(id.to_string()));
 }
 
+/// Replace the pinned block of `layout` with `pinned`. An empty layout (the flat list) stays
+/// empty. True when the layout changed.
+pub fn set_pins(layout: &mut Vec<LayoutEntry>, pinned: &[String]) -> bool {
+    if layout.is_empty() {
+        return false;
+    }
+    let rest: Vec<LayoutEntry> = layout
+        .iter()
+        .filter(|entry| !matches!(entry, LayoutEntry::Pinned(_)))
+        .cloned()
+        .collect();
+    let mut next: Vec<LayoutEntry> = pinned
+        .iter()
+        .map(|id| LayoutEntry::Pinned(id.clone()))
+        .collect();
+    next.extend(rest);
+    let changed = next != *layout;
+    *layout = next;
+    changed
+}
+
 /// Drop playlist `id` from the rootlist part of `layout`; its pin, if any, stays (pins are
 /// their own set). True when an entry was removed.
 pub fn remove_from_layout(layout: &mut Vec<LayoutEntry>, id: &str) -> bool {
@@ -230,6 +251,10 @@ impl ListItem for PlaylistRow {
 
     fn share_url(&self) -> Option<String> {
         self.with(ListItem::share_url).flatten()
+    }
+
+    fn playlist_id(&self) -> Option<String> {
+        Self::playlist_id(self).map(str::to_string)
     }
 
     fn album(&self, queue: &Queue) -> Option<Album> {
@@ -604,6 +629,33 @@ mod tests {
                 LayoutEntry::FolderEnd,
             ]
         );
+    }
+
+    #[test]
+    fn set_pins_replaces_the_pinned_block() {
+        let mut layout = vec![
+            LayoutEntry::Pinned("a".into()),
+            LayoutEntry::Playlist("x".into()),
+        ];
+        assert!(set_pins(&mut layout, &["b".to_string(), "c".to_string()]));
+        assert_eq!(
+            layout,
+            vec![
+                LayoutEntry::Pinned("b".into()),
+                LayoutEntry::Pinned("c".into()),
+                LayoutEntry::Playlist("x".into()),
+            ]
+        );
+        assert!(!set_pins(&mut layout, &["b".to_string(), "c".to_string()]));
+        assert!(set_pins(&mut layout, &[]));
+        assert_eq!(layout, vec![LayoutEntry::Playlist("x".into())]);
+    }
+
+    #[test]
+    fn set_pins_leaves_a_flat_layout_empty() {
+        let mut layout = Vec::new();
+        assert!(!set_pins(&mut layout, &["a".to_string()]));
+        assert!(layout.is_empty());
     }
 
     #[test]

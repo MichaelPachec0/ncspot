@@ -42,7 +42,7 @@ use crate::playlist_edit::{self, EditError, created_playlist};
 use crate::playlist_items::UNAVAILABLE;
 use crate::playlist_layout::{
     LayoutEntry, PLAYLIST_FETCH_SPACING, Spacer, insert_after_pins, layout_from, pinned_ids,
-    remove_from_layout,
+    remove_from_layout, set_pins,
 };
 use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
@@ -67,6 +67,8 @@ const CACHE_PLAYLISTS: &str = "playlists.db";
 
 /// Cached Playlists tab layout (folders and pins) filename.
 const CACHE_PLAYLIST_LAYOUT: &str = "playlist_layout.db";
+
+const PLAYLIST_URI_PREFIX: &str = "spotify:playlist:";
 
 /// The collection v2 set of pinned items.
 const SET_PIN: &str = "ylpin";
@@ -274,11 +276,69 @@ impl Library {
             self.save_layout();
         }
         self.trigger_redraw();
+        // A pin on a deleted playlist would linger in the set; a failure only logs.
+        if self.is_pinned(id) && self.unpin_playlist(id) != PinOutcome::Done {
+            warn!("Deleted a pinned playlist but could not unpin it");
+        }
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(
                 id.to_string(),
             )));
+    }
+
+    /// Whether playlist `id` is in the layout's pinned block.
+    pub fn is_pinned(&self, id: &str) -> bool {
+        self.playlist_layout
+            .read()
+            .unwrap()
+            .iter()
+            .any(|entry| matches!(entry, LayoutEntry::Pinned(p) if p == id))
+    }
+
+    /// Pin playlist `id`. Internal API only (no Web fallback).
+    pub fn pin_playlist(&self, id: &str) -> PinOutcome {
+        self.change_pin(id, true)
+    }
+
+    /// Unpin playlist `id`. Internal API only (no Web fallback).
+    pub fn unpin_playlist(&self, id: &str) -> PinOutcome {
+        self.change_pin(id, false)
+    }
+
+    /// Pin or unpin playlist `id` for a command or menu entry; the status note to show, if any.
+    pub fn pin_command(&self, id: &str, pin: bool) -> Option<String> {
+        let outcome = if pin {
+            self.pin_playlist(id)
+        } else {
+            self.unpin_playlist(id)
+        };
+        pin_note(&outcome).map(str::to_string)
+    }
+
+    fn change_pin(&self, id: &str, pin: bool) -> PinOutcome {
+        let api = &self.spotify.api;
+        let uri = format!("{PLAYLIST_URI_PREFIX}{id}");
+        let (outcome, pinned) = run_pin_change(
+            pin,
+            &uri,
+            api.internal_usable(Area::Playlists),
+            || api.collection_page_all(Area::Playlists, SET_PIN),
+            || api.collection_write(Area::Playlists, SET_PIN, std::slice::from_ref(&uri), !pin),
+            |err| {
+                if let InternalError::ProtocolChanged(_) = err {
+                    api.latch_area(Area::Playlists, err);
+                }
+            },
+        );
+        if let Some(pinned) = pinned {
+            let changed = set_pins(&mut self.playlist_layout.write().unwrap(), &pinned);
+            if changed {
+                self.save_layout();
+            }
+            self.trigger_redraw();
+        }
+        outcome
     }
 
     /// Save the Playlists tab layout to `playlist_layout.db`.
@@ -1704,7 +1764,7 @@ impl Library {
         if !write_through(
             api,
             Area::Library,
-            || api.collection_write(SET_COLLECTION, &uris, false),
+            || api.collection_write(Area::Library, SET_COLLECTION, &uris, false),
             || api.current_user_saved_tracks_add(ids).is_ok(),
         ) {
             return;
@@ -1751,7 +1811,7 @@ impl Library {
         if !write_through(
             api,
             Area::Library,
-            || api.collection_write(SET_COLLECTION, &uris, true),
+            || api.collection_write(Area::Library, SET_COLLECTION, &uris, true),
             || api.current_user_saved_tracks_delete(ids).is_ok(),
         ) {
             return;
@@ -1800,7 +1860,7 @@ impl Library {
             if !write_through(
                 api,
                 Area::Library,
-                || api.collection_write(SET_COLLECTION, &uris, false),
+                || api.collection_write(Area::Library, SET_COLLECTION, &uris, false),
                 || {
                     api.current_user_saved_albums_add(vec![album_id.as_str()])
                         .is_ok()
@@ -1838,7 +1898,7 @@ impl Library {
             if !write_through(
                 api,
                 Area::Library,
-                || api.collection_write(SET_COLLECTION, &uris, true),
+                || api.collection_write(Area::Library, SET_COLLECTION, &uris, true),
                 || {
                     api.current_user_saved_albums_delete(vec![album_id.as_str()])
                         .is_ok()
@@ -1881,7 +1941,7 @@ impl Library {
             if !write_through(
                 api,
                 Area::Library,
-                || api.collection_write(SET_ARTIST, &uris, false),
+                || api.collection_write(Area::Library, SET_ARTIST, &uris, false),
                 || api.user_follow_artists(vec![artist_id.as_str()]).is_ok(),
             ) {
                 return;
@@ -1919,7 +1979,7 @@ impl Library {
             if !write_through(
                 api,
                 Area::Library,
-                || api.collection_write(SET_ARTIST, &uris, true),
+                || api.collection_write(Area::Library, SET_ARTIST, &uris, true),
                 || api.user_unfollow_artists(vec![artist_id.as_str()]).is_ok(),
             ) {
                 return;
@@ -2049,7 +2109,7 @@ impl Library {
         if write_through(
             api,
             Area::Library,
-            || api.collection_write(SET_SHOW, &uris, false),
+            || api.collection_write(Area::Library, SET_SHOW, &uris, false),
             || api.save_shows(&[show.id.as_str()]).is_ok(),
         ) {
             {
@@ -2076,7 +2136,7 @@ impl Library {
         if write_through(
             api,
             Area::Library,
-            || api.collection_write(SET_SHOW, &uris, true),
+            || api.collection_write(Area::Library, SET_SHOW, &uris, true),
             || api.unsave_shows(&[show.id.as_str()]).is_ok(),
         ) {
             {
@@ -2465,7 +2525,7 @@ fn outcome(api: &WebApi, set: &str, result: Result<String, InternalError>) -> Se
 /// An episode write. Episodes have no Web API fallback: any failure fails the action with a
 /// warning; a protocol change still latches the area.
 fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
-    match api.collection_write(SET_LISTEN_LATER, uris, removed) {
+    match api.collection_write(Area::Library, SET_LISTEN_LATER, uris, removed) {
         Ok(()) => true,
         Err(err) => {
             if let InternalError::ProtocolChanged(_) = err {
@@ -2495,6 +2555,87 @@ fn rootlist_edit_failed(err: EditError) -> InternalError {
     };
     warn!("{note}");
     InternalError::from(err)
+}
+
+/// At most this many items can be pinned (`ylpin` holds playlists and the collection pins).
+pub const PIN_LIMIT: usize = 4;
+
+/// The result of a pin or unpin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinOutcome {
+    Done,
+    Full,
+    NotKept,
+    NeedsInternal,
+    Failed,
+}
+
+/// The status text for an outcome that needs one.
+pub fn pin_note(outcome: &PinOutcome) -> Option<&'static str> {
+    match outcome {
+        PinOutcome::Done => None,
+        PinOutcome::Full => Some("Pins are full (4): unpin one first"),
+        PinOutcome::NotKept => Some("Spotify did not keep the pin"),
+        PinOutcome::NeedsInternal => Some("Pins need the internal API"),
+        PinOutcome::Failed => Some("Could not change the pin"),
+    }
+}
+
+/// Whether one more item fits in a pin set that holds `pinned_count`.
+fn pin_decision(pinned_count: usize) -> bool {
+    pinned_count < PIN_LIMIT
+}
+
+/// One pin (`pin`) or unpin of `uri`: read the set, write, read it back. Returns the outcome
+/// and, on `Done`, the playlist ids now pinned. Nothing is sent when the area is unusable or
+/// the set is full; an already pinned playlist is not written again. `on_error` sees every
+/// internal error (to latch the area); no error text is logged, only its class.
+fn run_pin_change(
+    pin: bool,
+    uri: &str,
+    usable: bool,
+    mut read: impl FnMut() -> Result<crate::internal_api::collection::Listing, InternalError>,
+    write: impl FnOnce() -> Result<(), InternalError>,
+    mut on_error: impl FnMut(&InternalError),
+) -> (PinOutcome, Option<Vec<String>>) {
+    if !usable {
+        return (PinOutcome::NeedsInternal, None);
+    }
+    let mut fail = |err: InternalError| {
+        warn!("Could not change the pin ({})", err.class());
+        on_error(&err);
+        (PinOutcome::Failed, None)
+    };
+    let holds =
+        |items: &[crate::internal_api::collection::Item]| items.iter().any(|i| i.uri == uri);
+    if pin {
+        let before = match read() {
+            Ok(listing) => listing.items,
+            Err(err) => return fail(err),
+        };
+        if holds(&before) {
+            return (PinOutcome::Done, Some(pinned_ids(&before)));
+        }
+        if !pin_decision(before.len()) {
+            return (PinOutcome::Full, None);
+        }
+    }
+    if let Err(err) = write() {
+        return fail(err);
+    }
+    let after = match read() {
+        Ok(listing) => listing.items,
+        Err(err) => return fail(err),
+    };
+    if holds(&after) == pin {
+        (PinOutcome::Done, Some(pinned_ids(&after)))
+    } else if pin {
+        warn!("Spotify did not keep the pin");
+        (PinOutcome::NotKept, None)
+    } else {
+        warn!("Spotify did not remove the pin");
+        (PinOutcome::Failed, None)
+    }
 }
 
 /// One write in `area`: the internal API first, then the Web API per the fallback classes.
@@ -2906,6 +3047,186 @@ mod test {
         assert!(!library.load_cache(&dir.join("missing.db"), &mut store));
         assert!(!library.save_cache(&dir.join("no-such-dir").join("x.db"), &[1u32]));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn pin_items(uris: &[&str]) -> crate::internal_api::collection::Listing {
+        crate::internal_api::collection::Listing {
+            items: uris
+                .iter()
+                .map(|u| crate::internal_api::collection::Item {
+                    uri: u.to_string(),
+                    added_at: 0,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    const P: &str = "spotify:playlist:p";
+
+    #[test]
+    fn pin_decision_refuses_at_the_limit() {
+        assert!(pin_decision(3));
+        assert!(!pin_decision(4));
+        assert!(!pin_decision(5));
+    }
+
+    #[test]
+    fn pin_notes_have_their_texts() {
+        assert_eq!(pin_note(&PinOutcome::Done), None);
+        assert_eq!(
+            pin_note(&PinOutcome::Full),
+            Some("Pins are full (4): unpin one first")
+        );
+        assert_eq!(
+            pin_note(&PinOutcome::NotKept),
+            Some("Spotify did not keep the pin")
+        );
+        assert_eq!(
+            pin_note(&PinOutcome::NeedsInternal),
+            Some("Pins need the internal API")
+        );
+        assert_eq!(
+            pin_note(&PinOutcome::Failed),
+            Some("Could not change the pin")
+        );
+    }
+
+    #[test]
+    fn pin_with_the_area_off_sends_nothing() {
+        let library = test_library();
+        library
+            .spotify
+            .api
+            .latch_area(Area::Playlists, &InternalError::ProtocolChanged("x".into()));
+        assert!(!library.is_pinned("p"));
+        assert_eq!(library.pin_playlist("p"), PinOutcome::NeedsInternal);
+        assert_eq!(library.unpin_playlist("p"), PinOutcome::NeedsInternal);
+    }
+
+    #[test]
+    fn is_pinned_reads_the_layout() {
+        let library = test_library();
+        *library.playlist_layout.write().unwrap() = vec![
+            LayoutEntry::Pinned("p".into()),
+            LayoutEntry::Playlist("q".into()),
+        ];
+        assert!(library.is_pinned("p"));
+        assert!(!library.is_pinned("q"));
+    }
+
+    #[test]
+    fn pin_at_four_sends_nothing() {
+        let wrote = std::cell::Cell::new(false);
+        let full = ["spotify:collection:tracks", "spotify:playlist:a", "b", "c"];
+        let (outcome, pinned) = run_pin_change(
+            true,
+            P,
+            true,
+            || Ok(pin_items(&full)),
+            || {
+                wrote.set(true);
+                Ok(())
+            },
+            |_| {},
+        );
+        assert_eq!(outcome, PinOutcome::Full);
+        assert_eq!(pinned, None);
+        assert!(!wrote.get());
+    }
+
+    #[test]
+    fn pin_at_three_writes_and_verifies() {
+        let reads = std::cell::Cell::new(0);
+        let (outcome, pinned) = run_pin_change(
+            true,
+            P,
+            true,
+            || {
+                reads.set(reads.get() + 1);
+                Ok(if reads.get() == 1 {
+                    pin_items(&["spotify:playlist:a", "x", "y"])
+                } else {
+                    pin_items(&["spotify:playlist:a", "x", "y", P])
+                })
+            },
+            || Ok(()),
+            |_| {},
+        );
+        assert_eq!(outcome, PinOutcome::Done);
+        assert_eq!(pinned, Some(vec!["a".to_string(), "p".to_string()]));
+    }
+
+    #[test]
+    fn pin_missing_after_the_write_is_not_kept() {
+        let (outcome, pinned) =
+            run_pin_change(true, P, true, || Ok(pin_items(&[])), || Ok(()), |_| {});
+        assert_eq!(outcome, PinOutcome::NotKept);
+        assert_eq!(pinned, None);
+    }
+
+    #[test]
+    fn pin_already_pinned_is_done_without_a_write() {
+        let wrote = std::cell::Cell::new(false);
+        let (outcome, _) = run_pin_change(
+            true,
+            P,
+            true,
+            || Ok(pin_items(&[P, "a", "b", "c"])),
+            || {
+                wrote.set(true);
+                Ok(())
+            },
+            |_| {},
+        );
+        assert_eq!(outcome, PinOutcome::Done);
+        assert!(!wrote.get());
+    }
+
+    #[test]
+    fn unpin_writes_then_confirms_it_is_gone() {
+        let reads = std::cell::Cell::new(0);
+        let (outcome, pinned) = run_pin_change(
+            false,
+            P,
+            true,
+            || {
+                reads.set(reads.get() + 1);
+                Ok(pin_items(&["spotify:playlist:a"]))
+            },
+            || Ok(()),
+            |_| {},
+        );
+        assert_eq!(outcome, PinOutcome::Done);
+        assert_eq!(pinned, Some(vec!["a".to_string()]));
+        assert_eq!(reads.get(), 1, "an unpin reads once, after the write");
+        let (outcome, _) =
+            run_pin_change(false, P, true, || Ok(pin_items(&[P])), || Ok(()), |_| {});
+        assert_eq!(outcome, PinOutcome::Failed);
+    }
+
+    #[test]
+    fn pin_errors_fail_and_reach_the_latch_hook() {
+        let seen = std::cell::Cell::new(0);
+        let (outcome, _) = run_pin_change(
+            true,
+            P,
+            true,
+            || Ok(pin_items(&[])),
+            || Err(InternalError::ProtocolChanged("x".into())),
+            |_| seen.set(seen.get() + 1),
+        );
+        assert_eq!(outcome, PinOutcome::Failed);
+        assert_eq!(seen.get(), 1);
+        let (outcome, _) = run_pin_change(
+            true,
+            P,
+            true,
+            || Err(InternalError::RateLimited),
+            || Ok(()),
+            |_| {},
+        );
+        assert_eq!(outcome, PinOutcome::Failed);
     }
 
     #[test]

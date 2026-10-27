@@ -100,6 +100,13 @@ impl ViewExt for PlaylistView {
             };
         }
 
+        if let Command::Pin | Command::Unpin = cmd {
+            let note = self
+                .library
+                .pin_command(&self.playlist.id, matches!(cmd, Command::Pin));
+            return Ok(CommandResult::Consumed(note));
+        }
+
         if let Command::Sort(key, direction) = cmd {
             self.library.cfg.with_state_mut(|state| {
                 let order = crate::config::SortingOrder {

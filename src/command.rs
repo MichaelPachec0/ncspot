@@ -23,6 +23,8 @@ const SAVE_QUEUE_CMD: &str = "save queue";
 const ADD: &str = "add";
 const ADD_CURRENT_CMD: &str = "add current";
 const DELETE_CMD: &str = "delete";
+const PIN_CMD: &str = "pin";
+const UNPIN_CMD: &str = "unpin";
 const FOCUS: &str = "focus";
 const SEEK: &str = "seek";
 const VOLUME_UP_CMD: &str = "volup";
@@ -87,6 +89,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     ADD,
     ADD_CURRENT_CMD,
     DELETE_CMD,
+    PIN_CMD,
+    UNPIN_CMD,
     FOCUS,
     SEEK,
     VOLUME_UP_CMD,
@@ -276,6 +280,8 @@ pub enum Command {
     Add,
     AddCurrent,
     Delete,
+    Pin,
+    Unpin,
     Focus(String),
     Seek(SeekDirection),
     VolumeUp(u16),
@@ -395,6 +401,8 @@ impl fmt::Display for Command {
             | Self::Add
             | Self::AddCurrent
             | Self::Delete
+            | Self::Pin
+            | Self::Unpin
             | Self::Back
             | Self::Help
             | Self::ReloadConfig
@@ -442,6 +450,8 @@ impl Command {
             Self::Add => ADD,
             Self::AddCurrent => ADD_CURRENT_CMD,
             Self::Delete => DELETE_CMD,
+            Self::Pin => PIN_CMD,
+            Self::Unpin => UNPIN_CMD,
             Self::Focus(_) => FOCUS,
             Self::Seek(_) => SEEK,
             Self::VolumeUp(_) => VOLUME_UP_CMD,
@@ -686,6 +696,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     None => Ok(Command::Save),
                 }?,
                 DELETE_CMD => Command::Delete,
+                PIN_CMD => Command::Pin,
+                UNPIN_CMD => Command::Unpin,
                 FOCUS => {
                     let &target = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
@@ -1160,6 +1172,25 @@ mod tests {
         assert!(parse("harness").is_err());
         assert!(parse("harness open").is_err());
         assert!(parse("harness fly away").is_err());
+    }
+
+    #[test]
+    fn parses_pin_and_unpin() {
+        let pin = parse("pin").unwrap();
+        assert!(matches!(pin.as_slice(), [Command::Pin]));
+        assert_eq!(pin[0].to_string(), "pin");
+        assert!(matches!(
+            parse(&pin[0].to_string()).as_deref(),
+            Ok([Command::Pin])
+        ));
+        let unpin = parse("unpin").unwrap();
+        assert!(matches!(unpin.as_slice(), [Command::Unpin]));
+        assert_eq!(unpin[0].to_string(), "unpin");
+        assert!(matches!(
+            parse(&unpin[0].to_string()).as_deref(),
+            Ok([Command::Unpin])
+        ));
+        assert!(!pin[0].accepts_count() && !unpin[0].accepts_count());
     }
 
     #[test]

@@ -453,18 +453,19 @@ impl WebApi {
         })
     }
 
-    /// Add or remove `uris` in a collection set: one internal call per [collection::WRITE_BATCH]
+    /// Add or remove `uris` in a collection set (calls count in `area`): one internal call per [collection::WRITE_BATCH]
     /// items. A failed batch stops the write; batches before it stay written, and the next
     /// delta sync brings them into the store.
     pub fn collection_write(
         &self,
+        area: Area,
         set: &'static str,
         uris: &[String],
         removed: bool,
     ) -> Result<(), InternalError> {
         for batch in uris.chunks(collection::WRITE_BATCH) {
             let batch = batch.to_vec();
-            self.run_internal(Area::Library, |session| {
+            self.run_internal(area, |session| {
                 collection::write(session, set, batch.clone(), removed)
             })?;
         }
@@ -1595,10 +1596,13 @@ mod test {
         let api = WebApi::new(&Config::new_for_test());
         let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
         assert_eq!(
-            api.collection_write("collection", &uris, false),
+            api.collection_write(Area::Library, "collection", &uris, false),
             Err(InternalError::NoSession)
         );
-        assert_eq!(api.collection_write("collection", &[], true), Ok(()));
+        assert_eq!(
+            api.collection_write(Area::Library, "collection", &[], true),
+            Ok(())
+        );
     }
 
     #[test]

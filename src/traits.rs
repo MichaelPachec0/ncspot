@@ -48,6 +48,11 @@ pub trait ListItem: Sync + Send + 'static {
         None
     }
 
+    /// The playlist id when this item is a playlist (the pin commands act on it).
+    fn playlist_id(&self) -> Option<String> {
+        None
+    }
+
     #[allow(unused_variables)]
     #[inline]
     fn is_saved(&self, library: &Library) -> Option<bool> {

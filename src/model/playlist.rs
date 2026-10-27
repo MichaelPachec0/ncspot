@@ -411,6 +411,10 @@ impl ListItem for Playlist {
         ))
     }
 
+    fn playlist_id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
     fn is_saved(&self, library: &Library) -> Option<bool> {
         // save status of personal playlists can't be toggled for safety
         if !library.is_followed_playlist(self) {
