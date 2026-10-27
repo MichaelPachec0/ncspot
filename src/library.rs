@@ -293,10 +293,14 @@ impl Library {
     /// running. If the sync is left incomplete by a rate limit, a resume (not forced) is
     /// scheduled for when the limit has passed.
     pub fn update_library(&self, force_full: bool) {
-        if !self.start_sync() {
-            return;
+        if self.start_sync() {
+            self.run_update(force_full);
         }
+    }
 
+    /// The body of [Library::update_library], on a background thread; the caller holds the
+    /// sync slot from [Library::start_sync].
+    fn run_update(&self, force_full: bool) {
         let library = self.clone();
         thread::spawn(move || {
             let _guard = SyncGuard(library.syncing.clone());
@@ -569,9 +573,26 @@ impl Library {
         let library = self.clone();
         thread::spawn(move || {
             thread::sleep(delay);
-            library.resume_pending.store(false, Ordering::SeqCst);
-            library.resume_count.fetch_add(1, Ordering::SeqCst);
-            library.update_library(false);
+            // While another sync (a tab update) holds the slot, this resume stays the one
+            // pending: wait for the slot instead of being dropped, without counting the wait.
+            loop {
+                let count = library.resume_count.load(Ordering::SeqCst);
+                match resume_attempt(library.start_sync(), count) {
+                    Some(count) => {
+                        library.resume_pending.store(false, Ordering::SeqCst);
+                        library.resume_count.store(count, Ordering::SeqCst);
+                        library.run_update(false);
+                        break;
+                    }
+                    None => {
+                        info!(
+                            "library sync resume waiting {}s for the running sync",
+                            RESUME_BUSY_RETRY.as_secs()
+                        );
+                        thread::sleep(RESUME_BUSY_RETRY);
+                    }
+                }
+            }
         });
     }
 
@@ -2097,6 +2118,16 @@ impl Drop for SyncGuard {
     }
 }
 
+/// How long a due resume waits before trying again while another sync holds the slot.
+const RESUME_BUSY_RETRY: Duration = Duration::from_secs(10);
+
+/// One try of a due resume at resume count `count`: with the sync slot `slot_taken` the
+/// resume runs as attempt `count + 1` (Some); otherwise it stays pending and tries again
+/// later, the count unchanged (None).
+fn resume_attempt(slot_taken: bool, count: u32) -> Option<u32> {
+    slot_taken.then_some(count + 1)
+}
+
 /// Whether to schedule an automatic resume after a sync: only if it was incomplete because of
 /// a rate limit, the resume cap is not reached, and no resume is already pending.
 fn should_schedule_resume(complete: bool, rate_limited: bool, count: u32, pending: bool) -> bool {
@@ -2501,6 +2532,12 @@ mod test {
     #[test]
     fn resume_only_one_pending_at_a_time() {
         assert!(!should_schedule_resume(false, true, 0, true));
+    }
+
+    #[test]
+    fn a_busy_slot_retries_the_resume_without_counting_it() {
+        assert_eq!(resume_attempt(false, 1), None);
+        assert_eq!(resume_attempt(true, 1), Some(2));
     }
 
     #[test]
