@@ -19,6 +19,7 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
+use crate::playlist_edit;
 use crate::queue::Queue;
 use crate::rate_limit::{ClientLabel, Stamp};
 use crate::spotify::{PlayerEvent, Spotify, UriType};
@@ -239,10 +240,50 @@ pub fn test_playlist_names(library: &Library, spotify: &Spotify) -> Result<Vec<S
         .collect())
 }
 
+/// What a server rootlist read says about a recorded playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootlistState {
+    Listed,
+    /// A complete read that does not list it.
+    Absent,
+    /// The read failed or was incomplete.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineDecision {
+    KeepLine,
+    DropLine,
+}
+
+/// Whether to drop a recorded line after an unfollow attempt. Only a playlist known to be out of
+/// the library (deleted from the store, unfollowed, or verified absent) loses its line.
+fn line_decision(
+    was_stored: bool,
+    still_stored: bool,
+    listing: RootlistState,
+    unfollowed: bool,
+) -> LineDecision {
+    let gone = if was_stored {
+        !still_stored
+    } else {
+        match listing {
+            RootlistState::Absent => true,
+            RootlistState::Listed => unfollowed,
+            RootlistState::Unknown => false,
+        }
+    };
+    if gone {
+        LineDecision::DropLine
+    } else {
+        LineDecision::KeepLine
+    }
+}
+
 /// Unfollow the n-th (1-based) recorded test playlist through the normal delete path (which
 /// also unpins), then drop its line. Refuses an `n` out of range, and keeps the line when the
 /// playlist is still in the library afterwards. Errors carry no ID or URI.
-pub fn unfollow_recorded(library: &Library, n: usize) -> Result<(), String> {
+pub fn unfollow_recorded(library: &Library, spotify: &Spotify, n: usize) -> Result<(), String> {
     let path = test_playlists::file_path();
     let recorded = test_playlists::read(&path)
         .map_err(|e| format!("harness unfollow-recorded: cannot read the list: {e}"))?;
@@ -261,11 +302,42 @@ pub fn unfollow_recorded(library: &Library, n: usize) -> Result<(), String> {
         return Err("harness unfollow-recorded: the library is still syncing".into());
     }
     let stored = |library: &Library| library.playlists.read().unwrap().iter().any(|p| p.id == id);
-    // A playlist already gone from the library only needs its line dropped.
-    if stored(library) {
+    let was_stored = stored(library);
+    let mut still_stored = false;
+    let mut listing = RootlistState::Unknown;
+    let mut unfollowed = false;
+    if was_stored {
         library.delete_playlist(&id);
-        if stored(library) {
+        still_stored = stored(library);
+    } else {
+        // Absent from the store is not absent from the library (partial sync, stale cache):
+        // ask the server before dropping the record. These reads are unspaced; fine for the
+        // handful of recorded playlists.
+        let api = &spotify.api;
+        if let Ok(rootlist) = api.playlist_rootlist() {
+            let complete = rootlist.read >= rootlist.length;
+            listing = match (playlist_edit::rootlist_index(&rootlist, &id), complete) {
+                (Some(_), _) => RootlistState::Listed,
+                (None, true) => RootlistState::Absent,
+                (None, false) => RootlistState::Unknown,
+            };
+        }
+        if listing == RootlistState::Listed {
+            unfollowed = playlist_edit::unfollow(api, &id).is_ok();
+        }
+    }
+    match line_decision(was_stored, still_stored, listing, unfollowed) {
+        LineDecision::DropLine => {}
+        LineDecision::KeepLine if was_stored => {
             return Err("harness unfollow-recorded: library unchanged".into());
+        }
+        LineDecision::KeepLine if listing == RootlistState::Unknown => {
+            return Err(
+                "harness unfollow-recorded: could not confirm; not removed from the list".into(),
+            );
+        }
+        LineDecision::KeepLine => {
+            return Err("harness unfollow-recorded: unfollow failed".into());
         }
     }
     test_playlists::remove(&path, n).map_err(|e| {
@@ -474,6 +546,27 @@ mod tests {
         assert_eq!(recorded_id("spotify:playlist:p1").as_deref(), Some("p1"));
         assert_eq!(recorded_id("spotify:album:a1"), None);
         assert_eq!(recorded_id("junk"), None);
+    }
+
+    #[test]
+    fn line_decision_drops_only_a_playlist_known_to_be_gone() {
+        use LineDecision::{DropLine, KeepLine};
+        use RootlistState::{Absent, Listed, Unknown};
+        let table = [
+            (true, false, Unknown, false, DropLine),
+            (true, true, Unknown, false, KeepLine),
+            (false, false, Absent, false, DropLine),
+            (false, false, Listed, true, DropLine),
+            (false, false, Listed, false, KeepLine),
+            (false, false, Unknown, false, KeepLine),
+        ];
+        for (was, still, listing, done, expect) in table {
+            assert_eq!(
+                line_decision(was, still, listing, done),
+                expect,
+                "{was} {still} {listing:?} {done}"
+            );
+        }
     }
 
     #[test]

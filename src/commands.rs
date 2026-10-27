@@ -460,7 +460,7 @@ impl CommandManager {
             }
             #[cfg(feature = "harness")]
             Command::Harness(crate::command::HarnessCommand::UnfollowRecorded(n)) => {
-                crate::harness::unfollow_recorded(&self.library, *n)?;
+                crate::harness::unfollow_recorded(&self.library, &self.spotify, *n)?;
                 Ok(None)
             }
             #[cfg(feature = "harness")]

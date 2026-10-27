@@ -271,7 +271,7 @@ class CleanupTest(unittest.TestCase):
         self.assertEqual((b.command, b.n, b.no_build), ("unfollow", 2, True))
 
     def test_rejects_a_missing_or_bad_number(self):
-        for argv in (["unfollow"], ["unfollow", "x"]):
+        for argv in (["unfollow"], ["unfollow", "x"], ["unfollow", "0"], ["unfollow", "-1"]):
             with self.assertRaises(SystemExit):
                 drive.parse_cleanup(argv)
 

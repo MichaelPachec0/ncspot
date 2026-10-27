@@ -724,6 +724,13 @@ SCENARIOS = {
 CLEANUP_COMMANDS = ("test-playlists", "unfollow")
 
 
+def positive_int(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("the playlist number starts at 1")
+    return n
+
+
 def parse_cleanup(argv):
     """Parse a cleanup subcommand line (`test-playlists` or `unfollow <n>`). These are not
     scenarios: main() hands them over only when the first argument names one."""
@@ -731,7 +738,7 @@ def parse_cleanup(argv):
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("test-playlists", help="list the recorded test playlists as '<n> <name>'")
     unf = sub.add_parser("unfollow", help="unfollow the n-th recorded test playlist")
-    unf.add_argument("n", type=int, help="1-based number from test-playlists")
+    unf.add_argument("n", type=positive_int, help="1-based number from test-playlists")
     for q in sub.choices.values():
         q.add_argument("--keep", action="store_true", help="keep the temp dirs")
         q.add_argument("--no-build", action="store_true", help="skip cargo build")
