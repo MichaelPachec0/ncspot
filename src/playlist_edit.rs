@@ -1,5 +1,6 @@
 //! One verified internal write on a playlist: bring the local copy up to date, POST the change
-//! against the head revision, then confirm it with a second head read.
+//! against the head revision, then confirm it with a second head read. Rootlist actions
+//! (create, follow, unfollow) work the same way on the rootlist head.
 //!
 //! A write reply never proves the write applied (librespot may also re-send a POST by itself),
 //! so the head length after the write is the check, and the local copy takes the snapshot of
@@ -10,12 +11,13 @@ use std::thread::sleep;
 use std::time::Instant;
 
 use librespot_protocol::playlist4_external::Op;
-use log::warn;
+use log::{debug, warn};
 
 use crate::internal_api::error::InternalError;
-use crate::internal_api::playlist::Head;
+use crate::internal_api::playlist::{Head, RootEntry, Rootlist, base64_encode};
 use crate::internal_api::playlist_write::{
-    ADD_BATCH, OVERWRITE_ATOMIC_MAX, add_op, list_changes, overwrite_ops, remove_at_op,
+    ADD_BATCH, Created, OVERWRITE_ATOMIC_MAX, add_op, list_changes, overwrite_ops, remove_at_op,
+    rootlist_add_op, rootlist_remove_op,
 };
 use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
@@ -308,9 +310,169 @@ pub fn overwrite(
     add_batches(api, playlist, known, after, rest, &mut spacer)
 }
 
+const PLAYLIST_URI_PREFIX: &str = "spotify:playlist:";
+
+fn playlist_uri(id: &str) -> String {
+    format!("{PLAYLIST_URI_PREFIX}{id}")
+}
+
+/// The rootlist index of `spotify:playlist:<id>`, counting folder markers as entries.
+/// Items the parse left out of `entries` count too (through `Rootlist::skipped`).
+pub fn rootlist_index(rootlist: &Rootlist, id: &str) -> Option<usize> {
+    let entry = rootlist
+        .entries
+        .iter()
+        .position(|entry| matches!(entry, RootEntry::Playlist(p) if p.id == id))?;
+    // The entry is the `entry`-th raw item that was not skipped.
+    let mut index = entry;
+    for &skipped in &rootlist.skipped {
+        if skipped > index {
+            break;
+        }
+        index += 1;
+    }
+    Some(index)
+}
+
+/// What a rootlist write is based on.
+struct RootBase {
+    revision: Vec<u8>,
+    length: usize,
+}
+
+/// The base of a full rootlist read; a read without a revision is a protocol change.
+fn root_base(rootlist: &Rootlist) -> Result<RootBase, InternalError> {
+    if rootlist.revision.is_empty() {
+        return Err(InternalError::ProtocolChanged(
+            "rootlist read without a revision".into(),
+        ));
+    }
+    Ok(RootBase {
+        revision: rootlist.revision.clone(),
+        length: rootlist.length,
+    })
+}
+
+/// The base from the rootlist head; when the head carries no revision, from a full rootlist
+/// read instead.
+fn rootlist_base(api: &WebApi) -> Result<RootBase, InternalError> {
+    let head = api.rootlist_head()?;
+    if !head.revision.is_empty() {
+        return Ok(RootBase {
+            revision: head.revision,
+            length: head.length,
+        });
+    }
+    debug!("rootlist head without a revision, reading the whole rootlist for the base");
+    root_base(&api.playlist_rootlist()?)
+}
+
+/// POST `op` against the rootlist `base`, then confirm the rootlist head length is
+/// `expected_len`. Every error here comes after the POST was sent ([EditError::Unverified]).
+fn send_rootlist_verified(
+    api: &WebApi,
+    base: RootBase,
+    op: Op,
+    expected_len: usize,
+) -> Result<(), EditError> {
+    api.rootlist_changes(list_changes(base.revision, vec![op]))
+        .map_err(EditError::Unverified)?;
+    let after = api.rootlist_head().map_err(EditError::Unverified)?;
+    if after.length == expected_len {
+        return Ok(());
+    }
+    warn!(
+        "Rootlist write did not verify: length {} after it, {expected_len} expected",
+        after.length
+    );
+    Err(EditError::Mismatch)
+}
+
+/// Add `spotify:playlist:<id>` at the top of the rootlist, verified.
+fn rootlist_add(api: &WebApi, id: &str) -> Result<(), EditError> {
+    let base = rootlist_base(api)?;
+    let expected = expected_len(base.length, Change::Add(1)).unwrap_or_default();
+    send_rootlist_verified(api, base, rootlist_add_op(&playlist_uri(id)), expected)
+}
+
+/// The stored copy of a playlist just created: empty, owned by `owner`, at the create
+/// reply's revision.
+pub fn created_playlist(created: &Created, name: &str, owner: Option<&str>) -> Playlist {
+    Playlist {
+        id: created.id.clone(),
+        name: name.to_string(),
+        owner_id: owner.unwrap_or_default().to_string(),
+        owner_name: None,
+        snapshot_id: base64_encode(&created.revision),
+        num_tracks: 0,
+        tracks: Some(vec![]),
+        collaborative: false,
+        cover_url: None,
+    }
+}
+
+/// A failure once the playlist exists: it must never lead to a second create through the Web
+/// API, so even an error from before the rootlist POST counts as [EditError::Unverified].
+fn after_create(err: EditError) -> EditError {
+    match err {
+        EditError::Internal(err) => EditError::Unverified(err),
+        other => other,
+    }
+}
+
+/// Create a playlist and add it to the top of the rootlist; returns the stored copy.
+///
+/// A failed rootlist add is retried once, then the Web API follow (a second add of the same
+/// new playlist is harmless). If all fail the playlist exists but is not in the library.
+pub fn create(api: &WebApi, name: &str) -> Result<Playlist, EditError> {
+    let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
+    spaced(&mut spacer);
+    let created = api.playlist_create(name)?;
+    let playlist = created_playlist(&created, name, api.user_id());
+    spaced(&mut spacer);
+    let added = rootlist_add(api, &created.id)
+        .or_else(|err| {
+            warn!("Could not add the new playlist to the rootlist ({err:?}), trying again");
+            spaced(&mut spacer);
+            rootlist_add(api, &created.id)
+        })
+        .or_else(|err| {
+            warn!("Could not add the new playlist to the rootlist ({err:?}), following it");
+            api.user_playlist_follow_playlist(&created.id)
+                .map_err(|()| err)
+        });
+    match added {
+        Ok(()) => Ok(playlist),
+        Err(err) => {
+            warn!("Playlist created but not added to your library");
+            Err(after_create(err))
+        }
+    }
+}
+
+/// Add playlist `id` to the top of the rootlist.
+pub fn follow(api: &WebApi, id: &str) -> Result<(), EditError> {
+    rootlist_add(api, id)
+}
+
+/// Remove `id` from the rootlist, at the index found in a fresh full rootlist read.
+pub fn unfollow(api: &WebApi, id: &str) -> Result<(), EditError> {
+    let rootlist = api.playlist_rootlist()?;
+    let index = rootlist_index(&rootlist, id).ok_or(EditError::Moved)?;
+    // The index walks the raw items, so it is the playlist's own; it must also lie inside the
+    // listing the service reported.
+    if index >= rootlist.length {
+        return Err(EditError::Moved);
+    }
+    let base = root_base(&rootlist)?;
+    let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
+    send_rootlist_verified(api, base, rootlist_remove_op(index), expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::internal_api::playlist::{RootEntry, RootPlaylist};
     use crate::playlist_items::placeholder;
 
     fn track_playable(uri: &str) -> Playable {
@@ -469,6 +631,106 @@ mod tests {
         for (i, p) in tracks.iter().enumerate() {
             assert_eq!(p.list_index(), i);
         }
+    }
+
+    fn root_pl(id: &str) -> RootEntry {
+        RootEntry::Playlist(RootPlaylist {
+            id: id.into(),
+            name: String::new(),
+            snapshot_id: String::new(),
+            length: 0,
+            owner_id: String::new(),
+            collaborative: false,
+            cover_url: None,
+            status: 200,
+        })
+    }
+
+    #[test]
+    fn rootlist_index_counts_folder_markers() {
+        let rootlist = Rootlist {
+            entries: vec![
+                RootEntry::FolderStart { name: "F".into() },
+                root_pl("a"),
+                RootEntry::FolderEnd,
+                root_pl("b"),
+            ],
+            length: 4,
+            read: 4,
+            pages: 1,
+            ..Default::default()
+        };
+        assert_eq!(rootlist_index(&rootlist, "b"), Some(3));
+        assert_eq!(rootlist_index(&rootlist, "a"), Some(1));
+        assert_eq!(rootlist_index(&rootlist, "missing"), None);
+    }
+
+    #[test]
+    fn rootlist_index_counts_skipped_items() {
+        // Raw items: a, <track>, <track>, b, <track>, c
+        let rootlist = Rootlist {
+            entries: vec![root_pl("a"), root_pl("b"), root_pl("c")],
+            skipped: vec![1, 2, 4],
+            length: 6,
+            read: 6,
+            pages: 1,
+            ..Default::default()
+        };
+        assert_eq!(rootlist_index(&rootlist, "a"), Some(0));
+        assert_eq!(rootlist_index(&rootlist, "b"), Some(3));
+        assert_eq!(rootlist_index(&rootlist, "c"), Some(5));
+    }
+
+    #[test]
+    fn create_without_a_session_sends_nothing() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert!(matches!(
+            create(&api, "ncspot-test-1"),
+            Err(EditError::Internal(InternalError::NoSession))
+        ));
+    }
+
+    #[test]
+    fn follow_and_unfollow_without_a_session_send_nothing() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert!(matches!(
+            follow(&api, "p"),
+            Err(EditError::Internal(InternalError::NoSession))
+        ));
+        assert!(matches!(
+            unfollow(&api, "p"),
+            Err(EditError::Internal(InternalError::NoSession))
+        ));
+    }
+
+    #[test]
+    fn errors_after_the_create_never_allow_a_second_create() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        for err in [
+            EditError::Internal(InternalError::NoSession),
+            EditError::Internal(InternalError::ProtocolChanged("x".into())),
+            EditError::Unverified(InternalError::Denied),
+            EditError::Mismatch,
+        ] {
+            let after = after_create(err);
+            assert!(!matches!(after, EditError::Internal(_)));
+            assert_eq!(decide_after(&InternalError::from(after)), Action::Fail);
+        }
+    }
+
+    #[test]
+    fn created_playlist_is_empty_and_owned() {
+        let created = Created {
+            id: "abc".into(),
+            revision: b"rev1".to_vec(),
+        };
+        let playlist = created_playlist(&created, "ncspot-test-1", Some("me"));
+        assert_eq!(playlist.id, "abc");
+        assert_eq!(playlist.snapshot_id, "cmV2MQ==");
+        assert_eq!(playlist.owner_id, "me");
+        assert_eq!(playlist.name, "ncspot-test-1");
+        assert_eq!(playlist.num_tracks, 0);
+        assert_eq!(playlist.tracks.as_deref().map(<[Playable]>::len), Some(0));
     }
 
     #[test]

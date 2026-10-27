@@ -51,6 +51,11 @@ pub struct Rootlist {
     pub read: usize,
     /// Pages absorbed.
     pub pages: usize,
+    /// The rootlist revision, from the first page.
+    pub revision: Vec<u8>,
+    /// Raw positions (ascending) of the items left out of `entries`, so an entry's rootlist
+    /// index can be recovered.
+    pub skipped: Vec<usize>,
 }
 
 /// A playlist's (or the rootlist's) head without its items.
@@ -74,7 +79,7 @@ pub struct PlaylistItem {
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with padding. The `base64` crate is only built with `jukebox-graphics`.
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk
@@ -166,10 +171,14 @@ pub fn absorb_rootlist(
     }
     let total = usize::try_from(page.length.unwrap_or(0)).unwrap_or(0);
     list.length = total;
+    if list.pages == 0 {
+        list.revision = page.revision.clone().unwrap_or_default();
+    }
     let Some(contents) = page.contents.into_option() else {
         return Ok(None);
     };
     let count = contents.items.len();
+    let start = list.read;
     list.read += count;
     list.pages += 1;
     let no_meta = MetaItem::default();
@@ -186,6 +195,8 @@ pub fn absorb_rootlist(
             });
         } else if uri.starts_with("spotify:end-group:") {
             list.entries.push(RootEntry::FolderEnd);
+        } else {
+            list.skipped.push(start + i);
         }
     }
     Ok((count > 0 && list.read < total && list.pages < MAX_ROOTLIST_PAGES).then_some(list.read))
@@ -368,16 +379,27 @@ mod tests {
     fn rootlist_pages_until_length() {
         let pl = |n: u8| item(&format!("spotify:playlist:00000000000000000000{n:02}"));
         let mut list = Rootlist::default();
-        let first = page(
-            3,
-            vec![pl(1), pl(2)],
-            vec![meta(Some("a"), b"r", 200), meta(Some("b"), b"r", 200)],
-        );
+        let first = SelectedListContent {
+            revision: Some(b"root".to_vec()),
+            ..page(
+                3,
+                vec![pl(1), pl(2)],
+                vec![meta(Some("a"), b"r", 200), meta(Some("b"), b"r", 200)],
+            )
+        };
         assert_eq!(absorb_rootlist(&mut list, first), Ok(Some(2)));
-        let second = page(3, vec![pl(3)], vec![meta(Some("c"), b"r", 200)]);
+        let second = SelectedListContent {
+            revision: Some(b"later".to_vec()),
+            ..page(3, vec![pl(3)], vec![meta(Some("c"), b"r", 200)])
+        };
         assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!(list.length, 3);
+        assert_eq!(
+            list.revision,
+            b"root".to_vec(),
+            "the revision of the first page"
+        );
     }
 
     #[test]
@@ -521,6 +543,7 @@ mod tests {
         assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!((list.read, list.pages), (4, 2));
+        assert_eq!(list.skipped, [1], "the raw position of the skipped item");
     }
 
     #[test]

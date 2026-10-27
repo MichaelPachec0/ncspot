@@ -3,14 +3,6 @@
 //! The request builders are pure; the senders POST protobuf through the spclient. A reply never
 //! proves a write applied, so callers verify with a head read.
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the playlist write actions that call these arrive in a later change"
-    )
-)]
-
 use http::{HeaderMap, HeaderValue, Method, header};
 use librespot_core::Session;
 use librespot_protocol::playlist4_external::{

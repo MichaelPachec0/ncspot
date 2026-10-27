@@ -286,9 +286,8 @@ impl CommandManager {
                 Ok(None)
             }
             Command::NewPlaylist(name) => {
-                match self.spotify.api.create_playlist(name, None, None) {
-                    Ok(_) => self.library.update_library(false),
-                    Err(_) => error!("could not create playlist {name}"),
+                if self.library.create_playlist(name).is_none() {
+                    error!("could not create playlist {name}");
                 }
                 Ok(None)
             }

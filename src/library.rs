@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs::File;
 use std::iter::Iterator;
@@ -23,6 +23,7 @@ use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LAT
 use crate::internal_api::error::InternalError;
 use crate::internal_api::fallback::{Action, decide_after, run_with_fallback};
 use crate::internal_api::playlist::{RootEntry, RootPlaylist};
+use crate::internal_api::playlist_write::Created;
 use crate::library_collection::{
     Membership, Mode, fetch_membership, merge_followed, plan_sync, rebuild, sort_albums,
     sort_newest_first, with_artist,
@@ -37,10 +38,11 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
-use crate::playlist_edit;
+use crate::playlist_edit::{self, EditError, created_playlist};
 use crate::playlist_items::UNAVAILABLE;
 use crate::playlist_layout::{
-    LayoutEntry, PLAYLIST_FETCH_SPACING, Spacer, layout_from, pinned_ids,
+    LayoutEntry, PLAYLIST_FETCH_SPACING, Spacer, insert_after_pins, layout_from, pinned_ids,
+    remove_from_layout,
 };
 use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
@@ -238,33 +240,124 @@ impl Library {
         });
     }
 
-    /// Delete the playlist with the given `id` if it exists.
+    /// Delete (unfollow) the playlist with the given `id` if it exists: the internal API
+    /// first, the Web API per the fallback classes. The store, the layout and their caches
+    /// update in place.
     pub fn delete_playlist(&self, id: &str) {
         if !*self.is_done.read().unwrap() {
             return;
         }
 
-        let position = self
-            .playlists
-            .read()
-            .unwrap()
-            .iter()
-            .position(|i| i.id == id);
-
-        if let Some(position) = position
-            && self.spotify.api.delete_playlist(id).is_ok()
-        {
-            self.playlists.write().unwrap().remove(position);
-            self.save_cache(
-                &config::cache_path(CACHE_PLAYLISTS),
-                &self.playlists.read().unwrap(),
-            );
-            #[cfg(feature = "mpris")]
-            self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(
-                    id.to_string(),
-                )));
+        let stored = self.playlists.read().unwrap().iter().any(|i| i.id == id);
+        if !stored {
+            return;
         }
+
+        let api = &self.spotify.api;
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || playlist_edit::unfollow(api, id).map_err(rootlist_edit_failed),
+            || api.delete_playlist(id).is_ok(),
+        );
+        if !written {
+            return;
+        }
+
+        self.playlists.write().unwrap().retain(|p| p.id != id);
+        self.save_cache(
+            &config::cache_path(CACHE_PLAYLISTS),
+            &self.playlists.read().unwrap(),
+        );
+        let changed = remove_from_layout(&mut self.playlist_layout.write().unwrap(), id);
+        if changed {
+            self.save_layout();
+        }
+        self.trigger_redraw();
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(
+                id.to_string(),
+            )));
+    }
+
+    /// Save the Playlists tab layout to `playlist_layout.db`.
+    fn save_layout(&self) {
+        self.save_cache(
+            &config::cache_path(CACHE_PLAYLIST_LAYOUT),
+            &self.playlist_layout.read().unwrap(),
+        );
+    }
+
+    /// Put `playlist` at the top of the store and the layout (after the pins) unless the store
+    /// has it already, then save both caches and redraw.
+    fn insert_new_playlist(&self, playlist: Playlist) {
+        let id = playlist.id.clone();
+        {
+            let mut store = self.playlists.write().unwrap();
+            if store.iter().any(|p| p.id == id) {
+                return;
+            }
+            store.insert(0, playlist);
+        }
+        self.save_cache(
+            &config::cache_path(CACHE_PLAYLISTS),
+            &self.playlists.read().unwrap(),
+        );
+        // An empty layout is the flat store list (the Web path ran): it stays empty.
+        let layout_changed = {
+            let mut layout = self.playlist_layout.write().unwrap();
+            let listed = layout
+                .iter()
+                .any(|e| matches!(e, LayoutEntry::Playlist(p) if *p == id));
+            if layout.is_empty() || listed {
+                false
+            } else {
+                insert_after_pins(&mut layout, &id);
+                true
+            }
+        };
+        if layout_changed {
+            self.save_layout();
+        }
+        self.trigger_redraw();
+        #[cfg(feature = "mpris")]
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(id)));
+    }
+
+    /// Create an empty playlist named `name` and put it at the top of the library: the
+    /// internal API first, the Web API per the fallback classes. Returns its id.
+    pub fn create_playlist(&self, name: &str) -> Option<String> {
+        let api = &self.spotify.api;
+        let created: RefCell<Option<Playlist>> = RefCell::new(None);
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || {
+                let playlist = playlist_edit::create(api, name).map_err(rootlist_edit_failed)?;
+                *created.borrow_mut() = Some(playlist);
+                Ok(())
+            },
+            || match api.create_playlist(name, None, None) {
+                Ok(id) => {
+                    // No revision: the next sync downloads it.
+                    let web = Created {
+                        id,
+                        revision: Vec::new(),
+                    };
+                    let owner = self.user_id.as_deref();
+                    *created.borrow_mut() = Some(created_playlist(&web, name, owner));
+                    true
+                }
+                Err(()) => false,
+            },
+        );
+        let mut playlist = created.into_inner().filter(|_| written)?;
+        playlist.owner_name.clone_from(&self.display_name);
+        let id = playlist.id.clone();
+        self.insert_new_playlist(playlist);
+        Some(id)
     }
 
     /// Set the playlist with `id` to contain only `tracks`. If the playlist already contains
@@ -287,12 +380,8 @@ impl Library {
                     .cloned();
                 // Not a stored playlist: nothing to verify against, use the Web API.
                 let mut playlist = stored.ok_or(InternalError::NotFound)?;
-                playlist_edit::overwrite(api, &mut playlist, tracks, &known).map_err(|err| {
-                    if let Some(note) = err.note() {
-                        warn!("{note}");
-                    }
-                    InternalError::from(err)
-                })?;
+                playlist_edit::overwrite(api, &mut playlist, tracks, &known)
+                    .map_err(edit_failed)?;
                 self.playlist_update(&playlist);
                 Ok(())
             },
@@ -314,9 +403,9 @@ impl Library {
     /// Create a playlist with the given `name` and add `tracks` to it.
     pub fn save_playlist(&self, name: &str, tracks: &[Playable]) {
         debug!("saving {} tracks to new list {}", tracks.len(), name);
-        match self.spotify.api.create_playlist(name, None, None) {
-            Ok(id) => self.overwrite_playlist(&id, tracks),
-            Err(_) => error!("could not create new playlist.."),
+        match self.create_playlist(name) {
+            Some(id) => self.overwrite_playlist(&id, tracks),
+            None => error!("could not create new playlist.."),
         }
     }
 
@@ -1870,42 +1959,26 @@ impl Library {
             .unwrap_or(false)
     }
 
-    /// Add `playlist` to the user's library by following it as the logged in user.
+    /// Add `playlist` to the user's library by following it as the logged in user: the
+    /// internal API first, the Web API per the fallback classes.
     pub fn follow_playlist(&self, mut playlist: Playlist) {
         if !*self.is_done.read().unwrap() {
             return;
         }
 
-        let follow_playlist_result = self.spotify.api.user_playlist_follow_playlist(&playlist.id);
-
-        if follow_playlist_result.is_err() {
+        let api = &self.spotify.api;
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || playlist_edit::follow(api, &playlist.id).map_err(rootlist_edit_failed),
+            || api.user_playlist_follow_playlist(&playlist.id).is_ok(),
+        );
+        if !written {
             return;
         }
 
         playlist.load_tracks(&self.spotify);
-
-        let already_present = {
-            let mut store = self.playlists.write().unwrap();
-            if !store.iter().any(|p| p.id == playlist.id) {
-                store.insert(0, playlist.clone());
-                false
-            } else {
-                true
-            }
-        };
-
-        if !already_present {
-            self.save_cache(
-                &config::cache_path(CACHE_PLAYLISTS),
-                &self.playlists.read().unwrap(),
-            );
-
-            #[cfg(feature = "mpris")]
-            self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitPlaylistChanged(Some(
-                    playlist.id.clone(),
-                )));
-        }
+        self.insert_new_playlist(playlist);
     }
 
     /// Check whether `show` is already in the user's library.
@@ -2402,6 +2475,26 @@ fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
             false
         }
     }
+}
+
+/// Log the status note of a failed internal playlist edit and turn it into its fallback class.
+fn edit_failed(err: EditError) -> InternalError {
+    if let Some(note) = err.note() {
+        warn!("{note}");
+    }
+    InternalError::from(err)
+}
+
+/// [edit_failed] for a rootlist edit (create, follow, delete): its moves and mismatches are of
+/// the playlist list, and nothing is reloaded.
+fn rootlist_edit_failed(err: EditError) -> InternalError {
+    let note = match &err {
+        EditError::Moved => "Playlist list changed, try again",
+        EditError::Mismatch => "Playlist list changed elsewhere; the change may have applied",
+        _ => return edit_failed(err),
+    };
+    warn!("{note}");
+    InternalError::from(err)
 }
 
 /// One write in `area`: the internal API first, then the Web API per the fallback classes.

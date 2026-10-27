@@ -196,6 +196,11 @@ impl WebApi {
         self.user = user;
     }
 
+    /// The username set with [WebApi::set_user].
+    pub fn user_id(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
     /// Set the sending end of the channel to the worker thread, managed by
     /// [Spotify](crate::spotify::Spotify).
     pub(crate) fn set_worker_channel(
