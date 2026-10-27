@@ -360,10 +360,10 @@ impl WebApi {
             .into_iter()
             .partition(|uri| uri.starts_with("spotify:episode:"));
         let mut merged = known.clone();
-        for track in self.library_tracks(&tracks)? {
+        for track in self.tracks_in(Area::Playlists, &tracks)? {
             merged.insert(track.uri.clone(), Playable::Track(track));
         }
-        for episode in self.library_episodes(&episodes)? {
+        for episode in self.episodes_in(Area::Playlists, &episodes)? {
             merged.insert(episode.uri.clone(), Playable::Episode(episode));
         }
         Ok(playlist_items::assemble(&items, &merged))
@@ -400,6 +400,7 @@ impl WebApi {
     /// longer has; with nothing left to ask for, no session is needed.
     fn library_items<M, T, Fut>(
         &self,
+        area: Area,
         uris: &[String],
         fetch: impl Fn(Session, Vec<SpotifyUri>) -> Fut,
     ) -> Result<Vec<T>, InternalError>
@@ -413,34 +414,42 @@ impl WebApi {
         }
         let uris = parse_uris(uris);
         in_batches(&uris, metadata::BATCH_SIZE, |batch| {
-            self.run_internal(Area::Library, |session| fetch(session, batch.clone()))
+            self.run_internal(area, |session| fetch(session, batch.clone()))
                 .map(|items| items.iter().map(T::from).collect())
         })
     }
 
     pub fn library_tracks(&self, uris: &[String]) -> Result<Vec<Track>, InternalError> {
-        self.library_items(uris, metadata::tracks_by_uri)
+        self.tracks_in(Area::Library, uris)
+    }
+
+    fn tracks_in(&self, area: Area, uris: &[String]) -> Result<Vec<Track>, InternalError> {
+        self.library_items(area, uris, metadata::tracks_by_uri)
     }
 
     pub fn library_albums(&self, uris: &[String]) -> Result<Vec<Album>, InternalError> {
-        self.library_items(uris, |session, uris| {
+        self.library_items(Area::Library, uris, |session, uris| {
             metadata::albums_by_uri(session, uris, Missing::Skip)
         })
     }
 
     pub fn library_artists(&self, uris: &[String]) -> Result<Vec<Artist>, InternalError> {
-        self.library_items(uris, metadata::artists_by_uri)
+        self.library_items(Area::Library, uris, metadata::artists_by_uri)
     }
 
     pub fn library_shows(
         &self,
         uris: &[String],
     ) -> Result<Vec<crate::model::show::Show>, InternalError> {
-        self.library_items(uris, metadata::shows_by_uri)
+        self.library_items(Area::Library, uris, metadata::shows_by_uri)
     }
 
     pub fn library_episodes(&self, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
-        self.library_items(uris, |session, uris| {
+        self.episodes_in(Area::Library, uris)
+    }
+
+    fn episodes_in(&self, area: Area, uris: &[String]) -> Result<Vec<Episode>, InternalError> {
+        self.library_items(area, uris, |session, uris| {
             metadata::episodes_by_uri(session, uris, Missing::Skip)
         })
     }
@@ -1513,6 +1522,26 @@ mod test {
             Err(InternalError::NoSession)
         );
         assert_eq!(api.collection_write("collection", &[], true), Ok(()));
+    }
+
+    #[test]
+    fn playlist_metadata_is_fetched_under_the_playlists_area() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Library, &InternalError::ProtocolChanged("x".into()));
+        let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert!(matches!(
+            api.library_tracks(&uris),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+        assert!(matches!(
+            api.tracks_in(Area::Playlists, &uris),
+            Err(InternalError::NoSession)
+        ));
+        let episodes = vec!["spotify:episode:4uLU6hMCjMI75M1A2tKUQC".to_string()];
+        assert!(matches!(
+            api.episodes_in(Area::Playlists, &episodes),
+            Err(InternalError::NoSession)
+        ));
     }
 
     #[test]

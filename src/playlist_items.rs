@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::DateTime;
 use librespot_core::SpotifyUri;
 
-use crate::internal_api::playlist::PlaylistItem;
+use crate::internal_api::playlist::{PlaylistItem, decode_name as decode};
 use crate::model::playable::Playable;
 use crate::model::track::Track;
 
@@ -47,31 +47,6 @@ pub fn placeholder(uri: &str) -> Playable {
         is_local: false,
         is_playable: Some(false),
     })
-}
-
-/// Percent-decode `s`, reading `+` as a space. Bytes that do not form a valid escape are kept.
-fn decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => out.push(b' '),
-            b'%' if bytes.len() >= i + 3 => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    Some(byte) => {
-                        out.push(byte);
-                        i += 2;
-                    }
-                    None => out.push(b'%'),
-                }
-            }
-            byte => out.push(byte),
-        }
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A local file from `spotify:local:<artist>:<album>:<title>:<seconds>`; `None` when the URI

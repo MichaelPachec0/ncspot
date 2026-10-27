@@ -82,7 +82,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 }
 
 /// Decode a folder name: `+` is a space and `%XX` is a byte. Malformed escapes stay as typed.
-fn decode_name(raw: &str) -> String {
+pub(crate) fn decode_name(raw: &str) -> String {
     let bytes = raw.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
