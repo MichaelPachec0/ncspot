@@ -149,6 +149,11 @@ impl ViewExt for PlaylistsView {
         "Playlists".to_string()
     }
 
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        self.list.harness_state()
+    }
+
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         if acts_on_selection(cmd) && self.selected_is_header() {
             return Ok(CommandResult::Consumed(None));
