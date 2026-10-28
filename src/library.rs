@@ -90,8 +90,10 @@ pub struct Library {
     /// The Playlists tab layout from the last complete internal sync; only meaningful while
     /// the internal API playlists area is usable.
     pub playlist_layout: Arc<RwLock<Vec<LayoutEntry>>>,
-    /// Playlists created here that no complete listing has shown yet: a listing read right
-    /// after a create may lag behind it, so a sync never prunes them until one lists them.
+    /// Playlists created or followed here that no complete listing has shown yet: a listing
+    /// read right after the write may lag behind it, so a sync never prunes them until one
+    /// lists them. Memory only: an id no complete listing ever shows stays protected until
+    /// it is deleted here or ncspot exits.
     fresh_playlists: Arc<RwLock<HashSet<String>>>,
     pub shows: Arc<RwLock<Vec<Show>>>,
     /// Saved episodes (Your Episodes), filled only over the internal API.
@@ -2163,6 +2165,10 @@ impl Library {
         }
 
         playlist.load_tracks(&self.spotify);
+        self.fresh_playlists
+            .write()
+            .unwrap()
+            .insert(playlist.id.clone());
         self.insert_new_playlist(playlist);
     }
 
@@ -2433,8 +2439,9 @@ fn sync_download(
 /// Remove local playlists that existed when the sync started (`known_at_start`) but are missing
 /// from `remote_ids`, and sort the rest in remote order. Only done when the remote listing was
 /// complete; a partial listing must never delete cached playlists, and a playlist created while
-/// the sync was running must survive, as must a `fresh` one (created here, not listed yet). A
-/// fresh id the complete listing holds leaves `fresh`: from then on it is pruned as usual.
+/// the sync was running must survive, as must a `fresh` one (created or followed here, not
+/// listed yet). A fresh id the complete listing holds leaves `fresh`: from then on it is
+/// pruned as usual.
 fn reconcile_playlists(
     local: &mut Vec<Playlist>,
     known_at_start: &[String],
