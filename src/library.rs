@@ -499,7 +499,7 @@ impl Library {
         debug!("saving {} tracks to new list {}", tracks.len(), name);
         match self.create_playlist(name) {
             Some(id) => self.overwrite_playlist(&id, tracks),
-            None => error!("could not create new playlist.."),
+            None => debug!("could not create new playlist.."),
         }
     }
 
@@ -3223,6 +3223,20 @@ mod test {
         assert_eq!(
             posted_notes(&library),
             vec!["Could not change the playlist"; 2]
+        );
+    }
+
+    #[test]
+    fn a_failed_create_posts_exactly_one_specific_note() {
+        // create_playlist settles its write once; the Web create cannot run in a test, so
+        // this drives the same collect-then-settle steps.
+        let library = test_library();
+        let note = Cell::new(None);
+        rootlist_edit_failed(EditError::Moved, &note);
+        library.settle_write(false, &note);
+        assert_eq!(
+            posted_notes(&library),
+            vec!["Playlist list changed, try again"]
         );
     }
 
