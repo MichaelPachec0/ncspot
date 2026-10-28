@@ -453,6 +453,25 @@ impl Library {
     /// leaves the stored copy without a revision, so an incremental playlists sync starts
     /// after it to fetch the real snapshot.
     pub fn create_playlist(&self, name: &str) -> Option<String> {
+        let (id, web_created) = self.create_new_playlist(name)?;
+        if web_created {
+            self.sync_after_web_create();
+        }
+        Some(id)
+    }
+
+    /// Start the incremental playlists sync that fetches the snapshot of a Web-created
+    /// playlist.
+    fn sync_after_web_create(&self) {
+        let update = self.update_tab(&LibraryTab::Playlists);
+        if update != TabUpdate::Started {
+            info!("playlists sync after a Web create not started: {update:?}");
+        }
+    }
+
+    /// The create of [Library::create_playlist] without its sync; returns the id and whether
+    /// the Web API created it.
+    fn create_new_playlist(&self, name: &str) -> Option<(String, bool)> {
         let api = &self.spotify.api;
         let created: RefCell<Option<Playlist>> = RefCell::new(None);
         let web_created = Cell::new(false);
@@ -487,18 +506,18 @@ impl Library {
         let id = playlist.id.clone();
         self.fresh_playlists.write().unwrap().insert(id.clone());
         self.insert_new_playlist(playlist);
-        if web_created.get() {
-            let update = self.update_tab(&LibraryTab::Playlists);
-            if update != TabUpdate::Started {
-                info!("playlists sync after a Web create not started: {update:?}");
-            }
-        }
-        Some(id)
+        Some((id, web_created.get()))
     }
 
     /// Set the playlist with `id` to contain only `tracks`. If the playlist already contains
     /// tracks, they will be removed. Update the cache to match the new state.
     pub fn overwrite_playlist(&self, id: &str, tracks: &[Playable]) {
+        self.overwrite_and_list(id, tracks);
+    }
+
+    /// The overwrite of [Library::overwrite_playlist]; true when it read the playlist listing
+    /// (after a Web overwrite).
+    fn overwrite_and_list(&self, id: &str, tracks: &[Playable]) -> bool {
         debug!("saving {} tracks to list {}", tracks.len(), id);
         let api = &self.spotify.api;
         let known = || self.known_playables();
@@ -534,19 +553,27 @@ impl Library {
         );
 
         self.settle_write(written, &note);
-        if written && web_used.get() && self.fetch_playlists(false).listing_complete {
+        let listed = written && web_used.get();
+        if listed && self.fetch_playlists(false).listing_complete {
             self.save_cache(
                 &config::cache_path(CACHE_PLAYLISTS),
                 &self.playlists.read().unwrap(),
             );
         }
+        listed
     }
 
-    /// Create a playlist with the given `name` and add `tracks` to it.
+    /// Create a playlist with the given `name` and add `tracks` to it. One playlist listing
+    /// at most: a Web create's sync runs only when the overwrite read no listing itself.
     pub fn save_playlist(&self, name: &str, tracks: &[Playable]) {
         debug!("saving {} tracks to new list {}", tracks.len(), name);
-        match self.create_playlist(name) {
-            Some(id) => self.overwrite_playlist(&id, tracks),
+        match self.create_new_playlist(name) {
+            Some((id, web_created)) => {
+                let listed = self.overwrite_and_list(&id, tracks);
+                if web_created && !listed {
+                    self.sync_after_web_create();
+                }
+            }
             None => debug!("could not create new playlist.."),
         }
     }
