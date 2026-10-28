@@ -43,6 +43,12 @@ pub trait PlaylistServer {
     ) -> Result<(Head, Vec<Playable>), InternalError>;
     /// One write POST, sent at most once.
     fn playlist_changes(&self, id: &str, body: ListChanges) -> Result<(), InternalError>;
+    /// The whole rootlist, page by page (up to the page cap).
+    fn playlist_rootlist(&self) -> Result<Rootlist, InternalError>;
+    /// The rootlist head (revision, length), without entries.
+    fn rootlist_head(&self) -> Result<RootHead, InternalError>;
+    /// One rootlist write POST, sent at most once.
+    fn rootlist_changes(&self, body: ListChanges) -> Result<(), InternalError>;
     /// The area is on and not latched.
     fn internal_usable(&self, area: Area) -> bool;
     fn latch_area(&self, area: Area, err: &InternalError);
@@ -63,6 +69,18 @@ impl PlaylistServer for WebApi {
 
     fn playlist_changes(&self, id: &str, body: ListChanges) -> Result<(), InternalError> {
         Self::playlist_changes(self, id, body)
+    }
+
+    fn playlist_rootlist(&self) -> Result<Rootlist, InternalError> {
+        Self::playlist_rootlist(self)
+    }
+
+    fn rootlist_head(&self) -> Result<RootHead, InternalError> {
+        Self::rootlist_head(self)
+    }
+
+    fn rootlist_changes(&self, body: ListChanges) -> Result<(), InternalError> {
+        Self::rootlist_changes(self, body)
     }
 
     fn internal_usable(&self, area: Area) -> bool {
@@ -225,6 +243,9 @@ pub enum EditError {
     /// The head after the write does not match; the local copy was reloaded (when the reload
     /// failed, its snapshot was cleared instead).
     Mismatch,
+    /// The rootlist read stopped at the page cap, so a copy of the playlist may lie past it;
+    /// nothing was sent.
+    TooLong,
     /// An add stopped after `added` of `total` tracks: the verified batches applied, the local
     /// copy holds them (or the server's copy, when a later batch did not verify). `unconfirmed`
     /// when the failed batch may have applied too.
@@ -244,6 +265,7 @@ impl EditError {
             Self::Refused(_) => "refused",
             Self::Moved => "moved",
             Self::Mismatch => "mismatch",
+            Self::TooLong => "too_long",
             Self::Partial { .. } => "partial",
         }
     }
@@ -256,6 +278,7 @@ impl EditError {
             Self::Mismatch => "Playlist changed elsewhere, reloaded",
             Self::Unverified(_) => "Could not confirm the change; it may have applied",
             Self::Refused(_) => "Spotify refused the change",
+            Self::TooLong => "Playlist list too long to edit",
             Self::Partial {
                 added,
                 total,
@@ -299,6 +322,7 @@ impl From<EditError> for InternalError {
             EditError::Refused(err) => Self::Transient(format!("the write was refused: {err}")),
             EditError::Moved => Self::Transient("the selected item moved".into()),
             EditError::Mismatch => Self::Transient("the playlist changed during the write".into()),
+            EditError::TooLong => Self::Transient("the playlist list is too long to edit".into()),
             EditError::Partial { .. } => Self::Transient("only part of the add applied".into()),
         }
     }
@@ -753,15 +777,16 @@ fn rootlist_verify(after: &RootHead, expected_len: usize) -> Result<(), EditErro
 }
 
 /// POST `op` against the rootlist `base`, then confirm it with [rootlist_verify]. A failed
-/// POST is classed by [post_error] (it is the first POST); a failed verify read is
+/// POST is classed by [post_error] at its position `post`; a failed verify read is
 /// [EditError::Unverified].
 fn send_rootlist_verified(
-    api: &WebApi,
+    api: &impl PlaylistServer,
+    post: Post,
     base: RootBase,
     op: Op,
     expected_len: usize,
 ) -> Result<(), EditError> {
-    send_post(api, Post::First, || {
+    send_post(api, post, || {
         api.rootlist_changes(list_changes(base.revision, vec![op]))
     })?;
     let after = api.rootlist_head().map_err(EditError::Unverified)?;
@@ -771,7 +796,13 @@ fn send_rootlist_verified(
 /// Add `spotify:playlist:<id>` on top of `base`, verified.
 fn rootlist_add_on(api: &WebApi, base: RootBase, id: &str) -> Result<(), EditError> {
     let expected = expected_len(base.length, Change::Add(1)).unwrap_or_default();
-    send_rootlist_verified(api, base, rootlist_add_op(&playlist_uri(id)), expected)
+    send_rootlist_verified(
+        api,
+        Post::First,
+        base,
+        rootlist_add_op(&playlist_uri(id)),
+        expected,
+    )
 }
 
 /// Add `spotify:playlist:<id>` at the top of the rootlist, verified.
@@ -824,9 +855,10 @@ pub fn created_playlist(created: &Created, name: &str, owner: Option<&str>) -> P
     }
 }
 
-/// A failure once the playlist exists: it must never lead to a second create through the Web
-/// API, so even an error from before the rootlist POST counts as [EditError::Unverified].
-fn after_create(err: EditError) -> EditError {
+/// A failure once part of the action applied (the playlist exists, a rootlist copy was
+/// removed): it must never lead to a repeat through the Web API, so even an error from before
+/// the next POST counts as [EditError::Unverified].
+fn after_applied(err: EditError) -> EditError {
     match err {
         EditError::Internal(err) => EditError::Unverified(err),
         other => other,
@@ -872,7 +904,7 @@ pub fn create(api: &WebApi, name: &str) -> Result<Playlist, EditError> {
         Ok(()) => Ok(playlist),
         Err(err) => {
             warn!("Playlist created but not added to your library");
-            Err(after_create(err))
+            Err(after_applied(err))
         }
     }
 }
@@ -882,18 +914,81 @@ pub fn follow(api: &WebApi, id: &str) -> Result<(), EditError> {
     rootlist_add(api, id)
 }
 
-/// Remove `id` from the rootlist, at the index found in a fresh full rootlist read.
-pub fn unfollow(api: &WebApi, id: &str) -> Result<(), EditError> {
-    let rootlist = api.playlist_rootlist()?;
-    let index = rootlist_index(&rootlist, id).ok_or(EditError::Moved)?;
-    // The index walks the raw items, so it is the playlist's own; it must also lie inside the
-    // listing the service reported.
-    if index >= rootlist.length {
-        return Err(EditError::Moved);
+/// What a delete does after one full rootlist read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootlistStep {
+    /// Remove the (first) copy of the playlist at this rootlist index.
+    Remove(usize),
+    /// The complete listing does not hold the playlist: nothing (more) to remove.
+    Absent,
+    /// The read stopped at the page cap: a copy may lie past it, so nothing may be sent.
+    Incomplete,
+}
+
+fn rootlist_step(rootlist: &Rootlist, id: &str) -> RootlistStep {
+    if rootlist.read < rootlist.length {
+        return RootlistStep::Incomplete;
     }
-    let base = root_base(&rootlist)?;
-    let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
-    send_rootlist_verified(api, base, rootlist_remove_op(index), expected)
+    rootlist_index(rootlist, id).map_or(RootlistStep::Absent, RootlistStep::Remove)
+}
+
+fn rootlist_copies(rootlist: &Rootlist, id: &str) -> usize {
+    rootlist
+        .entries
+        .iter()
+        .filter(|entry| matches!(entry, RootEntry::Playlist(p) if p.id == id))
+        .count()
+}
+
+/// Remove every rootlist copy of `id`: read the whole rootlist, remove the first copy at the
+/// index found there (verified by the head length), and read again until no copy is left. A
+/// rootlist the playlist is not in needs no POST; a read that stopped at the page cap fails
+/// before any POST ([EditError::TooLong]).
+///
+/// Every POST after the first verified remove is a later POST, and any failure after it is
+/// never repeated through the Web API ([after_applied]). At most as many removes are sent as
+/// the first read listed copies; one still listed after them fails with
+/// [EditError::Mismatch] (the list changed elsewhere).
+pub fn unfollow(api: &impl PlaylistServer, id: &str) -> Result<(), EditError> {
+    let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
+    let mut removed = 0;
+    let mut listed = None;
+    loop {
+        let post = if removed == 0 {
+            Post::First
+        } else {
+            Post::Later
+        };
+        let fail = |err: EditError| match post {
+            Post::First => err,
+            Post::Later => after_applied(err),
+        };
+        spaced(&mut spacer);
+        let rootlist = api.playlist_rootlist().map_err(|err| fail(err.into()))?;
+        let index = match rootlist_step(&rootlist, id) {
+            RootlistStep::Absent => {
+                if removed == 0 {
+                    debug!("the playlist is not in the rootlist, nothing to remove");
+                }
+                return Ok(());
+            }
+            RootlistStep::Incomplete => return Err(EditError::TooLong),
+            RootlistStep::Remove(index) => index,
+        };
+        if removed >= *listed.get_or_insert_with(|| rootlist_copies(&rootlist, id)) {
+            warn!("Playlist still in the rootlist after removing every copy listed");
+            return Err(EditError::Mismatch);
+        }
+        // The index walks the raw items, so it is the playlist's own; it must also lie inside
+        // the listing the service reported.
+        if index >= rootlist.length {
+            return Err(EditError::Moved);
+        }
+        let base = root_base(&rootlist).map_err(|err| fail(err.into()))?;
+        let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
+        send_rootlist_verified(api, post, base, rootlist_remove_op(index), expected)?;
+        removed += 1;
+    }
 }
 
 #[cfg(test)]
@@ -1389,7 +1484,7 @@ mod tests {
             EditError::Refused(InternalError::NotFound),
             EditError::Mismatch,
         ] {
-            let after = after_create(err);
+            let after = after_applied(err);
             assert!(!matches!(after, EditError::Internal(_)));
             assert_eq!(decide_after(&InternalError::from(after)), Action::Fail);
         }
@@ -1510,6 +1605,8 @@ mod tests {
         posts: RefCell<VecDeque<Result<(), InternalError>>>,
         sent: RefCell<Vec<ListChanges>>,
         contents_reads: std::cell::Cell<usize>,
+        rootlists: RefCell<VecDeque<Result<Rootlist, InternalError>>>,
+        root_heads: RefCell<VecDeque<Result<RootHead, InternalError>>>,
     }
 
     impl Fake {
@@ -1526,6 +1623,31 @@ mod tests {
         fn contents(self, read: ContentsRead) -> Self {
             self.contents.borrow_mut().push_back(read);
             self
+        }
+
+        fn rootlists(
+            self,
+            reads: impl IntoIterator<Item = Result<Rootlist, InternalError>>,
+        ) -> Self {
+            self.rootlists.borrow_mut().extend(reads);
+            self
+        }
+
+        fn root_heads(
+            self,
+            heads: impl IntoIterator<Item = Result<RootHead, InternalError>>,
+        ) -> Self {
+            self.root_heads.borrow_mut().extend(heads);
+            self
+        }
+
+        /// The `from_index` of each POST's remove op, in order.
+        fn removed_at(&self) -> Vec<Option<i32>> {
+            self.sent
+                .borrow()
+                .iter()
+                .map(|body| body.deltas[0].ops[0].rem.from_index)
+                .collect()
         }
     }
 
@@ -1547,6 +1669,28 @@ mod tests {
         }
 
         fn playlist_changes(&self, _id: &str, body: ListChanges) -> Result<(), InternalError> {
+            self.sent.borrow_mut().push(body);
+            self.posts
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued POST reply")
+        }
+
+        fn playlist_rootlist(&self) -> Result<Rootlist, InternalError> {
+            self.rootlists
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued rootlist read")
+        }
+
+        fn rootlist_head(&self) -> Result<RootHead, InternalError> {
+            self.root_heads
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued rootlist head")
+        }
+
+        fn rootlist_changes(&self, body: ListChanges) -> Result<(), InternalError> {
             self.sent.borrow_mut().push(body);
             self.posts
                 .borrow_mut()
@@ -1899,5 +2043,151 @@ mod tests {
         remove_after_web(&mut reloaded, 1, "spotify:track:gone");
         assert_eq!(reloaded.num_tracks, 3);
         assert_eq!(reloaded.snapshot_id, "");
+    }
+
+    /// A complete rootlist read of `ids` (one raw item each) at revision `rev`.
+    fn rootlist_of(rev: &str, ids: &[&str]) -> Rootlist {
+        Rootlist {
+            entries: ids.iter().map(|id| root_pl(id)).collect(),
+            length: ids.len(),
+            read: ids.len(),
+            pages: 1,
+            revision: rev.as_bytes().to_vec(),
+            skipped: vec![],
+        }
+    }
+
+    fn root_head(rev: &str, length: usize) -> RootHead {
+        RootHead {
+            revision: Some(rev.as_bytes().to_vec()),
+            length: Some(length),
+        }
+    }
+
+    #[test]
+    fn a_rootlist_read_decides_the_delete_step() {
+        let once = rootlist_of("r", &["a", "p", "b"]);
+        assert_eq!(rootlist_step(&once, "p"), RootlistStep::Remove(1));
+        let twice = rootlist_of("r", &["p", "a", "p"]);
+        assert_eq!(rootlist_step(&twice, "p"), RootlistStep::Remove(0));
+        assert_eq!(rootlist_copies(&twice, "p"), 2);
+        let absent = rootlist_of("r", &["a", "b"]);
+        assert_eq!(rootlist_step(&absent, "p"), RootlistStep::Absent);
+        let incomplete = Rootlist {
+            length: 7000,
+            ..rootlist_of("r", &["p", "a"])
+        };
+        assert_eq!(rootlist_step(&incomplete, "p"), RootlistStep::Incomplete);
+        let incomplete_absent = Rootlist {
+            length: 7000,
+            ..absent
+        };
+        assert_eq!(
+            rootlist_step(&incomplete_absent, "p"),
+            RootlistStep::Incomplete
+        );
+    }
+
+    #[test]
+    fn a_delete_removes_every_copy_one_read_at_a_time() {
+        let api = Fake::default()
+            .rootlists([
+                Ok(rootlist_of("r1", &["a", "p", "b", "p"])),
+                Ok(rootlist_of("r2", &["a", "b", "p"])),
+                Ok(rootlist_of("r3", &["a", "b"])),
+            ])
+            .posts([Ok(()), Ok(())])
+            .root_heads([Ok(root_head("r2", 3)), Ok(root_head("r3", 2))]);
+        unfollow(&api, "p").expect("every copy removed");
+        assert_eq!(api.removed_at(), [Some(1), Some(2)]);
+        // Each remove is based on the read that found its index.
+        let bases: Vec<Option<Vec<u8>>> = api
+            .sent
+            .borrow()
+            .iter()
+            .map(|body| body.base_revision.clone())
+            .collect();
+        assert_eq!(bases, [Some(b"r1".to_vec()), Some(b"r2".to_vec())]);
+    }
+
+    #[test]
+    fn a_delete_of_a_playlist_not_in_the_rootlist_sends_nothing() {
+        let api = Fake::default().rootlists([Ok(rootlist_of("r", &["a", "b"]))]);
+        unfollow(&api, "p").expect("nothing to remove is a success");
+        assert!(api.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_delete_on_an_incomplete_rootlist_fails_before_any_post() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        let api = Fake::default().rootlists([Ok(Rootlist {
+            length: 7000,
+            ..rootlist_of("r", &["p", "a"])
+        })]);
+        let err = unfollow(&api, "p").expect_err("too long");
+        assert!(matches!(err, EditError::TooLong));
+        assert_eq!(
+            err.note().as_deref(),
+            Some("Playlist list too long to edit")
+        );
+        assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
+        assert!(api.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_failure_after_the_first_remove_never_falls_back() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        // The re-read, the later POST and its verify read each fail in turn.
+        let reread = Fake::default()
+            .rootlists([
+                Ok(rootlist_of("r1", &["p", "p"])),
+                Err(InternalError::NoSession),
+            ])
+            .posts([Ok(())])
+            .root_heads([Ok(root_head("r2", 1))]);
+        let later_post = Fake::default()
+            .rootlists([
+                Ok(rootlist_of("r1", &["p", "p"])),
+                Ok(rootlist_of("r2", &["p"])),
+            ])
+            .posts([Ok(()), Err(InternalError::NotFound)])
+            .root_heads([Ok(root_head("r2", 1))]);
+        let later_verify = Fake::default()
+            .rootlists([
+                Ok(rootlist_of("r1", &["p", "p"])),
+                Ok(rootlist_of("r2", &["p"])),
+            ])
+            .posts([Ok(()), Ok(())])
+            .root_heads([Ok(root_head("r2", 1)), Err(InternalError::NoSession)]);
+        for api in [reread, later_post, later_verify] {
+            let err = unfollow(&api, "p").expect_err("failed after a remove");
+            assert!(matches!(err, EditError::Unverified(_)), "{err:?}");
+            assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
+        }
+    }
+
+    #[test]
+    fn a_first_remove_failure_keeps_its_class() {
+        let api = Fake::default()
+            .rootlists([Ok(rootlist_of("r1", &["p", "p"]))])
+            .posts([Err(InternalError::NoSession)]);
+        assert!(matches!(
+            unfollow(&api, "p"),
+            Err(EditError::Internal(InternalError::NoSession))
+        ));
+    }
+
+    #[test]
+    fn a_copy_still_listed_after_every_listed_remove_fails() {
+        // One copy listed, removed and verified; the next read lists it again.
+        let api = Fake::default()
+            .rootlists([
+                Ok(rootlist_of("r1", &["a", "p"])),
+                Ok(rootlist_of("r2", &["p", "a"])),
+            ])
+            .posts([Ok(())])
+            .root_heads([Ok(root_head("r2", 1))]);
+        assert!(matches!(unfollow(&api, "p"), Err(EditError::Mismatch)));
+        assert_eq!(api.removed_at(), [Some(1)]);
     }
 }

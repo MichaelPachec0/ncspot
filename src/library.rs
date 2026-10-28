@@ -264,8 +264,9 @@ impl Library {
     }
 
     /// Delete (unfollow) the playlist with the given `id` if it exists: the internal API
-    /// first, the Web API per the fallback classes. The store, the layout and their caches
-    /// update in place.
+    /// first (every rootlist copy is removed; one the rootlist no longer lists needs no write),
+    /// the Web API per the fallback classes. The store, the layout and their caches update in
+    /// place.
     pub fn delete_playlist(&self, id: &str) {
         if !*self.is_done.read().unwrap() {
             return;
@@ -412,10 +413,13 @@ impl Library {
     }
 
     /// Create an empty playlist named `name` and put it at the top of the library: the
-    /// internal API first, the Web API per the fallback classes. Returns its id.
+    /// internal API first, the Web API per the fallback classes. Returns its id. A Web create
+    /// leaves the stored copy without a revision, so an incremental playlists sync starts
+    /// after it to fetch the real snapshot.
     pub fn create_playlist(&self, name: &str) -> Option<String> {
         let api = &self.spotify.api;
         let created: RefCell<Option<Playlist>> = RefCell::new(None);
+        let web_created = Cell::new(false);
         let note = Cell::new(None);
         let written = write_through(
             api,
@@ -435,6 +439,7 @@ impl Library {
                     };
                     let owner = self.user_id.as_deref();
                     *created.borrow_mut() = Some(created_playlist(&web, name, owner));
+                    web_created.set(true);
                     true
                 }
                 Err(()) => false,
@@ -445,6 +450,12 @@ impl Library {
         playlist.owner_name.clone_from(&self.display_name);
         let id = playlist.id.clone();
         self.insert_new_playlist(playlist);
+        if web_created.get() {
+            let update = self.update_tab(&LibraryTab::Playlists);
+            if update != TabUpdate::Started {
+                info!("playlists sync after a Web create not started: {update:?}");
+            }
+        }
         Some(id)
     }
 
