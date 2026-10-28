@@ -37,10 +37,12 @@ pub struct Playlist {
 }
 
 impl Playlist {
-    /// Load the tracks if they are not loaded yet. Returns true if the tracks are loaded; on a
-    /// failed request `tracks` is left untouched.
+    /// Load the tracks if they are not loaded yet; a loaded copy whose snapshot was cleared is
+    /// reloaded instead when the internal API can (see [playlist_edit::reload_cleared]).
+    /// Returns true if the tracks are loaded; on a failed request `tracks` is left untouched.
     pub fn load_tracks(&mut self, spotify: &Spotify) -> bool {
         if self.tracks.is_some() {
+            playlist_edit::reload_cleared(&spotify.api, self);
             return true;
         }
 

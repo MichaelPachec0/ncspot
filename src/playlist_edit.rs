@@ -298,8 +298,9 @@ impl EditError {
 
     /// The edited local copy must be stored although the action failed, so the store matches
     /// the server: after an unconfirmed write it may hold earlier batches (a failed verify read
-    /// cleared its snapshot so the next open or write reloads it), after a mismatch it is the
-    /// reloaded copy, after a partial add it holds the verified batches.
+    /// cleared its snapshot, so the next write finds it stale and the next open reloads it
+    /// with [reload_cleared]), after a mismatch it is the reloaded copy, after a partial add it
+    /// holds the verified batches.
     pub fn stores_copy(&self) -> bool {
         matches!(
             self,
@@ -417,6 +418,32 @@ fn reload(
     Ok((base, drift))
 }
 
+/// Reload a loaded copy whose snapshot was cleared (a write that could not be confirmed, a
+/// mismatch whose reload failed, a Web create, which has no revision) with one full read,
+/// when the playlists area is usable; true when it was reloaded. The copy's own items are the
+/// known metadata, so only items added elsewhere are looked up. A failed read keeps the copy
+/// and its cleared snapshot (the next open or write tries again); a protocol change latches
+/// the area.
+pub fn reload_cleared(api: &impl PlaylistServer, playlist: &mut Playlist) -> bool {
+    let Some(tracks) = &playlist.tracks else {
+        return false;
+    };
+    if !playlist.snapshot_id.is_empty() || !api.internal_usable(Area::Playlists) {
+        return false;
+    }
+    let own: HashMap<String, Playable> = tracks.iter().map(|p| (p.uri(), p.clone())).collect();
+    match reload(api, playlist, &|| own.clone()) {
+        Ok(_) => true,
+        Err(err) => {
+            warn!("Could not reload a playlist ({})", err.class());
+            if let InternalError::ProtocolChanged(_) = err {
+                api.latch_area(Area::Playlists, &err);
+            }
+            false
+        }
+    }
+}
+
 /// Store `tracks` (renumbered by position) with `snapshot_id`.
 fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, snapshot_id: &str) {
     for (index, playable) in tracks.iter_mut().enumerate() {
@@ -489,15 +516,16 @@ fn send_post(
 }
 
 /// The verify read after a POST failed or proved nothing: clear the local snapshot so the
-/// next open or write reloads the copy (the caller stores it, see [EditError::stores_copy]).
+/// next write (stale copy) or open ([reload_cleared]) reloads the copy (the caller stores it,
+/// see [EditError::stores_copy]).
 fn unconfirmed(playlist: &mut Playlist, err: InternalError) -> EditError {
     playlist.snapshot_id.clear();
     EditError::Unverified(err)
 }
 
 /// POST `ops` against `base`, then read the head: its base when its length is `expected_len`,
-/// else reload the local copy (or, when the reload fails, clear its snapshot so the next open
-/// or write reloads it) and fail with [EditError::Mismatch]. A failed POST is classed by
+/// else reload the local copy (or, when the reload fails, clear its snapshot so the next write
+/// or open reloads it, see [reload_cleared]) and fail with [EditError::Mismatch]. A failed POST is classed by
 /// [post_error] at its position `post`; a failed or unreadable verify read is [unconfirmed].
 fn send_verified(
     api: &impl PlaylistServer,
@@ -623,7 +651,7 @@ fn add_batches(
 /// The local side of a Web API remove of the row at server position `index` with `uri`. The
 /// Web call named that position in the snapshot from before the attempt; when the copy was
 /// reloaded since, the item may sit elsewhere. So remove it only where it is still `uri`, else
-/// clear the snapshot so the next open or write reloads the copy.
+/// clear the snapshot so the next write or open reloads the copy (see [reload_cleared]).
 pub fn remove_after_web(playlist: &mut Playlist, index: usize, uri: &str) {
     let removed = playlist
         .tracks
@@ -1623,6 +1651,9 @@ mod tests {
         contents_reads: std::cell::Cell<usize>,
         rootlists: RefCell<VecDeque<Result<Rootlist, InternalError>>>,
         root_heads: RefCell<VecDeque<Result<RootHead, InternalError>>>,
+        /// The playlists area is off or latched.
+        unusable: std::cell::Cell<bool>,
+        latches: std::cell::Cell<usize>,
     }
 
     impl Fake {
@@ -1715,10 +1746,12 @@ mod tests {
         }
 
         fn internal_usable(&self, _area: Area) -> bool {
-            true
+            !self.unusable.get()
         }
 
-        fn latch_area(&self, _area: Area, _err: &InternalError) {}
+        fn latch_area(&self, _area: Area, _err: &InternalError) {
+            self.latches.set(self.latches.get() + 1);
+        }
     }
 
     fn no_known() -> HashMap<String, Playable> {
@@ -2059,6 +2092,53 @@ mod tests {
         remove_after_web(&mut reloaded, 1, "spotify:track:gone");
         assert_eq!(reloaded.num_tracks, 3);
         assert_eq!(reloaded.snapshot_id, "");
+    }
+
+    #[test]
+    fn an_open_reloads_a_copy_whose_snapshot_was_cleared() {
+        // A Web-created empty playlist: one full read, no head read.
+        let api = Fake::default().contents(Ok((head("s1", 0), vec![])));
+        let mut created = local("", 0);
+        assert!(reload_cleared(&api, &mut created));
+        assert_eq!(api.contents_reads.get(), 1);
+        assert_eq!(
+            (created.snapshot_id.as_str(), created.num_tracks),
+            ("s1", 0)
+        );
+
+        // A copy left by an unconfirmed write takes the server's items and snapshot.
+        let server = vec![at("spotify:track:0", 0), at("spotify:track:new", 1)];
+        let api = Fake::default().contents(Ok((head("s2", 2), server)));
+        let mut stale = local("", 1);
+        assert!(reload_cleared(&api, &mut stale));
+        assert_eq!(uri_list(&stale), ["spotify:track:0", "spotify:track:new"]);
+        assert_eq!((stale.snapshot_id.as_str(), stale.num_tracks), ("s2", 2));
+    }
+
+    #[test]
+    fn an_open_keeps_a_current_or_unloaded_copy_and_a_failed_reload() {
+        // No queued reads: any read would panic.
+        let api = Fake::default();
+        let mut current = local("s", 2);
+        assert!(!reload_cleared(&api, &mut current));
+        let mut unloaded = Playlist {
+            tracks: None,
+            ..local("", 0)
+        };
+        assert!(!reload_cleared(&api, &mut unloaded));
+        api.unusable.set(true);
+        let mut cleared = local("", 2);
+        assert!(!reload_cleared(&api, &mut cleared));
+
+        let api = Fake::default().contents(Err(InternalError::ProtocolChanged("read".into())));
+        let mut cleared = local("", 2);
+        assert!(!reload_cleared(&api, &mut cleared));
+        assert_eq!(api.latches.get(), 1, "a protocol change latches the area");
+        assert_eq!((cleared.snapshot_id.as_str(), cleared.num_tracks), ("", 2));
+        let api = Fake::default().contents(Err(InternalError::Transient("read".into())));
+        assert!(!reload_cleared(&api, &mut cleared));
+        assert_eq!(api.latches.get(), 0);
+        assert_eq!(uri_list(&cleared), ["spotify:track:0", "spotify:track:1"]);
     }
 
     /// A complete rootlist read of `ids` (one raw item each) at revision `rev`.
