@@ -193,11 +193,6 @@ impl<I: ListItem + Clone> ListView<I> {
         }
     }
 
-    /// Remove the item at `index` from the list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `index` is out of bounds.
     /// Get the selected row from a mouse position and offset
     fn get_selected_row(&self, position: XY<usize>, offset: XY<usize>) -> Option<usize> {
         let viewport = self.scroller.content_viewport().top_left();

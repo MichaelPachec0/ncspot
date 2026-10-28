@@ -106,18 +106,19 @@ fn in_server_order(tracks: &[Playable]) -> bool {
 
 /// Where in `tracks` the item at server position `index` (its `list_index`) is, when it is
 /// still `uri`. The position in `tracks` is not used as the server index: a copy may be in
-/// another order.
+/// another order (or, cached by older builds, hold one `list_index` twice; the uri tells them
+/// apart).
 pub fn server_item(tracks: &[Playable], index: usize, uri: &str) -> Option<usize> {
     tracks
         .iter()
-        .position(|playable| playable.list_index() == index)
-        .filter(|&at| tracks[at].uri() == uri)
+        .position(|playable| playable.list_index() == index && playable.uri() == uri)
 }
 
-/// Remove the item at server position `index` (its `list_index`) and move every later item one
-/// position up, keeping the order of `tracks`. False when no item has that position.
-pub fn remove_server_item(tracks: &mut Vec<Playable>, index: usize) -> bool {
-    let Some(at) = tracks.iter().position(|p| p.list_index() == index) else {
+/// Remove the item at server position `index` (its `list_index`) when it is `uri`, and move
+/// every later item one position up, keeping the order of `tracks`. False (nothing removed)
+/// when no item at that position is `uri`.
+pub fn remove_server_item(tracks: &mut Vec<Playable>, index: usize, uri: &str) -> bool {
+    let Some(at) = server_item(tracks, index, uri) else {
         return false;
     };
     tracks.remove(at);
@@ -587,6 +588,21 @@ fn add_batches(
     Ok(())
 }
 
+/// The local side of a Web API remove of the row at server position `index` with `uri`. The
+/// Web call named that position in the snapshot from before the attempt; when the copy was
+/// reloaded since, the item may sit elsewhere. So remove it only where it is still `uri`, else
+/// clear the snapshot so the next open or write reloads the copy.
+pub fn remove_after_web(playlist: &mut Playlist, index: usize, uri: &str) {
+    let removed = playlist
+        .tracks
+        .as_mut()
+        .is_some_and(|tracks| remove_server_item(tracks, index, uri));
+    playlist.num_tracks = playlist.tracks.as_ref().map_or(0, Vec::len);
+    if !removed {
+        playlist.snapshot_id.clear();
+    }
+}
+
 /// Remove the item at server position `index` (its `list_index`), which must still be `uri`
 /// once the local copy is current.
 pub fn remove_track(
@@ -613,7 +629,7 @@ pub fn remove_track(
         expected,
     )?;
     if let Some(tracks) = playlist.tracks.as_mut() {
-        remove_server_item(tracks, index);
+        remove_server_item(tracks, index, uri);
         playlist.num_tracks = tracks.len();
     }
     playlist.snapshot_id = after.snapshot_id;
@@ -1042,7 +1058,12 @@ mod tests {
             at("spotify:track:d", 3),
             at("spotify:track:b", 1),
         ];
-        assert!(remove_server_item(&mut tracks, 1));
+        assert!(
+            !remove_server_item(&mut tracks, 1, "spotify:track:a"),
+            "another uri"
+        );
+        assert_eq!(tracks.len(), 4);
+        assert!(remove_server_item(&mut tracks, 1, "spotify:track:b"));
         let held: Vec<(String, usize)> = tracks.iter().map(|p| (p.uri(), p.list_index())).collect();
         assert_eq!(
             held,
@@ -1052,7 +1073,7 @@ mod tests {
                 ("spotify:track:d".to_string(), 2),
             ]
         );
-        assert!(!remove_server_item(&mut tracks, 7));
+        assert!(!remove_server_item(&mut tracks, 7, "spotify:track:c"));
     }
 
     #[test]
@@ -1818,5 +1839,65 @@ mod tests {
     fn a_later_batch_mismatch_note_is_exact() {
         let err = partial(100, 150, EditError::Mismatch);
         assert_eq!(err.note().as_deref(), Some("Added 100 of 150 tracks"));
+    }
+
+    /// A copy cached by an older Web append: x kept list_index 0, so a0 b1 x0. On the server
+    /// x is at position 2.
+    fn held_duplicate() -> Playlist {
+        Playlist {
+            tracks: Some(vec![
+                at("spotify:track:a", 0),
+                at("spotify:track:b", 1),
+                at("spotify:track:x", 0),
+            ]),
+            num_tracks: 3,
+            ..local("s", 0)
+        }
+    }
+
+    #[test]
+    fn a_duplicate_list_index_is_told_apart_by_the_uri() {
+        let tracks = held_duplicate().tracks.unwrap();
+        assert_eq!(server_item(&tracks, 0, "spotify:track:x"), Some(2));
+        assert_eq!(server_item(&tracks, 0, "spotify:track:a"), Some(0));
+    }
+
+    #[test]
+    fn a_row_with_a_duplicate_list_index_never_removes_another_track() {
+        // Deleting row x (list_index 0): the copy is not in server order, so it is reloaded;
+        // server position 0 is a, not x, so nothing is sent.
+        let mut playlist = held_duplicate();
+        let server = vec![
+            at("spotify:track:a", 0),
+            at("spotify:track:b", 1),
+            at("spotify:track:x", 2),
+        ];
+        let api = Fake::default()
+            .heads([Ok(head("s", 3))])
+            .contents(Ok((head("s", 3), server)));
+        let err = remove_track(&api, &mut playlist, 0, "spotify:track:x", &no_known).unwrap_err();
+        assert!(matches!(err, EditError::Moved));
+        assert!(api.sent.borrow().is_empty(), "a is never removed");
+        assert_eq!(
+            uri_list(&playlist),
+            ["spotify:track:a", "spotify:track:b", "spotify:track:x"]
+        );
+    }
+
+    #[test]
+    fn a_web_remove_drops_the_row_only_where_it_still_is() {
+        let mut playlist = local("s", 3);
+        remove_after_web(&mut playlist, 1, "spotify:track:1");
+        assert_eq!(uri_list(&playlist), ["spotify:track:0", "spotify:track:2"]);
+        assert_eq!(
+            (playlist.num_tracks, playlist.snapshot_id.as_str()),
+            (2, "s")
+        );
+
+        // Reloaded since: position 1 holds another track, which stays; the copy goes stale.
+        let mut reloaded = local("r", 3);
+        remove_after_web(&mut reloaded, 1, "spotify:track:gone");
+        assert_eq!(reloaded.num_tracks, 3);
+        assert_eq!(reloaded.snapshot_id, "");
     }
 }

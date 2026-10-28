@@ -92,20 +92,20 @@ impl Playlist {
         })
     }
 
-    /// Remove the track at server position `index` (its `list_index`, not its position in a
-    /// sorted view). On failure the error is the status note to show.
+    /// Remove the track `row` (a row of a view of this playlist): the item at its server
+    /// position (`list_index`, not its place in a sorted view) that is also its uri. On failure
+    /// the error is the status note to show.
     pub fn delete_track(
         &mut self,
-        index: usize,
+        row: &Playable,
         spotify: Spotify,
         library: &Library,
     ) -> Result<(), String> {
-        let Some(playable) = self
-            .tracks
-            .as_ref()
-            .and_then(|tracks| tracks.iter().find(|p| p.list_index() == index))
-            .cloned()
-        else {
+        let index = row.list_index();
+        let uri = row.uri();
+        let Some(playable) = self.tracks.as_ref().and_then(|tracks| {
+            playlist_edit::server_item(tracks, index, &uri).map(|at| tracks[at].clone())
+        }) else {
             return Err("Could not delete track.".to_string());
         };
         debug!("deleting track: {index} {playable:?}");
@@ -117,7 +117,6 @@ impl Playlist {
 
         let api = &spotify.api;
         let known = || library.known_playables();
-        let uri = playable.uri();
         let note = Cell::new(None);
         let web_used = Cell::new(false);
         let id = self.id.clone();
@@ -148,11 +147,8 @@ impl Playlist {
             return Err("Could not delete track.".to_string());
         }
 
-        if web_used.get()
-            && let Some(tracks) = &mut self.tracks
-        {
-            playlist_edit::remove_server_item(tracks, index);
-            self.num_tracks = tracks.len();
+        if web_used.get() {
+            playlist_edit::remove_after_web(self, index, &uri);
         }
         library.playlist_update(self);
         Ok(())

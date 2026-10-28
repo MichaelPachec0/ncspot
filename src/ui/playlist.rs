@@ -99,15 +99,16 @@ impl ViewExt for PlaylistView {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         if let Command::Delete = cmd {
             let pos = self.list.get_selected_index();
-            // The row's server position: the rows may be sorted, `playlist` is not.
-            let Some(index) = self.rows.read().unwrap().get(pos).map(Playable::list_index) else {
+            // The row itself: its server position and uri (the rows may be sorted, `playlist`
+            // is not).
+            let Some(row) = self.rows.read().unwrap().get(pos).cloned() else {
                 return Ok(CommandResult::Consumed(None));
             };
             let snapshot_id = self.playlist.snapshot_id.clone();
 
             return match self
                 .playlist
-                .delete_track(index, self.spotify.clone(), &self.library)
+                .delete_track(&row, self.spotify.clone(), &self.library)
             {
                 Ok(()) => {
                     // Rebuilt from the copy: a reload before the delete may have changed more

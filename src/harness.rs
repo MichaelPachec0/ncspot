@@ -284,7 +284,9 @@ pub fn playlist_remove_test(
             "harness playlist-remove-test: no track {index} ({len} loaded)"
         ));
     }
-    playlist.delete_track(index, spotify.clone(), library)
+    let row = playlist.tracks.as_ref().map(|tracks| tracks[index].clone());
+    let row = row.ok_or("harness playlist-remove-test: no tracks loaded")?;
+    playlist.delete_track(&row, spotify.clone(), library)
 }
 
 /// Replace the contents of the most recent test playlist with the first `n` public test tracks.
