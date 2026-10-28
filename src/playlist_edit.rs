@@ -121,14 +121,15 @@ fn verify(expected_len: usize, after: Head) -> Verify {
 
 #[derive(Debug)]
 pub enum EditError {
-    /// Failed before anything was sent; the class decides the fallback as usual.
+    /// Failed before anything was sent (including a first POST that never left: no session,
+    /// area off or latched); the class decides the fallback as usual.
     Internal(InternalError),
-    /// Failed after a POST may have reached the server (a transient or rate limited POST, the
-    /// verify read or a later batch): the write may have applied, so it must never be repeated
-    /// through the Web API.
+    /// Failed after a POST may have reached the server (a transient or rate limited first
+    /// POST, the verify read, or any error of a later batch): the write may have applied, so it
+    /// must never be repeated through the Web API.
     Unverified(InternalError),
-    /// The POST was refused (not found, denied, a protocol change) or never sent (no
-    /// session): nothing applied, but the action still fails without a Web fallback.
+    /// The server refused the first POST of an action (not found, denied, a protocol change):
+    /// nothing applied, but the action still fails without a Web fallback.
     Refused(InternalError),
     /// The selected item moved; nothing was sent.
     Moved,
@@ -281,25 +282,65 @@ fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, snapshot_id: &
     playlist.snapshot_id = snapshot_id.to_string();
 }
 
-/// The class of a failed write POST: only a transient error or a rate limit may have reached
-/// the server ([EditError::Unverified]); a refusal, a protocol change or a missing session
-/// means nothing applied ([EditError::Refused]). Neither falls back to the Web API.
-fn post_error(err: InternalError) -> EditError {
-    match err {
-        InternalError::Transient(_) | InternalError::RateLimited => EditError::Unverified(err),
-        InternalError::NotFound
-        | InternalError::Denied
-        | InternalError::ProtocolChanged(_)
-        | InternalError::NoSession => EditError::Refused(err),
+/// The position of a POST in its action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Post {
+    /// The first POST: nothing of the action applied before it.
+    First,
+    /// A later add batch (add batches 2..n, the overwrite tail): earlier batches applied.
+    Later,
+}
+
+/// The class of a failed write POST. A later batch is always [EditError::Unverified]:
+/// earlier batches applied, so the Web API must never repeat the action. For the first POST,
+/// a missing session never sent it ([EditError::Internal], the usual fallback); a transient
+/// error or a rate limit may have reached the server ([EditError::Unverified]); a refusal or
+/// a protocol change means nothing applied ([EditError::Refused], no Web fallback).
+fn post_error(err: InternalError, post: Post) -> EditError {
+    match (post, err) {
+        (Post::Later, err) => EditError::Unverified(err),
+        (Post::First, err @ InternalError::NoSession) => EditError::Internal(err),
+        (Post::First, err @ (InternalError::Transient(_) | InternalError::RateLimited)) => {
+            EditError::Unverified(err)
+        }
+        (
+            Post::First,
+            err @ (InternalError::NotFound
+            | InternalError::Denied
+            | InternalError::ProtocolChanged(_)),
+        ) => EditError::Refused(err),
     }
 }
 
-/// [post_error], latching the playlists area on a protocol change.
-fn failed_post(api: &WebApi, err: InternalError) -> EditError {
-    if let InternalError::ProtocolChanged(_) = err {
-        api.latch_area(Area::Playlists, &err);
+/// The error of a POST skipped because the playlists area is off or latched: nothing was
+/// sent, so a first POST keeps its class (latch, then the Web API) and a later batch is
+/// [EditError::Unverified] like any of its errors.
+fn unsent_post(post: Post) -> EditError {
+    let err = InternalError::ProtocolChanged("area off or latched".into());
+    match post {
+        Post::First => EditError::Internal(err),
+        Post::Later => EditError::Unverified(err),
     }
-    post_error(err)
+}
+
+/// Send one write POST at position `post`. The area is checked first, so a POST that
+/// `run_internal_once` would skip without sending is told apart from a server protocol
+/// change; a server protocol change latches the playlists area, then [post_error] classes
+/// the failure.
+fn send_post(
+    api: &WebApi,
+    post: Post,
+    send: impl FnOnce() -> Result<(), InternalError>,
+) -> Result<(), EditError> {
+    if !api.internal_usable(Area::Playlists) {
+        return Err(unsent_post(post));
+    }
+    send().map_err(|err| {
+        if let InternalError::ProtocolChanged(_) = err {
+            api.latch_area(Area::Playlists, &err);
+        }
+        post_error(err, post)
+    })
 }
 
 /// The verify read after a POST failed or proved nothing: clear the local snapshot so the
@@ -311,17 +352,19 @@ fn unconfirmed(playlist: &mut Playlist, err: InternalError) -> EditError {
 
 /// POST `ops` against `base`, then read the head: its base when its length is `expected_len`,
 /// else reload the local copy and fail with [EditError::Mismatch]. A failed POST is classed by
-/// [post_error]; a failed or unreadable verify read is [unconfirmed].
+/// [post_error] at its position `post`; a failed or unreadable verify read is [unconfirmed].
 fn send_verified(
     api: &WebApi,
     playlist: &mut Playlist,
     known: Known<'_>,
+    post: Post,
     base: Vec<u8>,
     ops: Vec<Op>,
     expected_len: usize,
 ) -> Result<Base, EditError> {
-    api.playlist_changes(&playlist.id, list_changes(base, ops))
-        .map_err(|err| failed_post(api, err))?;
+    send_post(api, post, || {
+        api.playlist_changes(&playlist.id, list_changes(base, ops))
+    })?;
     let after = match api.playlist_head(&playlist.id) {
         Ok(after) => after,
         Err(err) => return Err(unconfirmed(playlist, err)),
@@ -329,6 +372,8 @@ fn send_verified(
     let length = match verify(expected_len, after) {
         Verify::Applied(base) => return Ok(base),
         Verify::Unreadable => {
+            // Not latched: the POST went through and may have applied, so there is no Web
+            // fallback either way, and the next head read decides whether the area is usable.
             return Err(unconfirmed(
                 playlist,
                 InternalError::ProtocolChanged("playlist head without a revision or length".into()),
@@ -374,6 +419,7 @@ pub fn add_tracks(
         known,
         base,
         new,
+        Post::First,
         &mut Spacer::new(PLAYLIST_FETCH_SPACING),
     )
 }
@@ -386,13 +432,15 @@ fn add_batches(
     known: Known<'_>,
     mut base: Base,
     new: &[Playable],
+    mut post: Post,
     spacer: &mut Spacer,
 ) -> Result<(), EditError> {
     for batch in add_chunks(new) {
         spaced(spacer);
         let expected = expected_len(base.length, Change::Add(batch.len())).unwrap_or_default();
         let ops = vec![add_op(&uris(batch), None)];
-        let after = send_verified(api, playlist, known, base.revision, ops, expected)?;
+        let after = send_verified(api, playlist, known, post, base.revision, ops, expected)?;
+        post = Post::Later;
         let mut tracks = playlist.tracks.take().unwrap_or_default();
         tracks.extend_from_slice(batch);
         set_tracks(playlist, tracks, &after.snapshot_id);
@@ -416,7 +464,15 @@ pub fn remove_track(
     }
     let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
     let ops = vec![remove_at_op(index)];
-    let after = send_verified(api, playlist, known, base.revision, ops, expected)?;
+    let after = send_verified(
+        api,
+        playlist,
+        known,
+        Post::First,
+        base.revision,
+        ops,
+        expected,
+    )?;
     let mut tracks = playlist.tracks.take().unwrap_or_default();
     tracks.remove(index);
     set_tracks(playlist, tracks, &after.snapshot_id);
@@ -442,10 +498,19 @@ pub fn overwrite(
         spaced(&mut spacer);
         let expected =
             expected_len(base.length, Change::Overwrite(first.len())).unwrap_or_default();
-        send_verified(api, playlist, known, base.revision, ops, expected)?
+        send_verified(
+            api,
+            playlist,
+            known,
+            Post::First,
+            base.revision,
+            ops,
+            expected,
+        )?
     };
     set_tracks(playlist, first.to_vec(), &after.snapshot_id);
-    add_batches(api, playlist, known, after, rest, &mut spacer)
+    // `rest` is non-empty only when the head POST was sent, so its batches are later ones.
+    add_batches(api, playlist, known, after, rest, Post::Later, &mut spacer)
 }
 
 const PLAYLIST_URI_PREFIX: &str = "spotify:playlist:";
@@ -527,15 +592,17 @@ fn rootlist_verify(after: &RootHead, expected_len: usize) -> Result<(), EditErro
 }
 
 /// POST `op` against the rootlist `base`, then confirm it with [rootlist_verify]. A failed
-/// POST is classed by [post_error]; a failed verify read is [EditError::Unverified].
+/// POST is classed by [post_error] (it is the first POST); a failed verify read is
+/// [EditError::Unverified].
 fn send_rootlist_verified(
     api: &WebApi,
     base: RootBase,
     op: Op,
     expected_len: usize,
 ) -> Result<(), EditError> {
-    api.rootlist_changes(list_changes(base.revision, vec![op]))
-        .map_err(|err| failed_post(api, err))?;
+    send_post(api, Post::First, || {
+        api.rootlist_changes(list_changes(base.revision, vec![op]))
+    })?;
     let after = api.rootlist_head().map_err(EditError::Unverified)?;
     rootlist_verify(&after, expected_len)
 }
@@ -853,32 +920,85 @@ mod tests {
     }
 
     #[test]
-    fn post_errors_split_into_unverified_and_refused() {
+    fn post_errors_by_position_and_class() {
         use crate::internal_api::fallback::{Action, decide_after};
+        // (error, first POST: class and action, later batch: class and action)
         let cases = [
-            (InternalError::Transient("timeout".into()), "unverified"),
-            (InternalError::RateLimited, "unverified"),
-            (InternalError::NotFound, "refused"),
-            (InternalError::Denied, "refused"),
-            (InternalError::ProtocolChanged("412".into()), "refused"),
-            (InternalError::NoSession, "refused"),
+            (
+                InternalError::Transient("timeout".into()),
+                ("unverified", Action::Fail),
+            ),
+            (InternalError::RateLimited, ("unverified", Action::Fail)),
+            (InternalError::NotFound, ("refused", Action::Fail)),
+            (InternalError::Denied, ("refused", Action::Fail)),
+            (
+                InternalError::ProtocolChanged("412".into()),
+                ("refused", Action::Fail),
+            ),
+            (InternalError::NoSession, ("no session", Action::WebOnce)),
         ];
-        for (inner, class) in cases {
-            let err = post_error(inner.clone());
-            assert_eq!(err.class(), class, "{inner}");
-            assert_eq!(err.stores_copy(), class == "unverified", "{inner}");
-            let note = if class == "refused" {
-                "Spotify refused the change"
-            } else {
-                "Could not confirm the change; it may have applied"
-            };
-            assert_eq!(err.note(), Some(note), "{inner}");
+        let note = |class: &str| match class {
+            "refused" => Some("Spotify refused the change"),
+            "unverified" => Some("Could not confirm the change; it may have applied"),
+            _ => None,
+        };
+        for (inner, (class, action)) in cases {
+            let first = post_error(inner.clone(), Post::First);
+            assert_eq!(first.class(), class, "first {inner}");
+            assert_eq!(first.note(), note(class), "first {inner}");
+            assert_eq!(first.stores_copy(), class == "unverified", "first {inner}");
             assert_eq!(
-                decide_after(&InternalError::from(err)),
+                decide_after(&InternalError::from(first)),
+                action,
+                "first {inner}"
+            );
+
+            let later = post_error(inner.clone(), Post::Later);
+            assert_eq!(later.class(), "unverified", "later {inner}");
+            assert_eq!(later.note(), note("unverified"), "later {inner}");
+            assert!(
+                later.stores_copy(),
+                "later {inner}: the verified batches are stored"
+            );
+            assert_eq!(
+                decide_after(&InternalError::from(later)),
                 Action::Fail,
-                "{inner}"
+                "later {inner}"
             );
         }
+    }
+
+    #[test]
+    fn an_unsent_post_keeps_its_class_only_when_first() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        let first = unsent_post(Post::First);
+        assert!(matches!(
+            first,
+            EditError::Internal(InternalError::ProtocolChanged(_))
+        ));
+        assert_eq!(
+            decide_after(&InternalError::from(first)),
+            Action::LatchThenWeb
+        );
+        let later = unsent_post(Post::Later);
+        assert!(later.stores_copy());
+        assert_eq!(decide_after(&InternalError::from(later)), Action::Fail);
+    }
+
+    #[test]
+    fn a_post_on_a_latched_area_is_not_sent() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        api.latch_area(Area::Playlists, &InternalError::ProtocolChanged("x".into()));
+        let sent = std::cell::Cell::new(false);
+        let result = send_post(&api, Post::First, || {
+            sent.set(true);
+            Ok(())
+        });
+        assert!(!sent.get());
+        assert!(matches!(
+            result,
+            Err(EditError::Internal(InternalError::ProtocolChanged(_)))
+        ));
     }
 
     #[test]
