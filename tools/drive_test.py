@@ -46,6 +46,15 @@ class ScrubTest(unittest.TestCase):
         out = drive.redact(["open spotify:track:4uLU6hMCjMI75M1A2tKUQC now"], None)
         self.assertEqual(out, ["open spotify:track:[id] now"])
 
+    def test_redact_masks_bare_ids_and_drops_ipc_status_lines(self):
+        lines = [
+            'url: "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"',
+            '[ncspot::ipc] [DEBUG] IPC Status update: Status { title: "Some Song" }',
+        ]
+        out = drive.redact(lines, None)
+        self.assertEqual(out[0], 'url: "https://open.spotify.com/track/[id]"')
+        self.assertEqual(out[1], "[ipc status update]")
+
     def test_status_segments_keep_only_bracketed_segments(self):
         pane = ["  Some Artist - Some Song   3:01 |", " >> Song  [rate limited: shared 24s] [R1] 0:02"]
         self.assertEqual(drive.status_segments(pane), ["[rate limited: shared 24s] [R1]"])

@@ -34,6 +34,9 @@ REAL_CONFIG = os.path.join(
 )
 SECRET_WORDS = ("token", "bearer", "auth")
 URI_RE = re.compile(r"(spotify[:/])([a-z]+)[:/][A-Za-z0-9]{22}")
+BARE_ID_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{22}(?![A-Za-z0-9])")
+# ncspot's IPC debug line prints the whole player status: track, artists, ids, cover URL.
+IPC_STATUS = "IPC Status update"
 STATUS_RE = re.compile(r"\[[^\]\n]*\]")
 SOCKET_WAIT = 15.0
 DUMP_WAIT = 15.0
@@ -131,8 +134,10 @@ def redact(lines, username):
         secret = any(w in low for w in SECRET_WORDS)
         if secret or (username and username in line):
             out.append("[redacted]")
+        elif IPC_STATUS in line:
+            out.append("[ipc status update]")
         else:
-            out.append(URI_RE.sub(r"\1\2:[id]", line))
+            out.append(BARE_ID_RE.sub("[id]", URI_RE.sub(r"\1\2:[id]", line)))
     return out
 
 
