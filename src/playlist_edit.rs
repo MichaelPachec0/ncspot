@@ -651,14 +651,17 @@ fn add_batches(
 /// The local side of a Web API remove of the row at server position `index` with `uri`. The
 /// Web call named that position in the snapshot from before the attempt; when the copy was
 /// reloaded since, the item may sit elsewhere. So remove it only where it is still `uri`, else
-/// clear the snapshot so the next write or open reloads the copy (see [reload_cleared]).
+/// clear the snapshot so the next write or open reloads the copy (see [reload_cleared]). A
+/// copy left out of server order (one cached by older builds with a `list_index` twice) is
+/// cleared too, so it is reloaded rather than kept.
 pub fn remove_after_web(playlist: &mut Playlist, index: usize, uri: &str) {
     let removed = playlist
         .tracks
         .as_mut()
         .is_some_and(|tracks| remove_server_item(tracks, index, uri));
     playlist.num_tracks = playlist.tracks.as_ref().map_or(0, Vec::len);
-    if !removed {
+    let ordered = playlist.tracks.as_deref().is_some_and(in_server_order);
+    if !removed || !ordered {
         playlist.snapshot_id.clear();
     }
 }
@@ -2092,6 +2095,28 @@ mod tests {
         remove_after_web(&mut reloaded, 1, "spotify:track:gone");
         assert_eq!(reloaded.num_tracks, 3);
         assert_eq!(reloaded.snapshot_id, "");
+    }
+
+    #[test]
+    fn a_web_remove_on_a_duplicate_index_copy_clears_its_snapshot() {
+        // Cached by an older build: position 1 twice.
+        let mut cached = Playlist {
+            tracks: Some(vec![
+                at("spotify:track:a", 0),
+                at("spotify:track:b", 1),
+                at("spotify:track:c", 1),
+                at("spotify:track:d", 2),
+            ]),
+            num_tracks: 4,
+            ..local("s", 0)
+        };
+        remove_after_web(&mut cached, 1, "spotify:track:b");
+        assert_eq!(
+            uri_list(&cached),
+            ["spotify:track:a", "spotify:track:c", "spotify:track:d"]
+        );
+        assert_eq!(cached.num_tracks, 3);
+        assert_eq!(cached.snapshot_id, "", "reloaded on the next write or open");
     }
 
     #[test]
