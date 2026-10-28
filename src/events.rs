@@ -26,6 +26,8 @@ pub enum Event {
     },
     /// An internal API area hit a protocol change and uses the Web API for the rest of the
     /// session.
+    /// A failed action's status note, shown like a failed command's message.
+    StatusNote(String),
     InternalApiFallback {
         area: &'static str,
         reason: String,

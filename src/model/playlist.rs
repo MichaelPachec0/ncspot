@@ -169,10 +169,7 @@ impl Playlist {
                     if err.stores_copy() || self.snapshot_id != snapshot_id {
                         library.playlist_update(self);
                     }
-                    if let Some(note) = err.note() {
-                        warn!("{note}");
-                    }
-                    err.into()
+                    library.edit_failed(err)
                 })
             },
             || {

@@ -17,7 +17,7 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::config::{self, CACHE_VERSION, LibraryTab};
 use crate::cover_prefetch;
-use crate::events::EventManager;
+use crate::events::{Event, EventManager};
 use crate::internal_api::Area;
 use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW};
 use crate::internal_api::error::InternalError;
@@ -242,6 +242,30 @@ impl Library {
         });
     }
 
+    /// Show `note` on the status line (the place a failed command's message goes), from any
+    /// thread. Success stays silent; a note never carries an id, a URI or a name.
+    pub fn post_note(&self, note: &str) {
+        warn!("{note}");
+        self.ev.send(Event::StatusNote(note.to_string()));
+    }
+
+    /// Post the status note of a failed internal playlist edit, if it has one, and turn the
+    /// error into its fallback class.
+    pub fn edit_failed(&self, err: EditError) -> InternalError {
+        if let Some(note) = err.note() {
+            self.post_note(&note);
+        }
+        InternalError::from(err)
+    }
+
+    /// [Library::edit_failed] for a rootlist edit (create, follow, delete).
+    fn rootlist_edit_failed(&self, err: EditError) -> InternalError {
+        if let Some(note) = rootlist_note(&err) {
+            self.post_note(&note);
+        }
+        InternalError::from(err)
+    }
+
     /// Delete (unfollow) the playlist with the given `id` if it exists: the internal API
     /// first, the Web API per the fallback classes. The store, the layout and their caches
     /// update in place.
@@ -259,7 +283,7 @@ impl Library {
         let written = write_through(
             api,
             Area::Playlists,
-            || playlist_edit::unfollow(api, id).map_err(rootlist_edit_failed),
+            || playlist_edit::unfollow(api, id).map_err(|err| self.rootlist_edit_failed(err)),
             || api.delete_playlist(id).is_ok(),
         );
         if !written {
@@ -277,8 +301,11 @@ impl Library {
         }
         self.trigger_redraw();
         // A pin on a deleted playlist would linger in the set; a failure only logs.
-        if self.is_pinned(id) && self.unpin_playlist(id) != PinOutcome::Done {
-            warn!("Deleted a pinned playlist but could not unpin it");
+        if self.is_pinned(id) {
+            let outcome = self.unpin_playlist(id);
+            if let Some(note) = pin_note(&outcome) {
+                self.post_note(note);
+            }
         }
         #[cfg(feature = "mpris")]
         self.spotify
@@ -395,7 +422,8 @@ impl Library {
             api,
             Area::Playlists,
             || {
-                let playlist = playlist_edit::create(api, name).map_err(rootlist_edit_failed)?;
+                let playlist = playlist_edit::create(api, name)
+                    .map_err(|err| self.rootlist_edit_failed(err))?;
                 *created.borrow_mut() = Some(playlist);
                 Ok(())
             },
@@ -444,7 +472,7 @@ impl Library {
                     if err.stores_copy() {
                         self.playlist_update(&playlist);
                     }
-                    edit_failed(err)
+                    self.edit_failed(err)
                 })?;
                 self.playlist_update(&playlist);
                 Ok(())
@@ -2044,7 +2072,10 @@ impl Library {
         let written = write_through(
             api,
             Area::Playlists,
-            || playlist_edit::follow(api, &playlist.id).map_err(rootlist_edit_failed),
+            || {
+                playlist_edit::follow(api, &playlist.id)
+                    .map_err(|err| self.rootlist_edit_failed(err))
+            },
             || api.user_playlist_follow_playlist(&playlist.id).is_ok(),
         );
         if !written {
@@ -2559,24 +2590,16 @@ fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
     }
 }
 
-/// Log the status note of a failed internal playlist edit and turn it into its fallback class.
-fn edit_failed(err: EditError) -> InternalError {
-    if let Some(note) = err.note() {
-        warn!("{note}");
+/// The status note of a failed rootlist edit (create, follow, delete): its moves and
+/// mismatches are of the playlist list, and nothing is reloaded.
+fn rootlist_note(err: &EditError) -> Option<String> {
+    match err {
+        EditError::Moved => Some("Playlist list changed, try again".to_string()),
+        EditError::Mismatch => {
+            Some("Playlist list changed elsewhere; the change may have applied".to_string())
+        }
+        _ => err.note(),
     }
-    InternalError::from(err)
-}
-
-/// [edit_failed] for a rootlist edit (create, follow, delete): its moves and mismatches are of
-/// the playlist list, and nothing is reloaded.
-fn rootlist_edit_failed(err: EditError) -> InternalError {
-    let note = match &err {
-        EditError::Moved => "Playlist list changed, try again",
-        EditError::Mismatch => "Playlist list changed elsewhere; the change may have applied",
-        _ => return edit_failed(err),
-    };
-    warn!("{note}");
-    InternalError::from(err)
 }
 
 /// At most this many items can be pinned (`ylpin` holds playlists and the collection pins).
@@ -2588,6 +2611,7 @@ pub enum PinOutcome {
     Done,
     Full,
     NotKept,
+    NotRemoved,
     NeedsInternal,
     Failed,
 }
@@ -2598,6 +2622,7 @@ pub fn pin_note(outcome: &PinOutcome) -> Option<&'static str> {
         PinOutcome::Done => None,
         PinOutcome::Full => Some("Pins are full (4): unpin one first"),
         PinOutcome::NotKept => Some("Spotify did not keep the pin"),
+        PinOutcome::NotRemoved => Some("Spotify did not remove the pin"),
         PinOutcome::NeedsInternal => Some("Pins need the internal API"),
         PinOutcome::Failed => Some("Could not change the pin"),
     }
@@ -2656,7 +2681,7 @@ fn run_pin_change(
         (PinOutcome::NotKept, None)
     } else {
         warn!("Spotify did not remove the pin");
-        (PinOutcome::Failed, None)
+        (PinOutcome::NotRemoved, None)
     }
 }
 
@@ -3126,6 +3151,65 @@ mod test {
         );
     }
 
+    fn posted_notes(library: &Library) -> Vec<String> {
+        library
+            .ev
+            .msg_iter()
+            .filter_map(|event| match event {
+                Event::StatusNote(note) => Some(note),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unpin_not_removed_has_its_own_note() {
+        assert_eq!(
+            pin_note(&PinOutcome::NotRemoved),
+            Some("Spotify did not remove the pin")
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_posts_its_note_and_keeps_its_class() {
+        let library = test_library();
+        let err = library.edit_failed(EditError::Moved);
+        assert!(matches!(err, InternalError::Transient(_)));
+        let err = library.edit_failed(EditError::Partial {
+            added: 1,
+            total: 3,
+            unconfirmed: false,
+        });
+        assert!(matches!(err, InternalError::Transient(_)));
+        assert_eq!(
+            posted_notes(&library),
+            vec!["Playlist changed, try again", "Added 1 of 3 tracks"]
+        );
+    }
+
+    #[test]
+    fn an_edit_without_a_note_posts_nothing() {
+        let library = test_library();
+        library.edit_failed(EditError::Internal(InternalError::NotFound));
+        assert!(posted_notes(&library).is_empty());
+    }
+
+    #[test]
+    fn a_failed_rootlist_edit_posts_a_list_note() {
+        let library = test_library();
+        library.rootlist_edit_failed(EditError::Moved);
+        library.rootlist_edit_failed(EditError::Mismatch);
+        library.rootlist_edit_failed(EditError::Refused(InternalError::Denied));
+        assert_eq!(
+            posted_notes(&library),
+            vec![
+                "Playlist list changed, try again",
+                "Playlist list changed elsewhere; the change may have applied",
+                "Spotify refused the change",
+            ]
+        );
+    }
+
     #[test]
     fn pin_with_the_area_off_sends_nothing() {
         let library = test_library();
@@ -3236,7 +3320,7 @@ mod test {
         assert_eq!(reads.get(), 1, "an unpin reads once, after the write");
         let (outcome, _) =
             run_pin_change(false, P, true, || Ok(pin_items(&[P])), || Ok(()), |_| {});
-        assert_eq!(outcome, PinOutcome::Failed);
+        assert_eq!(outcome, PinOutcome::NotRemoved);
     }
 
     #[test]
