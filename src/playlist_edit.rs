@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::thread::sleep;
 use std::time::Instant;
 
-use librespot_protocol::playlist4_external::Op;
+use librespot_protocol::playlist4_external::{ListChanges, Op};
 use log::{debug, warn};
 
 use crate::internal_api::Area;
@@ -29,6 +29,50 @@ use crate::spotify_api::WebApi;
 /// Called only when a stale local copy is reloaded, so a write on a current copy never
 /// builds it.
 pub type Known<'a> = &'a dyn Fn() -> HashMap<String, Playable>;
+
+/// The playlist reads and writes a verified edit makes: the [WebApi] in the app, a fake in
+/// tests.
+pub trait PlaylistServer {
+    /// The head (revision, length) of a playlist, without its items.
+    fn playlist_head(&self, id: &str) -> Result<Head, InternalError>;
+    /// The full contents read: the head and every item.
+    fn playlist_playables_at(
+        &self,
+        id: &str,
+        known: &HashMap<String, Playable>,
+    ) -> Result<(Head, Vec<Playable>), InternalError>;
+    /// One write POST, sent at most once.
+    fn playlist_changes(&self, id: &str, body: ListChanges) -> Result<(), InternalError>;
+    /// The area is on and not latched.
+    fn internal_usable(&self, area: Area) -> bool;
+    fn latch_area(&self, area: Area, err: &InternalError);
+}
+
+impl PlaylistServer for WebApi {
+    fn playlist_head(&self, id: &str) -> Result<Head, InternalError> {
+        Self::playlist_head(self, id)
+    }
+
+    fn playlist_playables_at(
+        &self,
+        id: &str,
+        known: &HashMap<String, Playable>,
+    ) -> Result<(Head, Vec<Playable>), InternalError> {
+        Self::playlist_playables_at(self, id, known)
+    }
+
+    fn playlist_changes(&self, id: &str, body: ListChanges) -> Result<(), InternalError> {
+        Self::playlist_changes(self, id, body)
+    }
+
+    fn internal_usable(&self, area: Area) -> bool {
+        Self::internal_usable(self, area)
+    }
+
+    fn latch_area(&self, area: Area, err: &InternalError) {
+        Self::latch_area(self, area, err);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Freshness {
@@ -87,6 +131,20 @@ fn listing_base(head: Head, count: usize) -> Result<Base, InternalError> {
     })
 }
 
+/// The base of an overwrite: the head alone, since the contents are replaced whatever they
+/// are. A head without a revision or a length is a protocol change (nothing is sent).
+fn overwrite_base(head: Head) -> Result<Base, InternalError> {
+    let head = require_revision(head, "playlist head")?;
+    let length = head
+        .length
+        .ok_or_else(|| InternalError::ProtocolChanged("playlist head without a length".into()))?;
+    Ok(Base {
+        revision: head.revision,
+        snapshot_id: head.snapshot_id,
+        length,
+    })
+}
+
 /// The length the reply of a full read reports when it is not the count of its items.
 fn length_drift(head: &Head, count: usize) -> Option<usize> {
     head.length.filter(|&length| length != count)
@@ -133,8 +191,12 @@ pub enum EditError {
     Refused(InternalError),
     /// The selected item moved; nothing was sent.
     Moved,
-    /// The head after the write does not match; the local copy was reloaded.
+    /// The head after the write does not match; the local copy was reloaded (when the reload
+    /// failed, its snapshot was cleared instead).
     Mismatch,
+    /// An add stopped after `added` of `total` tracks: the verified batches applied, the local
+    /// copy holds them (or the server's copy, when a later batch did not verify).
+    Partial { added: usize, total: usize },
 }
 
 impl EditError {
@@ -146,25 +208,34 @@ impl EditError {
             Self::Refused(_) => "refused",
             Self::Moved => "moved",
             Self::Mismatch => "mismatch",
+            Self::Partial { .. } => "partial",
         }
     }
 
     /// The status note for a failure that is not a plain API error.
-    pub fn note(&self) -> Option<&'static str> {
-        match self {
-            Self::Internal(_) => None,
-            Self::Moved => Some("Playlist changed, try again"),
-            Self::Mismatch => Some("Playlist changed elsewhere, reloaded"),
-            Self::Unverified(_) => Some("Could not confirm the change; it may have applied"),
-            Self::Refused(_) => Some("Spotify refused the change"),
-        }
+    pub fn note(&self) -> Option<String> {
+        let note = match self {
+            Self::Internal(_) => return None,
+            Self::Moved => "Playlist changed, try again",
+            Self::Mismatch => "Playlist changed elsewhere, reloaded",
+            Self::Unverified(_) => "Could not confirm the change; it may have applied",
+            Self::Refused(_) => "Spotify refused the change",
+            Self::Partial { added, total } => {
+                return Some(format!("Added {added} of {total} tracks"));
+            }
+        };
+        Some(note.to_string())
     }
 
-    /// The edited local copy must be stored although the action failed: after an unconfirmed
-    /// write it may hold earlier batches, and a failed verify read cleared its snapshot so the
-    /// next open or write reloads it.
+    /// The edited local copy must be stored although the action failed, so the store matches
+    /// the server: after an unconfirmed write it may hold earlier batches (a failed verify read
+    /// cleared its snapshot so the next open or write reloads it), after a mismatch it is the
+    /// reloaded copy, after a partial add it holds the verified batches.
     pub fn stores_copy(&self) -> bool {
-        matches!(self, Self::Unverified(_))
+        matches!(
+            self,
+            Self::Unverified(_) | Self::Mismatch | Self::Partial { .. }
+        )
     }
 }
 
@@ -187,6 +258,7 @@ impl From<EditError> for InternalError {
             EditError::Refused(err) => Self::Transient(format!("the write was refused: {err}")),
             EditError::Moved => Self::Transient("the selected item moved".into()),
             EditError::Mismatch => Self::Transient("the playlist changed during the write".into()),
+            EditError::Partial { .. } => Self::Transient("only part of the add applied".into()),
         }
     }
 }
@@ -226,7 +298,7 @@ fn add_chunks<T>(new: &[T]) -> std::slice::Chunks<'_, T> {
 /// stale); returns the base of the write. A head or full read without a revision fails with
 /// a protocol change before anything is sent.
 fn prepare_head(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     known: Known<'_>,
 ) -> Result<Base, EditError> {
@@ -261,7 +333,7 @@ fn current_base(head: Head, playlist: &Playlist) -> Base {
 /// the reply's length when it differs from the item count. A read without a revision leaves
 /// the local copy unchanged.
 fn reload(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     known: Known<'_>,
 ) -> Result<(Base, Option<usize>), InternalError> {
@@ -328,7 +400,7 @@ fn unsent_post(post: Post) -> EditError {
 /// change; a server protocol change latches the playlists area, then [post_error] classes
 /// the failure.
 fn send_post(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     post: Post,
     send: impl FnOnce() -> Result<(), InternalError>,
 ) -> Result<(), EditError> {
@@ -351,10 +423,11 @@ fn unconfirmed(playlist: &mut Playlist, err: InternalError) -> EditError {
 }
 
 /// POST `ops` against `base`, then read the head: its base when its length is `expected_len`,
-/// else reload the local copy and fail with [EditError::Mismatch]. A failed POST is classed by
+/// else reload the local copy (or, when the reload fails, clear its snapshot so the next open
+/// or write reloads it) and fail with [EditError::Mismatch]. A failed POST is classed by
 /// [post_error] at its position `post`; a failed or unreadable verify read is [unconfirmed].
 fn send_verified(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     known: Known<'_>,
     post: Post,
@@ -387,6 +460,7 @@ fn send_verified(
             "Could not reload the playlist after a write that did not verify ({})",
             err.class()
         );
+        playlist.snapshot_id.clear();
     }
     Err(EditError::Mismatch)
 }
@@ -402,9 +476,10 @@ fn spaced(spacer: &mut Spacer) {
     }
 }
 
-/// Append `new` at the end of the playlist, one POST per [ADD_BATCH] tracks.
+/// Append `new` at the end of the playlist, one POST per [ADD_BATCH] tracks. A failure after
+/// the first batch verified is [EditError::Partial].
 pub fn add_tracks(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     new: &[Playable],
     known: Known<'_>,
@@ -422,25 +497,43 @@ pub fn add_tracks(
         Post::First,
         &mut Spacer::new(PLAYLIST_FETCH_SPACING),
     )
+    .map_err(|(added, err)| partial(added, new.len(), err))
+}
+
+/// The error of an add that failed after `added` of `total` tracks verified: the failure
+/// itself when none did, else [EditError::Partial] (the failure's class is logged).
+fn partial(added: usize, total: usize, err: EditError) -> EditError {
+    if added == 0 {
+        return err;
+    }
+    warn!(
+        "Playlist add stopped after {added} of {total} tracks ({})",
+        err.class()
+    );
+    EditError::Partial { added, total }
 }
 
 /// One verified ADD per [ADD_BATCH] tracks, [PLAYLIST_FETCH_SPACING] between POSTs, each based
-/// on the head verified after the previous one. Batches before a failure stay applied.
+/// on the head verified after the previous one. Batches before a failure stay applied and in
+/// the local copy; the error carries how many tracks they hold.
 fn add_batches(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     known: Known<'_>,
     mut base: Base,
     new: &[Playable],
     mut post: Post,
     spacer: &mut Spacer,
-) -> Result<(), EditError> {
+) -> Result<(), (usize, EditError)> {
+    let mut added = 0;
     for batch in add_chunks(new) {
         spaced(spacer);
         let expected = expected_len(base.length, Change::Add(batch.len())).unwrap_or_default();
         let ops = vec![add_op(&uris(batch), None)];
-        let after = send_verified(api, playlist, known, post, base.revision, ops, expected)?;
+        let after = send_verified(api, playlist, known, post, base.revision, ops, expected)
+            .map_err(|err| (added, err))?;
         post = Post::Later;
+        added += batch.len();
         let mut tracks = playlist.tracks.take().unwrap_or_default();
         tracks.extend_from_slice(batch);
         set_tracks(playlist, tracks, &after.snapshot_id);
@@ -451,7 +544,7 @@ fn add_batches(
 
 /// Remove the item at `index`, which must still be `uri` once the local copy is current.
 pub fn remove_track(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     index: usize,
     uri: &str,
@@ -481,14 +574,17 @@ pub fn remove_track(
 
 /// Replace the contents with `tracks`: one atomic POST up to [OVERWRITE_ATOMIC_MAX] tracks,
 /// above that the first POST carries the removal plus the first [OVERWRITE_ATOMIC_MAX] tracks
-/// and the rest go as add batches.
+/// and the rest go as add batches ([EditError::Partial] when one of them fails).
+///
+/// Based on the head alone ([overwrite_base]): the old contents are never read, and a stale
+/// local copy is simply replaced by `tracks`. Only a write that does not verify reloads.
 pub fn overwrite(
-    api: &WebApi,
+    api: &impl PlaylistServer,
     playlist: &mut Playlist,
     tracks: &[Playable],
     known: Known<'_>,
 ) -> Result<(), EditError> {
-    let base = prepare_head(api, playlist, known)?;
+    let base = overwrite_base(api.playlist_head(&playlist.id)?)?;
     let (first, rest) = overwrite_split(tracks);
     let ops = overwrite_ops(base.length, &uris(first));
     let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
@@ -511,6 +607,7 @@ pub fn overwrite(
     set_tracks(playlist, first.to_vec(), &after.snapshot_id);
     // `rest` is non-empty only when the head POST was sent, so its batches are later ones.
     add_batches(api, playlist, known, after, rest, Post::Later, &mut spacer)
+        .map_err(|(added, err)| partial(first.len() + added, tracks.len(), err))
 }
 
 const PLAYLIST_URI_PREFIX: &str = "spotify:playlist:";
@@ -737,6 +834,9 @@ pub fn unfollow(api: &WebApi, id: &str) -> Result<(), EditError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
     use super::*;
     use crate::internal_api::playlist::{RootEntry, RootPlaylist};
     use crate::playlist_items::placeholder;
@@ -910,7 +1010,7 @@ mod tests {
         assert!(matches!(err, EditError::Unverified(_)));
         assert!(err.stores_copy());
         assert_eq!(
-            err.note(),
+            err.note().as_deref(),
             Some("Could not confirm the change; it may have applied")
         );
         assert_eq!(playlist.snapshot_id, "");
@@ -945,7 +1045,7 @@ mod tests {
         for (inner, (class, action)) in cases {
             let first = post_error(inner.clone(), Post::First);
             assert_eq!(first.class(), class, "first {inner}");
-            assert_eq!(first.note(), note(class), "first {inner}");
+            assert_eq!(first.note().as_deref(), note(class), "first {inner}");
             assert_eq!(first.stores_copy(), class == "unverified", "first {inner}");
             assert_eq!(
                 decide_after(&InternalError::from(first)),
@@ -955,7 +1055,7 @@ mod tests {
 
             let later = post_error(inner.clone(), Post::Later);
             assert_eq!(later.class(), "unverified", "later {inner}");
-            assert_eq!(later.note(), note("unverified"), "later {inner}");
+            assert_eq!(later.note().as_deref(), note("unverified"), "later {inner}");
             assert!(
                 later.stores_copy(),
                 "later {inner}: the verified batches are stored"
@@ -1004,12 +1104,19 @@ mod tests {
     #[test]
     fn edit_errors_fail_without_fallback() {
         use crate::internal_api::fallback::{Action, decide_after};
-        for err in [
-            EditError::Moved,
-            EditError::Mismatch,
-            EditError::Refused(InternalError::Denied),
+        for (err, stores) in [
+            (EditError::Moved, false),
+            (EditError::Refused(InternalError::Denied), false),
+            (EditError::Mismatch, true),
+            (
+                EditError::Partial {
+                    added: 100,
+                    total: 150,
+                },
+                true,
+            ),
         ] {
-            assert!(!err.stores_copy());
+            assert_eq!(err.stores_copy(), stores, "{}", err.class());
             assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
         }
     }
@@ -1282,5 +1389,234 @@ mod tests {
         assert_eq!(playlist.num_tracks, 2);
         let uris: Vec<String> = playlist.tracks.unwrap().iter().map(Playable::uri).collect();
         assert_eq!(uris, ["spotify:track:0", "spotify:track:1"]);
+    }
+
+    type ContentsRead = Result<(Head, Vec<Playable>), InternalError>;
+
+    /// A scripted server: each call takes the next queued reply (a call with none queued
+    /// panics) and is recorded.
+    #[derive(Default)]
+    struct Fake {
+        heads: RefCell<VecDeque<Result<Head, InternalError>>>,
+        contents: RefCell<VecDeque<ContentsRead>>,
+        posts: RefCell<VecDeque<Result<(), InternalError>>>,
+        sent: RefCell<Vec<ListChanges>>,
+        contents_reads: std::cell::Cell<usize>,
+    }
+
+    impl Fake {
+        fn heads(self, heads: impl IntoIterator<Item = Result<Head, InternalError>>) -> Self {
+            self.heads.borrow_mut().extend(heads);
+            self
+        }
+
+        fn posts(self, posts: impl IntoIterator<Item = Result<(), InternalError>>) -> Self {
+            self.posts.borrow_mut().extend(posts);
+            self
+        }
+
+        fn contents(self, read: ContentsRead) -> Self {
+            self.contents.borrow_mut().push_back(read);
+            self
+        }
+    }
+
+    impl PlaylistServer for Fake {
+        fn playlist_head(&self, _id: &str) -> Result<Head, InternalError> {
+            self.heads.borrow_mut().pop_front().expect("a queued head")
+        }
+
+        fn playlist_playables_at(
+            &self,
+            _id: &str,
+            _known: &HashMap<String, Playable>,
+        ) -> ContentsRead {
+            self.contents_reads.set(self.contents_reads.get() + 1);
+            self.contents
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued contents read")
+        }
+
+        fn playlist_changes(&self, _id: &str, body: ListChanges) -> Result<(), InternalError> {
+            self.sent.borrow_mut().push(body);
+            self.posts
+                .borrow_mut()
+                .pop_front()
+                .expect("a queued POST reply")
+        }
+
+        fn internal_usable(&self, _area: Area) -> bool {
+            true
+        }
+
+        fn latch_area(&self, _area: Area, _err: &InternalError) {}
+    }
+
+    fn no_known() -> HashMap<String, Playable> {
+        HashMap::new()
+    }
+
+    fn new_tracks(n: usize) -> Vec<Playable> {
+        (0..n)
+            .map(|i| track_playable(&format!("spotify:track:new{i}")))
+            .collect()
+    }
+
+    fn uri_list(playlist: &Playlist) -> Vec<String> {
+        uris(playlist.tracks.as_deref().unwrap_or_default())
+    }
+
+    #[test]
+    fn a_later_batch_failure_is_partial_and_keeps_the_verified_batches() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        let new = new_tracks(ADD_BATCH + 50);
+        let api = Fake::default()
+            .heads([Ok(head("s", 2)), Ok(head("t", ADD_BATCH + 2))])
+            .posts([Ok(()), Err(InternalError::Transient("timeout".into()))]);
+        let mut playlist = local("s", 2);
+        let err = add_tracks(&api, &mut playlist, &new, &no_known).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::Partial {
+                added: ADD_BATCH,
+                total: 150
+            }
+        ));
+        assert_eq!(err.note().as_deref(), Some("Added 100 of 150 tracks"));
+        assert!(err.stores_copy());
+        assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
+        // The copy holds exactly the verified batch, at the head verified after it.
+        assert_eq!(playlist.num_tracks, ADD_BATCH + 2);
+        assert_eq!(playlist.snapshot_id, "t");
+        assert_eq!(uri_list(&playlist)[2..], uris(&new[..ADD_BATCH]));
+        assert_eq!(api.contents_reads.get(), 0);
+    }
+
+    #[test]
+    fn a_later_batch_mismatch_is_partial_and_stores_the_reloaded_copy() {
+        let new = new_tracks(ADD_BATCH + 50);
+        let server_copy: Vec<Playable> = new_tracks(5);
+        let api = Fake::default()
+            .heads([
+                Ok(head("s", 2)),
+                Ok(head("t", ADD_BATCH + 2)),
+                Ok(head("x", 7)),
+            ])
+            .posts([Ok(()), Ok(())])
+            .contents(Ok((head("r", 5), server_copy.clone())));
+        let mut playlist = local("s", 2);
+        let err = add_tracks(&api, &mut playlist, &new, &no_known).unwrap_err();
+        assert_eq!(err.note().as_deref(), Some("Added 100 of 150 tracks"));
+        assert!(err.stores_copy());
+        assert_eq!(playlist.snapshot_id, "r");
+        assert_eq!(uri_list(&playlist), uris(&server_copy));
+    }
+
+    #[test]
+    fn a_first_batch_failure_is_not_partial() {
+        let api = Fake::default()
+            .heads([Ok(head("s", 2))])
+            .posts([Err(InternalError::Denied)]);
+        let mut playlist = local("s", 2);
+        let err = add_tracks(&api, &mut playlist, &new_tracks(3), &no_known).unwrap_err();
+        assert!(matches!(err, EditError::Refused(InternalError::Denied)));
+        assert_eq!(playlist.num_tracks, 2);
+        assert_eq!(partial(0, 3, EditError::Mismatch).class(), "mismatch");
+    }
+
+    #[test]
+    fn a_mismatch_stores_the_reloaded_copy() {
+        let server_copy = new_tracks(3);
+        let api = Fake::default()
+            .heads([Ok(head("s", 2)), Ok(head("x", 2))])
+            .posts([Ok(())])
+            .contents(Ok((head("r", 3), server_copy.clone())));
+        let mut playlist = local("s", 2);
+        let err = remove_track(&api, &mut playlist, 0, "spotify:track:0", &no_known).unwrap_err();
+        assert!(matches!(err, EditError::Mismatch));
+        assert!(err.stores_copy());
+        assert_eq!(playlist.snapshot_id, "r");
+        assert_eq!(uri_list(&playlist), uris(&server_copy));
+    }
+
+    #[test]
+    fn a_mismatch_without_a_reload_clears_the_snapshot() {
+        let api = Fake::default()
+            .heads([Ok(head("s", 2)), Ok(head("x", 2))])
+            .posts([Ok(())])
+            .contents(Err(InternalError::Transient("timeout".into())));
+        let mut playlist = local("s", 2);
+        let err = remove_track(&api, &mut playlist, 0, "spotify:track:0", &no_known).unwrap_err();
+        assert!(matches!(err, EditError::Mismatch));
+        assert!(err.stores_copy());
+        assert_eq!(playlist.snapshot_id, "");
+        assert_eq!(freshness(&playlist, &head("s", 2)), Freshness::Stale);
+    }
+
+    #[test]
+    fn an_overwrite_of_a_stale_copy_reads_only_the_head() {
+        let new = new_tracks(2);
+        let read = Head {
+            revision: b"head".to_vec(),
+            ..head("new", 3)
+        };
+        let api = Fake::default()
+            .heads([Ok(read), Ok(head("w", 2))])
+            .posts([Ok(())]);
+        // Stale: another snapshot and another length than the head.
+        let mut playlist = local("old", 5);
+        overwrite(&api, &mut playlist, &new, &no_known).expect("verified");
+        assert_eq!(api.contents_reads.get(), 0, "no contents read");
+        let sent = api.sent.borrow();
+        assert_eq!(sent[0].base_revision.as_deref(), Some(&b"head"[..]));
+        let rem = &sent[0].deltas[0].ops[0].rem;
+        assert_eq!(
+            (rem.from_index, rem.length),
+            (Some(0), Some(3)),
+            "removes the head length, not the stale copy's"
+        );
+        assert_eq!(playlist.snapshot_id, "w");
+        assert_eq!(uri_list(&playlist), uris(&new));
+    }
+
+    #[test]
+    fn an_overwrite_needs_a_head_with_revision_and_length() {
+        let no_length = Head {
+            length: None,
+            ..head("s", 0)
+        };
+        let api = Fake::default().heads([Ok(no_length)]);
+        let mut playlist = local("s", 2);
+        let err = overwrite(&api, &mut playlist, &new_tracks(1), &no_known).unwrap_err();
+        assert!(matches!(
+            err,
+            EditError::Internal(InternalError::ProtocolChanged(_))
+        ));
+        assert!(api.sent.borrow().is_empty(), "nothing sent");
+        assert_eq!(api.contents_reads.get(), 0);
+        assert_eq!(playlist.num_tracks, 2);
+        let no_revision = Head {
+            revision: Vec::new(),
+            ..head("", 2)
+        };
+        assert!(matches!(
+            overwrite_base(no_revision),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+    }
+
+    #[test]
+    fn an_overwrite_tail_failure_counts_the_head_post() {
+        let new = new_tracks(OVERWRITE_ATOMIC_MAX + 50);
+        let api = Fake::default()
+            .heads([Ok(head("s", 2)), Ok(head("w", OVERWRITE_ATOMIC_MAX))])
+            .posts([Ok(()), Err(InternalError::Transient("timeout".into()))]);
+        let mut playlist = local("s", 2);
+        let err = overwrite(&api, &mut playlist, &new, &no_known).unwrap_err();
+        assert_eq!(err.note().as_deref(), Some("Added 1000 of 1050 tracks"));
+        assert!(err.stores_copy());
+        assert_eq!(uri_list(&playlist), uris(&new[..OVERWRITE_ATOMIC_MAX]));
+        assert_eq!(playlist.snapshot_id, "w");
     }
 }

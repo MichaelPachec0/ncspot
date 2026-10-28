@@ -1735,7 +1735,8 @@ impl Library {
         }
     }
 
-    /// If there is a local version of the playlist, update it and rewrite the cache.
+    /// If there is a local version of the playlist, update it, rewrite the cache and redraw the
+    /// views (also after a failed edit, whose copy may have been reloaded).
     pub fn playlist_update(&self, updated: &Playlist) {
         {
             let mut playlists = self.playlists.write().unwrap();
@@ -1748,6 +1749,7 @@ impl Library {
             &config::cache_path(CACHE_PLAYLISTS),
             &self.playlists.read().unwrap(),
         );
+        self.trigger_redraw();
     }
 
     /// Check whether `track` is saved in the user's library.

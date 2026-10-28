@@ -52,6 +52,16 @@ impl PlaylistView {
             queue,
         }
     }
+
+    /// Rebuild the list from the playlist's tracks.
+    fn show_tracks(&mut self) {
+        let tracks = self.playlist.tracks.as_ref().unwrap_or(&Vec::new()).clone();
+        self.list = ListView::new(
+            Arc::new(RwLock::new(tracks)),
+            self.queue.clone(),
+            self.library.clone(),
+        );
+    }
 }
 
 impl ViewWrapper for PlaylistView {
@@ -87,6 +97,7 @@ impl ViewExt for PlaylistView {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         if let Command::Delete = cmd {
             let pos = self.list.get_selected_index();
+            let snapshot_id = self.playlist.snapshot_id.clone();
 
             return match self
                 .playlist
@@ -96,7 +107,23 @@ impl ViewExt for PlaylistView {
                     self.list.remove(pos);
                     Ok(CommandResult::Consumed(None))
                 }
-                Err(note) => Err(note),
+                Err(note) => {
+                    // A failed delete may have reloaded the copy (or cleared its snapshot).
+                    if self.playlist.snapshot_id != snapshot_id {
+                        let order = self
+                            .library
+                            .cfg
+                            .state()
+                            .playlist_orders
+                            .get(&self.playlist.id)
+                            .cloned();
+                        if let Some(order) = order {
+                            self.playlist.sort(&order.key, &order.direction);
+                        }
+                        self.show_tracks();
+                    }
+                    Err(note)
+                }
             };
         }
 
@@ -119,12 +146,7 @@ impl ViewExt for PlaylistView {
             });
 
             self.playlist.sort(key, direction);
-            let tracks = self.playlist.tracks.as_ref().unwrap_or(&Vec::new()).clone();
-            self.list = ListView::new(
-                Arc::new(RwLock::new(tracks)),
-                self.queue.clone(),
-                self.library.clone(),
-            );
+            self.show_tracks();
             return Ok(CommandResult::Consumed(None));
         }
 

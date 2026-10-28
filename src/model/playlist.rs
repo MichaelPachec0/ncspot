@@ -132,9 +132,9 @@ impl Playlist {
             },
         );
         if !written {
-            if let Some(note) = note.get() {
+            if let Some(note) = note.take() {
                 warn!("{note}");
-                return Err(note.to_string());
+                return Err(note);
             }
             return Err("Could not delete track.".to_string());
         }
