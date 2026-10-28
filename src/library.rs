@@ -294,22 +294,10 @@ impl Library {
             return;
         }
 
-        self.playlists.write().unwrap().retain(|p| p.id != id);
-        self.save_cache(
-            &config::cache_path(CACHE_PLAYLISTS),
-            &self.playlists.read().unwrap(),
-        );
-        let changed = remove_from_layout(&mut self.playlist_layout.write().unwrap(), id);
-        if changed {
-            self.save_layout();
-        }
+        self.drop_deleted(id);
         self.trigger_redraw();
-        // A pin on a deleted playlist would linger in the set; a failure only logs.
-        if self.is_pinned(id) {
-            let outcome = self.unpin_playlist(id);
-            if let Some(note) = pin_note(&outcome) {
-                self.post_note(note);
-            }
+        if !self.unpin_deleted(id) {
+            self.post_note(PIN_LEFT_NOTE);
         }
         #[cfg(feature = "mpris")]
         self.spotify
@@ -318,13 +306,40 @@ impl Library {
             )));
     }
 
-    /// Whether playlist `id` is in the layout's pinned block.
+    /// Forget a deleted playlist locally: the store (and its cache), the fresh set, the layout.
+    fn drop_deleted(&self, id: &str) {
+        self.playlists.write().unwrap().retain(|p| p.id != id);
+        self.save_cache(
+            &config::cache_path(CACHE_PLAYLISTS),
+            &self.playlists.read().unwrap(),
+        );
+        self.fresh_playlists.write().unwrap().remove(id);
+        let changed = remove_from_layout(&mut self.playlist_layout.write().unwrap(), id);
+        if changed {
+            self.save_layout();
+        }
+    }
+
+    /// Whether playlist `id` is pinned: the layout's pinned block when there is a layout, else
+    /// (a flat list) the server's pin set.
     pub fn is_pinned(&self, id: &str) -> bool {
-        self.playlist_layout
-            .read()
-            .unwrap()
-            .iter()
-            .any(|entry| matches!(entry, LayoutEntry::Pinned(p) if p == id))
+        let api = &self.spotify.api;
+        pinned_in_layout_or_set(
+            &self.playlist_layout.read().unwrap(),
+            id,
+            api.internal_usable(Area::Playlists),
+            || api.collection_page_all(Area::Playlists, SET_PIN),
+        )
+    }
+
+    /// After a playlist is deleted: remove its pin when the server's pin set lists it (never
+    /// decided from the layout), retrying a failed unpin once. False when a pin is left.
+    pub fn unpin_deleted(&self, id: &str) -> bool {
+        let api = &self.spotify.api;
+        let listed = pin_listed(id, api.internal_usable(Area::Playlists), || {
+            api.collection_page_all(Area::Playlists, SET_PIN)
+        });
+        !listed || unpin_with_retry(|| self.unpin_playlist(id))
     }
 
     /// Pin playlist `id`. Internal API only (no Web fallback).
@@ -2672,6 +2687,45 @@ pub fn pin_note(outcome: &PinOutcome) -> Option<&'static str> {
     }
 }
 
+/// The note for a delete that left its pin behind.
+const PIN_LEFT_NOTE: &str = "Deleted, but the pin could not be removed";
+
+/// Whether the server's pin set lists playlist `id`. False when the area is unusable or the
+/// read fails (nothing to unpin that we know of).
+fn pin_listed(
+    id: &str,
+    usable: bool,
+    read: impl FnOnce() -> Result<crate::internal_api::collection::Listing, InternalError>,
+) -> bool {
+    if !usable {
+        return false;
+    }
+    let uri = format!("{PLAYLIST_URI_PREFIX}{id}");
+    read().is_ok_and(|listing| listing.items.iter().any(|i| i.uri == uri))
+}
+
+/// Whether `id` is pinned: the layout's `Pinned` entries when the layout is not empty, else
+/// the server's pin set.
+fn pinned_in_layout_or_set(
+    layout: &[LayoutEntry],
+    id: &str,
+    usable: bool,
+    read: impl FnOnce() -> Result<crate::internal_api::collection::Listing, InternalError>,
+) -> bool {
+    if layout.is_empty() {
+        pin_listed(id, usable, read)
+    } else {
+        layout
+            .iter()
+            .any(|entry| matches!(entry, LayoutEntry::Pinned(p) if p == id))
+    }
+}
+
+/// Run an unpin; when it does not end `Done`, run it once more. True when one succeeded.
+fn unpin_with_retry(mut unpin: impl FnMut() -> PinOutcome) -> bool {
+    unpin() == PinOutcome::Done || unpin() == PinOutcome::Done
+}
+
 /// Whether one more item fits in a pin set that holds `pinned_count`.
 fn pin_decision(pinned_count: usize) -> bool {
     pinned_count < PIN_LIMIT
@@ -3349,6 +3403,67 @@ mod test {
         ];
         assert!(library.is_pinned("p"));
         assert!(!library.is_pinned("q"));
+    }
+
+    #[test]
+    fn pinned_decision_follows_layout_else_the_server_set() {
+        let layout = [
+            LayoutEntry::Pinned("p".into()),
+            LayoutEntry::Playlist("q".into()),
+        ];
+        // A layout decides alone; the read is never needed.
+        assert!(pinned_in_layout_or_set(&layout, "p", true, || panic!(
+            "read"
+        )));
+        assert!(!pinned_in_layout_or_set(&layout, "q", true, || panic!(
+            "read"
+        )));
+        // A flat layout reads the set.
+        let set = || Ok(pin_items(&["spotify:playlist:p"]));
+        assert!(pinned_in_layout_or_set(&[], "p", true, set));
+        assert!(!pinned_in_layout_or_set(&[], "q", true, set));
+        // Unusable area or a failed read: not pinned.
+        assert!(!pinned_in_layout_or_set(&[], "p", false, || panic!("read")));
+        assert!(!pinned_in_layout_or_set(&[], "p", true, || Err(
+            InternalError::NoSession
+        )));
+    }
+
+    #[test]
+    fn a_deleted_playlist_leaves_the_fresh_set() {
+        let library = test_library();
+        library.fresh_playlists.write().unwrap().insert("p".into());
+        library.fresh_playlists.write().unwrap().insert("q".into());
+        library.drop_deleted("p");
+        let fresh = library.fresh_playlists.read().unwrap();
+        assert!(!fresh.contains("p"));
+        assert!(fresh.contains("q"));
+    }
+
+    #[test]
+    fn unpin_retries_once_then_gives_up() {
+        let mut calls = 0;
+        assert!(unpin_with_retry(|| {
+            calls += 1;
+            PinOutcome::Done
+        }));
+        assert_eq!(calls, 1);
+        let mut calls = 0;
+        assert!(unpin_with_retry(|| {
+            calls += 1;
+            if calls == 1 {
+                PinOutcome::Failed
+            } else {
+                PinOutcome::Done
+            }
+        }));
+        assert_eq!(calls, 2);
+        let mut calls = 0;
+        assert!(!unpin_with_retry(|| {
+            calls += 1;
+            PinOutcome::Failed
+        }));
+        assert_eq!(calls, 2);
     }
 
     #[test]
