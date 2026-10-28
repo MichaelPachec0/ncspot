@@ -522,7 +522,7 @@ impl Library {
     /// The overwrite of [Library::overwrite_playlist]; true when it read the playlist listing
     /// (after a Web overwrite).
     fn overwrite_and_list(&self, id: &str, tracks: &[Playable]) -> bool {
-        debug!("saving {} tracks to list {}", tracks.len(), id);
+        debug!("saving {} tracks to a playlist", tracks.len());
         let api = &self.spotify.api;
         let known = || self.known_playables();
         let web_used = Cell::new(false);
@@ -570,7 +570,7 @@ impl Library {
     /// Create a playlist with the given `name` and add `tracks` to it. One playlist listing
     /// at most: a Web create's sync runs only when the overwrite read no listing itself.
     pub fn save_playlist(&self, name: &str, tracks: &[Playable]) {
-        debug!("saving {} tracks to new list {}", tracks.len(), name);
+        debug!("saving {} tracks to a new playlist", tracks.len());
         match self.create_new_playlist(name) {
             Some((id, web_created)) => {
                 let listed = self.overwrite_and_list(&id, tracks);
@@ -1011,7 +1011,7 @@ impl Library {
             let mut downloaded = if current {
                 None
             } else {
-                info!("updating playlist {} (index: {})", remote.name, index);
+                info!("updating playlist (index: {index})");
                 let mut playlist = remote.clone();
                 playlist.tracks = None;
                 let tracks = playlist
@@ -1019,8 +1019,7 @@ impl Library {
                     .then(|| playlist.tracks.unwrap_or_default());
                 if tracks.is_none() {
                     warn!(
-                        "failed to load tracks for playlist {}, keeping cached copy",
-                        remote.name
+                        "failed to load tracks for playlist (index: {index}), keeping cached copy"
                     );
                 }
                 tracks
