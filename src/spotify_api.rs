@@ -326,11 +326,16 @@ impl WebApi {
     pub fn latch_area(&self, area: Area, err: &InternalError) {
         if self.internal.latch(area) {
             // The InternalApiFallback handler logs the warning with the user-facing text.
-            debug!("internal API {} latched to the Web API: {err}", area.name());
+            // The class only: error texts may carry endpoint paths with the username.
+            debug!(
+                "internal API {} latched to the Web API ({})",
+                area.name(),
+                err.class()
+            );
             if let Some(events) = &self.events {
                 events.try_send(Event::InternalApiFallback {
                     area: area.name(),
-                    reason: err.to_string(),
+                    reason: err.class().to_string(),
                 });
             }
         }

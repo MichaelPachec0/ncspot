@@ -61,10 +61,12 @@ pub struct Rootlist {
 /// A playlist's (or the rootlist's) head without its items.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Head {
+    /// Empty when the reply carried none (a write must never be based on it).
     pub revision: Vec<u8>,
     /// base64 (standard) of `revision`, the form `Playlist.snapshot_id` stores.
     pub snapshot_id: String,
-    pub length: usize,
+    /// None when the reply carried none (a missing length is not 0).
+    pub length: Option<usize>,
     pub name: Option<String>,
 }
 
@@ -225,13 +227,14 @@ pub fn parse_contents(content: SelectedListContent) -> Vec<PlaylistItem> {
         .collect()
 }
 
-/// The head fields of a reply: revision, length and name; missing fields are empty.
+/// The head fields of a reply: revision, length and name; a missing revision is empty, a
+/// missing length stays missing.
 pub fn parse_head(content: &SelectedListContent) -> Head {
     let revision = content.revision.clone().unwrap_or_default();
     Head {
         snapshot_id: base64_encode(&revision),
         revision,
-        length: usize::try_from(content.length.unwrap_or(0)).unwrap_or(0),
+        length: content.length.and_then(|n| usize::try_from(n).ok()),
         name: content.attributes.as_ref().and_then(|a| a.name.clone()),
     }
 }
@@ -518,7 +521,7 @@ mod tests {
         let (head, items) = parse_listing(content);
         assert_eq!(head.revision, b"read".to_vec());
         assert_eq!(head.snapshot_id, base64_encode(b"read"));
-        assert_eq!(head.length, 2);
+        assert_eq!(head.length, Some(2));
         assert_eq!(items.len(), 2);
     }
 
@@ -604,7 +607,7 @@ mod tests {
         let head = parse_head(&content);
         assert_eq!(head.revision, b"rev1".to_vec());
         assert_eq!(head.snapshot_id, "cmV2MQ==");
-        assert_eq!(head.length, 5272);
+        assert_eq!(head.length, Some(5272));
         assert_eq!(head.name.as_deref(), Some("ncspot-test-1"));
     }
 
@@ -645,7 +648,8 @@ mod tests {
         let head = parse_head(&SelectedListContent::default());
         assert_eq!(
             (head.length, head.name, head.snapshot_id.as_str()),
-            (0, None, "")
+            (None, None, "")
         );
+        assert!(head.revision.is_empty());
     }
 }

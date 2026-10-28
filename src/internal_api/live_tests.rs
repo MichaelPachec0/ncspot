@@ -397,20 +397,20 @@ fn playlist_write_round_trip() {
 
         // Add A, B, A.
         let h = head(rt);
-        assert_eq!(h.length, 0, "new playlist is empty");
+        assert_eq!(h.length, Some(0), "new playlist is empty");
         post(
             rt,
             &h,
             vec![write::add_op(&[track(0), track(1), track(0)], None)],
         );
         let h = head(rt);
-        assert_eq!(h.length, 3, "three tracks after the add");
+        assert_eq!(h.length, Some(3), "three tracks after the add");
         println!("add A, B, A: length 3");
 
         // Remove index 2 (the second A): one A must be left.
         post(rt, &h, vec![write::remove_at_op(2)]);
         let h = head(rt);
-        assert_eq!(h.length, 2, "two tracks after the remove");
+        assert_eq!(h.length, Some(2), "two tracks after the remove");
         let (_, items) = rt
             .block_on(playlist::contents(s.clone(), id.clone()))
             .map_err(|e| e.class())
@@ -423,19 +423,30 @@ fn playlist_write_round_trip() {
         post(
             rt,
             &h,
-            write::overwrite_ops(h.length, &[track(0), track(1), track(2)]),
+            write::overwrite_ops(
+                h.length.expect("head length"),
+                &[track(0), track(1), track(2)],
+            ),
         );
         let h = head(rt);
-        assert_eq!(h.length, 3, "three tracks after the overwrite");
+        assert_eq!(h.length, Some(3), "three tracks after the overwrite");
         println!("overwrite 3: length 3");
 
         // Overwrite with the atomic maximum in one POST.
         let many: Vec<String> = (0..OVERWRITE_ATOMIC_MAX).map(|i| track(i % 3)).collect();
-        post(rt, &h, write::overwrite_ops(h.length, &many));
+        post(
+            rt,
+            &h,
+            write::overwrite_ops(h.length.expect("head length"), &many),
+        );
         let h = head(rt);
-        assert_eq!(h.length, OVERWRITE_ATOMIC_MAX, "atomic overwrite landed");
+        assert_eq!(
+            h.length,
+            Some(OVERWRITE_ATOMIC_MAX),
+            "atomic overwrite landed"
+        );
         println!(
-            "overwrite {OVERWRITE_ATOMIC_MAX} in one POST: length {}",
+            "overwrite {OVERWRITE_ATOMIC_MAX} in one POST: length {:?}",
             h.length
         );
     });

@@ -59,7 +59,7 @@ impl Playlist {
                 api.playlist_playables(&self.id, &HashMap::new())
                     .inspect_err(|err| {
                         if decide_after(err) == Action::Fail {
-                            warn!("Could not load a playlist: {err}");
+                            warn!("Could not load a playlist ({})", err.class());
                         }
                     })
             },
@@ -119,6 +119,9 @@ impl Playlist {
             Area::Playlists,
             || {
                 playlist_edit::remove_track(api, self, index, &uri, &known).map_err(|err| {
+                    if err.stores_copy() {
+                        library.playlist_update(self);
+                    }
                     note.set(err.note());
                     err.into()
                 })
@@ -155,6 +158,9 @@ impl Playlist {
             Area::Playlists,
             || {
                 playlist_edit::add_tracks(api, self, new_tracks, &known).map_err(|err| {
+                    if err.stores_copy() {
+                        library.playlist_update(self);
+                    }
                     if let Some(note) = err.note() {
                         warn!("{note}");
                     }

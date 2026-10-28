@@ -37,10 +37,13 @@ pub enum Freshness {
 }
 
 /// Current when the local copy has loaded tracks, its snapshot is the head's and its track
-/// count (placeholders included) is the head length.
+/// count (placeholders included) is the head length. A head without a length is never
+/// current.
 pub fn freshness(local: &Playlist, head: &Head) -> Freshness {
     match &local.tracks {
-        Some(tracks) if local.snapshot_id == head.snapshot_id && tracks.len() == head.length => {
+        Some(tracks)
+            if local.snapshot_id == head.snapshot_id && head.length == Some(tracks.len()) =>
+        {
             Freshness::Current
         }
         _ => Freshness::Stale,
@@ -54,19 +57,79 @@ pub fn index_still(tracks: &[Playable], index: usize, uri: &str) -> bool {
         .is_some_and(|playable| playable.uri() == uri)
 }
 
+/// What a playlist write is based on: the revision the POST names, the snapshot the local
+/// copy takes and the length the expected one is computed from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Base {
+    revision: Vec<u8>,
+    snapshot_id: String,
+    length: usize,
+}
+
+/// A head read without a revision is a protocol change: a write never names an empty base.
+fn require_revision(head: Head, what: &str) -> Result<Head, InternalError> {
+    if head.revision.is_empty() {
+        return Err(InternalError::ProtocolChanged(format!(
+            "{what} without a revision"
+        )));
+    }
+    Ok(head)
+}
+
+/// The base a full read gives: its revision, and the count of the items it read (never the
+/// reply's `length` field, which may differ from them).
+fn listing_base(head: Head, count: usize) -> Result<Base, InternalError> {
+    let head = require_revision(head, "playlist read")?;
+    Ok(Base {
+        revision: head.revision,
+        snapshot_id: head.snapshot_id,
+        length: count,
+    })
+}
+
+/// The length the reply of a full read reports when it is not the count of its items.
+fn length_drift(head: &Head, count: usize) -> Option<usize> {
+    head.length.filter(|&length| length != count)
+}
+
+/// The outcome of the head read after a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Verify {
+    /// The head length is the expected one; the head is the base of the next write.
+    Applied(Base),
+    /// The head length is another one.
+    Differs(usize),
+    /// The head lacks its revision or its length, so it proves nothing.
+    Unreadable,
+}
+
 /// A write applied when the head length after it is the expected one. Length only: a
 /// concurrent edit that leaves the length unchanged is not detected.
-pub fn verified(expected_len: usize, after: &Head) -> bool {
-    after.length == expected_len
+fn verify(expected_len: usize, after: Head) -> Verify {
+    let Some(length) = after.length.filter(|_| !after.revision.is_empty()) else {
+        return Verify::Unreadable;
+    };
+    if length != expected_len {
+        return Verify::Differs(length);
+    }
+    Verify::Applied(Base {
+        revision: after.revision,
+        snapshot_id: after.snapshot_id,
+        length,
+    })
 }
 
 #[derive(Debug)]
 pub enum EditError {
     /// Failed before anything was sent; the class decides the fallback as usual.
     Internal(InternalError),
-    /// Failed after a POST was sent (the POST itself, the verify read or a later batch): the
-    /// write may have applied, so it must never be repeated through the Web API.
+    /// Failed after a POST may have reached the server (a transient or rate limited POST, the
+    /// verify read or a later batch): the write may have applied, so it must never be repeated
+    /// through the Web API.
     Unverified(InternalError),
+    /// The POST was refused (not found, denied, a protocol change) or never sent (no
+    /// session): nothing applied, but the action still fails without a Web fallback.
+    Refused(InternalError),
     /// The selected item moved; nothing was sent.
     Moved,
     /// The head after the write does not match; the local copy was reloaded.
@@ -79,6 +142,7 @@ impl EditError {
         match self {
             Self::Internal(err) => err.class(),
             Self::Unverified(_) => "unverified",
+            Self::Refused(_) => "refused",
             Self::Moved => "moved",
             Self::Mismatch => "mismatch",
         }
@@ -91,7 +155,15 @@ impl EditError {
             Self::Moved => Some("Playlist changed, try again"),
             Self::Mismatch => Some("Playlist changed elsewhere, reloaded"),
             Self::Unverified(_) => Some("Could not confirm the change; it may have applied"),
+            Self::Refused(_) => Some("Spotify refused the change"),
         }
+    }
+
+    /// The edited local copy must be stored although the action failed: after an unconfirmed
+    /// write it may hold earlier batches, and a failed verify read cleared its snapshot so the
+    /// next open or write reloads it.
+    pub fn stores_copy(&self) -> bool {
+        matches!(self, Self::Unverified(_))
     }
 }
 
@@ -101,8 +173,9 @@ impl From<InternalError> for EditError {
     }
 }
 
-/// A moved index, a mismatch or an error after a POST fails the action: `Transient` never
-/// falls back to the Web API (which could apply the write twice) and never latches the area.
+/// A moved index, a mismatch, a refused POST or an error after a POST fails the action:
+/// `Transient` never falls back to the Web API (which could apply the write twice) and never
+/// latches the area (a refused POST latches it itself on a protocol change).
 impl From<EditError> for InternalError {
     fn from(err: EditError) -> Self {
         match err {
@@ -110,6 +183,7 @@ impl From<EditError> for InternalError {
             EditError::Unverified(err) => {
                 Self::Transient(format!("the write may have applied: {err}"))
             }
+            EditError::Refused(err) => Self::Transient(format!("the write was refused: {err}")),
             EditError::Moved => Self::Transient("the selected item moved".into()),
             EditError::Mismatch => Self::Transient("the playlist changed during the write".into()),
         }
@@ -147,49 +221,97 @@ fn add_chunks<T>(new: &[T]) -> std::slice::Chunks<'_, T> {
     new.chunks(ADD_BATCH)
 }
 
-/// Bring `playlist` up to date with the server when stale; returns the head the write is
-/// based on (its revision is the POST base, its length the base for the expected one).
+/// Bring `playlist` up to date with the server when stale (a head without a length counts as
+/// stale); returns the base of the write. A head or full read without a revision fails with
+/// a protocol change before anything is sent.
 fn prepare_head(
     api: &WebApi,
     playlist: &mut Playlist,
     known: Known<'_>,
-) -> Result<Head, EditError> {
-    let head = api.playlist_head(&playlist.id)?;
-    let reloaded = match freshness(playlist, &head) {
-        Freshness::Current => None,
-        Freshness::Stale => Some(reload(api, playlist, known)?),
-    };
-    Ok(write_base(head, reloaded))
+) -> Result<Base, EditError> {
+    let head = require_revision(api.playlist_head(&playlist.id)?, "playlist head")?;
+    match freshness(playlist, &head) {
+        Freshness::Current => Ok(current_base(head, playlist)),
+        Freshness::Stale => {
+            let (base, drift) = reload(api, playlist, known)?;
+            if let Some(reported) = drift {
+                warn!(
+                    "Playlist read lists {} items but reports {reported}; using the items",
+                    base.length
+                );
+            }
+            Ok(base)
+        }
+    }
 }
 
-/// The head a write is based on: the head read when the local copy was current, else the
-/// head of the full read that reloaded it. The change is checked against the reloaded items,
-/// and the playlist may have changed between the head read and that full read, so the POST
-/// must name the revision of those items, never the older head's.
-fn write_base(head: Head, reloaded: Option<Head>) -> Head {
-    reloaded.unwrap_or(head)
+/// The base of a write on a current local copy: the head read (its length is the copy's).
+fn current_base(head: Head, playlist: &Playlist) -> Base {
+    Base {
+        revision: head.revision,
+        snapshot_id: head.snapshot_id,
+        length: playlist.tracks.as_ref().map_or(0, Vec::len),
+    }
 }
 
-/// Replace the local tracks with a full read and take that read's snapshot; returns its head.
-fn reload(api: &WebApi, playlist: &mut Playlist, known: Known<'_>) -> Result<Head, InternalError> {
+/// Replace the local tracks with a full read and take that read's snapshot; returns the base
+/// it gives (see [listing_base]: the change is checked against these items, and the playlist
+/// may have changed since the head read, so the POST must name the revision of this read) and
+/// the reply's length when it differs from the item count. A read without a revision leaves
+/// the local copy unchanged.
+fn reload(
+    api: &WebApi,
+    playlist: &mut Playlist,
+    known: Known<'_>,
+) -> Result<(Base, Option<usize>), InternalError> {
     let (head, tracks) = api.playlist_playables_at(&playlist.id, &known())?;
-    set_tracks(playlist, tracks, &head);
-    Ok(head)
+    let drift = length_drift(&head, tracks.len());
+    let base = listing_base(head, tracks.len())?;
+    set_tracks(playlist, tracks, &base.snapshot_id);
+    Ok((base, drift))
 }
 
-/// Store `tracks` (renumbered by position) with the snapshot of `head`.
-fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, head: &Head) {
+/// Store `tracks` (renumbered by position) with `snapshot_id`.
+fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, snapshot_id: &str) {
     for (index, playable) in tracks.iter_mut().enumerate() {
         playable.set_list_index(index);
     }
     playlist.num_tracks = tracks.len();
     playlist.tracks = Some(tracks);
-    playlist.snapshot_id = head.snapshot_id.clone();
+    playlist.snapshot_id = snapshot_id.to_string();
 }
 
-/// POST `ops` against `base`, then read the head: the new head when its length is
-/// `expected_len`, else reload the local copy and fail with [EditError::Mismatch]. Every other
-/// error here comes after the POST was sent, so it is [EditError::Unverified].
+/// The class of a failed write POST: only a transient error or a rate limit may have reached
+/// the server ([EditError::Unverified]); a refusal, a protocol change or a missing session
+/// means nothing applied ([EditError::Refused]). Neither falls back to the Web API.
+fn post_error(err: InternalError) -> EditError {
+    match err {
+        InternalError::Transient(_) | InternalError::RateLimited => EditError::Unverified(err),
+        InternalError::NotFound
+        | InternalError::Denied
+        | InternalError::ProtocolChanged(_)
+        | InternalError::NoSession => EditError::Refused(err),
+    }
+}
+
+/// [post_error], latching the playlists area on a protocol change.
+fn failed_post(api: &WebApi, err: InternalError) -> EditError {
+    if let InternalError::ProtocolChanged(_) = err {
+        api.latch_area(Area::Playlists, &err);
+    }
+    post_error(err)
+}
+
+/// The verify read after a POST failed or proved nothing: clear the local snapshot so the
+/// next open or write reloads the copy (the caller stores it, see [EditError::stores_copy]).
+fn unconfirmed(playlist: &mut Playlist, err: InternalError) -> EditError {
+    playlist.snapshot_id.clear();
+    EditError::Unverified(err)
+}
+
+/// POST `ops` against `base`, then read the head: its base when its length is `expected_len`,
+/// else reload the local copy and fail with [EditError::Mismatch]. A failed POST is classed by
+/// [post_error]; a failed or unreadable verify read is [unconfirmed].
 fn send_verified(
     api: &WebApi,
     playlist: &mut Playlist,
@@ -197,19 +319,24 @@ fn send_verified(
     base: Vec<u8>,
     ops: Vec<Op>,
     expected_len: usize,
-) -> Result<Head, EditError> {
+) -> Result<Base, EditError> {
     api.playlist_changes(&playlist.id, list_changes(base, ops))
-        .map_err(EditError::Unverified)?;
-    let after = api
-        .playlist_head(&playlist.id)
-        .map_err(EditError::Unverified)?;
-    if verified(expected_len, &after) {
-        return Ok(after);
-    }
-    warn!(
-        "Playlist write did not verify: length {} after it, {expected_len} expected",
-        after.length
-    );
+        .map_err(|err| failed_post(api, err))?;
+    let after = match api.playlist_head(&playlist.id) {
+        Ok(after) => after,
+        Err(err) => return Err(unconfirmed(playlist, err)),
+    };
+    let length = match verify(expected_len, after) {
+        Verify::Applied(base) => return Ok(base),
+        Verify::Unreadable => {
+            return Err(unconfirmed(
+                playlist,
+                InternalError::ProtocolChanged("playlist head without a revision or length".into()),
+            ));
+        }
+        Verify::Differs(length) => length,
+    };
+    warn!("Playlist write did not verify: length {length} after it, {expected_len} expected");
     if let Err(err) = reload(api, playlist, known) {
         warn!(
             "Could not reload the playlist after a write that did not verify ({})",
@@ -240,12 +367,12 @@ pub fn add_tracks(
     if new.is_empty() {
         return Ok(());
     }
-    let head = prepare_head(api, playlist, known)?;
+    let base = prepare_head(api, playlist, known)?;
     add_batches(
         api,
         playlist,
         known,
-        head,
+        base,
         new,
         &mut Spacer::new(PLAYLIST_FETCH_SPACING),
     )
@@ -257,19 +384,19 @@ fn add_batches(
     api: &WebApi,
     playlist: &mut Playlist,
     known: Known<'_>,
-    mut head: Head,
+    mut base: Base,
     new: &[Playable],
     spacer: &mut Spacer,
 ) -> Result<(), EditError> {
     for batch in add_chunks(new) {
         spaced(spacer);
-        let expected = expected_len(head.length, Change::Add(batch.len())).unwrap_or_default();
+        let expected = expected_len(base.length, Change::Add(batch.len())).unwrap_or_default();
         let ops = vec![add_op(&uris(batch), None)];
-        let after = send_verified(api, playlist, known, head.revision, ops, expected)?;
+        let after = send_verified(api, playlist, known, base.revision, ops, expected)?;
         let mut tracks = playlist.tracks.take().unwrap_or_default();
         tracks.extend_from_slice(batch);
-        set_tracks(playlist, tracks, &after);
-        head = after;
+        set_tracks(playlist, tracks, &after.snapshot_id);
+        base = after;
     }
     Ok(())
 }
@@ -282,17 +409,17 @@ pub fn remove_track(
     uri: &str,
     known: Known<'_>,
 ) -> Result<(), EditError> {
-    let head = prepare_head(api, playlist, known)?;
+    let base = prepare_head(api, playlist, known)?;
     let tracks = playlist.tracks.as_deref().unwrap_or_default();
     if !index_still(tracks, index, uri) {
         return Err(EditError::Moved);
     }
-    let expected = expected_len(head.length, Change::Remove).ok_or(EditError::Moved)?;
+    let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
     let ops = vec![remove_at_op(index)];
-    let after = send_verified(api, playlist, known, head.revision, ops, expected)?;
+    let after = send_verified(api, playlist, known, base.revision, ops, expected)?;
     let mut tracks = playlist.tracks.take().unwrap_or_default();
     tracks.remove(index);
-    set_tracks(playlist, tracks, &after);
+    set_tracks(playlist, tracks, &after.snapshot_id);
     Ok(())
 }
 
@@ -305,19 +432,19 @@ pub fn overwrite(
     tracks: &[Playable],
     known: Known<'_>,
 ) -> Result<(), EditError> {
-    let head = prepare_head(api, playlist, known)?;
+    let base = prepare_head(api, playlist, known)?;
     let (first, rest) = overwrite_split(tracks);
-    let ops = overwrite_ops(head.length, &uris(first));
+    let ops = overwrite_ops(base.length, &uris(first));
     let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
     let after = if ops.is_empty() {
-        head
+        base
     } else {
         spaced(&mut spacer);
         let expected =
-            expected_len(head.length, Change::Overwrite(first.len())).unwrap_or_default();
-        send_verified(api, playlist, known, head.revision, ops, expected)?
+            expected_len(base.length, Change::Overwrite(first.len())).unwrap_or_default();
+        send_verified(api, playlist, known, base.revision, ops, expected)?
     };
-    set_tracks(playlist, first.to_vec(), &after);
+    set_tracks(playlist, first.to_vec(), &after.snapshot_id);
     add_batches(api, playlist, known, after, rest, &mut spacer)
 }
 
@@ -399,8 +526,8 @@ fn rootlist_verify(after: &RootHead, expected_len: usize) -> Result<(), EditErro
     }
 }
 
-/// POST `op` against the rootlist `base`, then confirm it with [rootlist_verify]. Every error
-/// here comes after the POST was sent ([EditError::Unverified]).
+/// POST `op` against the rootlist `base`, then confirm it with [rootlist_verify]. A failed
+/// POST is classed by [post_error]; a failed verify read is [EditError::Unverified].
 fn send_rootlist_verified(
     api: &WebApi,
     base: RootBase,
@@ -408,7 +535,7 @@ fn send_rootlist_verified(
     expected_len: usize,
 ) -> Result<(), EditError> {
     api.rootlist_changes(list_changes(base.revision, vec![op]))
-        .map_err(EditError::Unverified)?;
+        .map_err(|err| failed_post(api, err))?;
     let after = api.rootlist_head().map_err(EditError::Unverified)?;
     rootlist_verify(&after, expected_len)
 }
@@ -582,7 +709,7 @@ mod tests {
         Head {
             revision: vec![1],
             snapshot_id: snapshot.into(),
-            length,
+            length: Some(length),
             name: None,
         }
     }
@@ -600,17 +727,78 @@ mod tests {
     }
 
     #[test]
-    fn a_write_is_based_on_the_head_when_current_else_on_the_reload() {
+    fn a_head_without_a_length_is_stale() {
+        let no_length = Head {
+            length: None,
+            ..head("s", 0)
+        };
+        assert_eq!(freshness(&local("s", 0), &no_length), Freshness::Stale);
+    }
+
+    #[test]
+    fn a_read_without_a_revision_is_a_protocol_change() {
+        let no_revision = Head {
+            revision: Vec::new(),
+            ..head("", 2)
+        };
+        assert!(matches!(
+            listing_base(no_revision.clone(), 2),
+            Err(InternalError::ProtocolChanged(_))
+        ));
+        assert_eq!(
+            require_revision(head("s", 2), "playlist head"),
+            Ok(head("s", 2))
+        );
+        let err = require_revision(no_revision, "playlist head").unwrap_err();
+        assert!(matches!(err, InternalError::ProtocolChanged(_)));
+        // Before any POST, so it keeps its class: the area latches, then the Web API.
+        use crate::internal_api::fallback::{Action, decide_after};
+        let err = InternalError::from(EditError::from(err));
+        assert_eq!(decide_after(&err), Action::LatchThenWeb);
+    }
+
+    #[test]
+    fn a_reload_is_based_on_its_item_count_and_revision() {
+        let read = Head {
+            revision: b"reload".to_vec(),
+            ..head("r", 5)
+        };
+        let base = listing_base(read, 3).expect("has a revision");
+        assert_eq!(
+            base,
+            Base {
+                revision: b"reload".to_vec(),
+                snapshot_id: "r".into(),
+                length: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn a_write_on_a_current_copy_is_based_on_the_head() {
         let read = Head {
             revision: b"head".to_vec(),
             ..head("h", 2)
         };
-        let reloaded = Head {
-            revision: b"reload".to_vec(),
-            ..head("r", 3)
+        assert_eq!(
+            current_base(read, &local("h", 2)),
+            Base {
+                revision: b"head".to_vec(),
+                snapshot_id: "h".into(),
+                length: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn length_drift_compares_a_reported_length_with_the_items() {
+        assert_eq!(length_drift(&head("s", 3), 3), None);
+        assert_eq!(length_drift(&head("s", 4), 3), Some(4));
+        let no_length = Head {
+            length: None,
+            ..head("s", 0)
         };
-        assert_eq!(write_base(read.clone(), None), read);
-        assert_eq!(write_base(read, Some(reloaded.clone())), reloaded);
+        assert_eq!(length_drift(&no_length, 3), None);
     }
 
     #[test]
@@ -622,15 +810,86 @@ mod tests {
     }
 
     #[test]
-    fn verified_compares_the_head_length() {
-        assert!(verified(3, &head("x", 3)));
-        assert!(!verified(3, &head("x", 2)));
+    fn verify_compares_the_head_length() {
+        assert_eq!(
+            verify(3, head("x", 3)),
+            Verify::Applied(Base {
+                revision: vec![1],
+                snapshot_id: "x".into(),
+                length: 3,
+            })
+        );
+        assert_eq!(verify(3, head("x", 2)), Verify::Differs(2));
+    }
+
+    #[test]
+    fn a_verify_head_without_revision_or_length_proves_nothing() {
+        let no_length = Head {
+            length: None,
+            ..head("x", 0)
+        };
+        let no_revision = Head {
+            revision: Vec::new(),
+            ..head("", 3)
+        };
+        assert_eq!(verify(0, no_length), Verify::Unreadable);
+        assert_eq!(verify(3, no_revision), Verify::Unreadable);
+    }
+
+    #[test]
+    fn an_unconfirmed_write_clears_the_snapshot_and_stores_the_copy() {
+        let mut playlist = local("s", 2);
+        let err = unconfirmed(&mut playlist, InternalError::Transient("x".into()));
+        assert!(matches!(err, EditError::Unverified(_)));
+        assert!(err.stores_copy());
+        assert_eq!(
+            err.note(),
+            Some("Could not confirm the change; it may have applied")
+        );
+        assert_eq!(playlist.snapshot_id, "");
+        assert_eq!(playlist.num_tracks, 2, "the tracks stay");
+        // The next write sees the copy as stale and reloads.
+        assert_eq!(freshness(&playlist, &head("s", 2)), Freshness::Stale);
+    }
+
+    #[test]
+    fn post_errors_split_into_unverified_and_refused() {
+        use crate::internal_api::fallback::{Action, decide_after};
+        let cases = [
+            (InternalError::Transient("timeout".into()), "unverified"),
+            (InternalError::RateLimited, "unverified"),
+            (InternalError::NotFound, "refused"),
+            (InternalError::Denied, "refused"),
+            (InternalError::ProtocolChanged("412".into()), "refused"),
+            (InternalError::NoSession, "refused"),
+        ];
+        for (inner, class) in cases {
+            let err = post_error(inner.clone());
+            assert_eq!(err.class(), class, "{inner}");
+            assert_eq!(err.stores_copy(), class == "unverified", "{inner}");
+            let note = if class == "refused" {
+                "Spotify refused the change"
+            } else {
+                "Could not confirm the change; it may have applied"
+            };
+            assert_eq!(err.note(), Some(note), "{inner}");
+            assert_eq!(
+                decide_after(&InternalError::from(err)),
+                Action::Fail,
+                "{inner}"
+            );
+        }
     }
 
     #[test]
     fn edit_errors_fail_without_fallback() {
         use crate::internal_api::fallback::{Action, decide_after};
-        for err in [EditError::Moved, EditError::Mismatch] {
+        for err in [
+            EditError::Moved,
+            EditError::Mismatch,
+            EditError::Refused(InternalError::Denied),
+        ] {
+            assert!(!err.stores_copy());
             assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
         }
     }
@@ -699,17 +958,13 @@ mod tests {
     }
 
     #[test]
-    fn set_tracks_renumbers_and_takes_the_head_snapshot() {
+    fn set_tracks_renumbers_and_takes_the_snapshot() {
         let mut playlist = local("s", 0);
         let tracks = vec![
             track_playable("spotify:track:a"),
             track_playable("spotify:track:b"),
         ];
-        set_tracks(
-            &mut playlist,
-            tracks.into_iter().rev().collect(),
-            &head("t", 2),
-        );
+        set_tracks(&mut playlist, tracks.into_iter().rev().collect(), "t");
         assert_eq!(playlist.snapshot_id, "t");
         assert_eq!(playlist.num_tracks, 2);
         let tracks = playlist.tracks.unwrap();
@@ -796,6 +1051,7 @@ mod tests {
             EditError::Internal(InternalError::NoSession),
             EditError::Internal(InternalError::ProtocolChanged("x".into())),
             EditError::Unverified(InternalError::Denied),
+            EditError::Refused(InternalError::NotFound),
             EditError::Mismatch,
         ] {
             let after = after_create(err);
@@ -875,6 +1131,10 @@ mod tests {
         assert_eq!(
             EditError::Unverified(InternalError::Transient("/user/x".into())).class(),
             "unverified"
+        );
+        assert_eq!(
+            EditError::Refused(InternalError::ProtocolChanged("/user/x".into())).class(),
+            "refused"
         );
     }
 

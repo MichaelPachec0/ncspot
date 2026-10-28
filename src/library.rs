@@ -440,8 +440,12 @@ impl Library {
                     .cloned();
                 // Not a stored playlist: nothing to verify against, use the Web API.
                 let mut playlist = stored.ok_or(InternalError::NotFound)?;
-                playlist_edit::overwrite(api, &mut playlist, tracks, &known)
-                    .map_err(edit_failed)?;
+                playlist_edit::overwrite(api, &mut playlist, tracks, &known).map_err(|err| {
+                    if err.stores_copy() {
+                        self.playlist_update(&playlist);
+                    }
+                    edit_failed(err)
+                })?;
                 self.playlist_update(&playlist);
                 Ok(())
             },
@@ -1056,7 +1060,10 @@ impl Library {
             let pinned = match api.collection_page_all(Area::Playlists, SET_PIN) {
                 Ok(listing) => pinned_ids(&listing.items),
                 Err(err) => {
-                    debug!("playlists: pins not read ({err}), keeping the previous pins");
+                    debug!(
+                        "playlists: pins not read ({}), keeping the previous pins",
+                        err.class()
+                    );
                     self.playlist_layout
                         .read()
                         .unwrap()
@@ -1195,7 +1202,10 @@ impl Library {
                 None
             }
             Err(err) => {
-                warn!("playlists: a playlist download failed ({err}), keeping the cached copy");
+                warn!(
+                    "playlists: a playlist download failed ({}), keeping the cached copy",
+                    err.class()
+                );
                 None
             }
         }
