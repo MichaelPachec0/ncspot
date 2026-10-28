@@ -331,6 +331,7 @@ impl Library {
             id,
             api.internal_usable(Area::Playlists),
             || api.collection_page_all(Area::Playlists, SET_PIN),
+            |err| api.latch_area(Area::Playlists, err),
         )
     }
 
@@ -342,14 +343,15 @@ impl Library {
         let api = &self.spotify.api;
         let usable = api.internal_usable(Area::Playlists);
         let read = || api.collection_page_all(Area::Playlists, SET_PIN);
-        match pin_listing(id, usable, read) {
+        let latch = |err: &InternalError| api.latch_area(Area::Playlists, err);
+        match pin_listing(id, usable, read, latch) {
             PinListing::NotListed => None,
             PinListing::Unknown => Some(PIN_MAYBE_LEFT_NOTE),
             PinListing::Listed => {
                 let mut tries = 0;
                 let removed = unpin_with_retry(|| {
                     tries += 1;
-                    if tries > 1 && pin_listing(id, usable, read) == PinListing::NotListed {
+                    if tries > 1 && pin_listing(id, usable, read, latch) == PinListing::NotListed {
                         PinOutcome::Done
                     } else {
                         self.unpin_playlist(id)
@@ -2753,17 +2755,30 @@ enum PinListing {
 }
 
 /// Whether the server's pin set lists playlist `id`. An unusable area has no pins we can
-/// touch (`NotListed`); a failed read is retried once, then `Unknown`.
+/// touch (`NotListed`); a failed read is retried once, then `Unknown`. A protocol change
+/// latches the area (`latch`, like a pin change) and is `Unknown` without a retry.
 fn pin_listing(
     id: &str,
     usable: bool,
     mut read: impl FnMut() -> Result<crate::internal_api::collection::Listing, InternalError>,
+    mut latch: impl FnMut(&InternalError),
 ) -> PinListing {
     if !usable {
         return PinListing::NotListed;
     }
     let uri = format!("{PLAYLIST_URI_PREFIX}{id}");
-    match read().or_else(|_| read()) {
+    let mut attempt = || {
+        read().inspect_err(|err| {
+            if let InternalError::ProtocolChanged(_) = err {
+                latch(err);
+            }
+        })
+    };
+    let listing = attempt().or_else(|err| match err {
+        InternalError::ProtocolChanged(_) => Err(err),
+        _ => attempt(),
+    });
+    match listing {
         Ok(listing) if listing.items.iter().any(|i| i.uri == uri) => PinListing::Listed,
         Ok(_) => PinListing::NotListed,
         Err(_) => PinListing::Unknown,
@@ -2771,18 +2786,22 @@ fn pin_listing(
 }
 
 /// Whether `id` is pinned: the layout's `Pinned` entries when the layout is not empty, else
-/// the server's pin set.
+/// the server's pin set (a protocol change on its read is passed to `latch`).
 fn pinned_in_layout_or_set(
     layout: &[LayoutEntry],
     id: &str,
     usable: bool,
     read: impl FnOnce() -> Result<crate::internal_api::collection::Listing, InternalError>,
+    latch: impl FnMut(&InternalError),
 ) -> bool {
     if layout.is_empty() {
         let mut read = Some(read);
-        pin_listing(id, usable, || {
-            read.take().map_or(Err(InternalError::NoSession), |r| r())
-        }) == PinListing::Listed
+        pin_listing(
+            id,
+            usable,
+            || read.take().map_or(Err(InternalError::NoSession), |r| r()),
+            latch,
+        ) == PinListing::Listed
     } else {
         layout
             .iter()
@@ -3485,22 +3504,30 @@ mod test {
             LayoutEntry::Pinned("p".into()),
             LayoutEntry::Playlist("q".into()),
         ];
+        let no_latch = |_: &InternalError| panic!("latch");
         // A layout decides alone; the read is never needed.
-        assert!(pinned_in_layout_or_set(&layout, "p", true, || panic!(
-            "read"
-        )));
-        assert!(!pinned_in_layout_or_set(&layout, "q", true, || panic!(
-            "read"
-        )));
+        let unread = || panic!("read");
+        assert!(pinned_in_layout_or_set(
+            &layout, "p", true, unread, no_latch
+        ));
+        assert!(!pinned_in_layout_or_set(
+            &layout, "q", true, unread, no_latch
+        ));
         // A flat layout reads the set.
         let set = || Ok(pin_items(&["spotify:playlist:p"]));
-        assert!(pinned_in_layout_or_set(&[], "p", true, set));
-        assert!(!pinned_in_layout_or_set(&[], "q", true, set));
+        assert!(pinned_in_layout_or_set(&[], "p", true, set, no_latch));
+        assert!(!pinned_in_layout_or_set(&[], "q", true, set, no_latch));
         // Unusable area or a failed read: not pinned.
-        assert!(!pinned_in_layout_or_set(&[], "p", false, || panic!("read")));
-        assert!(!pinned_in_layout_or_set(&[], "p", true, || Err(
-            InternalError::NoSession
-        )));
+        assert!(!pinned_in_layout_or_set(&[], "p", false, unread, no_latch));
+        let failed = || Err(InternalError::NoSession);
+        assert!(!pinned_in_layout_or_set(&[], "p", true, failed, no_latch));
+        // A protocol change latches the area, then is not pinned.
+        let mut latched = 0;
+        let changed = || Err(InternalError::ProtocolChanged("set".into()));
+        assert!(!pinned_in_layout_or_set(&[], "p", true, changed, |_| {
+            latched += 1;
+        }));
+        assert_eq!(latched, 1);
     }
 
     #[test]
@@ -3516,24 +3543,50 @@ mod test {
 
     #[test]
     fn pin_listing_retries_a_failed_read_once() {
+        let no_latch = |_: &InternalError| panic!("latch");
         let mut calls = 0;
-        let l = pin_listing("p", true, || {
+        let read = || {
             calls += 1;
             if calls == 1 {
                 Err(InternalError::NoSession)
             } else {
                 Ok(pin_items(&["spotify:playlist:p"]))
             }
-        });
+        };
+        let l = pin_listing("p", true, read, no_latch);
         assert_eq!((l, calls), (PinListing::Listed, 2));
         let mut calls = 0;
-        let l = pin_listing("p", true, || {
+        let read = || {
             calls += 1;
             Err(InternalError::NoSession)
-        });
+        };
+        let l = pin_listing("p", true, read, no_latch);
         assert_eq!((l, calls), (PinListing::Unknown, 2));
-        let l = pin_listing("p", false, || panic!("read"));
+        let l = pin_listing("p", false, || panic!("read"), no_latch);
         assert_eq!(l, PinListing::NotListed);
+    }
+
+    #[test]
+    fn a_protocol_change_on_the_pin_read_latches_without_a_retry() {
+        let (mut calls, mut latched) = (0, 0);
+        let read = || {
+            calls += 1;
+            Err(InternalError::ProtocolChanged("set".into()))
+        };
+        let l = pin_listing("p", true, read, |_| latched += 1);
+        assert_eq!((l, calls, latched), (PinListing::Unknown, 1, 1));
+        // Changed on the retry: latched too.
+        let (mut calls, mut latched) = (0, 0);
+        let read = || {
+            calls += 1;
+            if calls == 1 {
+                Err(InternalError::Transient("set".into()))
+            } else {
+                Err(InternalError::ProtocolChanged("set".into()))
+            }
+        };
+        let l = pin_listing("p", true, read, |_| latched += 1);
+        assert_eq!((l, calls, latched), (PinListing::Unknown, 2, 1));
     }
 
     #[test]
