@@ -80,13 +80,15 @@ pub enum Freshness {
     Stale,
 }
 
-/// Current when the local copy has loaded tracks, its snapshot is the head's and its track
-/// count (placeholders included) is the head length. A head without a length is never
-/// current.
+/// Current when the local copy has loaded tracks, its snapshot is the head's, its track
+/// count (placeholders included) is the head length and it is in server order (each item's
+/// `list_index` is its position). A head without a length is never current.
 pub fn freshness(local: &Playlist, head: &Head) -> Freshness {
     match &local.tracks {
         Some(tracks)
-            if local.snapshot_id == head.snapshot_id && head.length == Some(tracks.len()) =>
+            if local.snapshot_id == head.snapshot_id
+                && head.length == Some(tracks.len())
+                && in_server_order(tracks) =>
         {
             Freshness::Current
         }
@@ -94,11 +96,38 @@ pub fn freshness(local: &Playlist, head: &Head) -> Freshness {
     }
 }
 
-/// The selected item is still at `index` (same URI).
-pub fn index_still(tracks: &[Playable], index: usize, uri: &str) -> bool {
+/// Each item's `list_index` is its position, so positions in the copy are server positions.
+fn in_server_order(tracks: &[Playable]) -> bool {
     tracks
-        .get(index)
-        .is_some_and(|playable| playable.uri() == uri)
+        .iter()
+        .enumerate()
+        .all(|(position, playable)| playable.list_index() == position)
+}
+
+/// Where in `tracks` the item at server position `index` (its `list_index`) is, when it is
+/// still `uri`. The position in `tracks` is not used as the server index: a copy may be in
+/// another order.
+pub fn server_item(tracks: &[Playable], index: usize, uri: &str) -> Option<usize> {
+    tracks
+        .iter()
+        .position(|playable| playable.list_index() == index)
+        .filter(|&at| tracks[at].uri() == uri)
+}
+
+/// Remove the item at server position `index` (its `list_index`) and move every later item one
+/// position up, keeping the order of `tracks`. False when no item has that position.
+pub fn remove_server_item(tracks: &mut Vec<Playable>, index: usize) -> bool {
+    let Some(at) = tracks.iter().position(|p| p.list_index() == index) else {
+        return false;
+    };
+    tracks.remove(at);
+    for playable in tracks.iter_mut() {
+        let position = playable.list_index();
+        if position > index {
+            playable.set_list_index(position - 1);
+        }
+    }
+    true
 }
 
 /// What a playlist write is based on: the revision the POST names, the snapshot the local
@@ -132,12 +161,13 @@ fn listing_base(head: Head, count: usize) -> Result<Base, InternalError> {
 }
 
 /// The base of an overwrite: the head alone, since the contents are replaced whatever they
-/// are. A head without a revision or a length is a protocol change (nothing is sent).
+/// are. Nothing is sent from a head without a revision (a protocol change) or without a length
+/// (a transient failure: the old contents cannot be removed by count, and they are not read).
 fn overwrite_base(head: Head) -> Result<Base, InternalError> {
     let head = require_revision(head, "playlist head")?;
     let length = head
         .length
-        .ok_or_else(|| InternalError::ProtocolChanged("playlist head without a length".into()))?;
+        .ok_or_else(|| InternalError::Transient("playlist head without a length".into()))?;
     Ok(Base {
         revision: head.revision,
         snapshot_id: head.snapshot_id,
@@ -195,8 +225,13 @@ pub enum EditError {
     /// failed, its snapshot was cleared instead).
     Mismatch,
     /// An add stopped after `added` of `total` tracks: the verified batches applied, the local
-    /// copy holds them (or the server's copy, when a later batch did not verify).
-    Partial { added: usize, total: usize },
+    /// copy holds them (or the server's copy, when a later batch did not verify). `unconfirmed`
+    /// when the failed batch may have applied too.
+    Partial {
+        added: usize,
+        total: usize,
+        unconfirmed: bool,
+    },
 }
 
 impl EditError {
@@ -220,8 +255,13 @@ impl EditError {
             Self::Mismatch => "Playlist changed elsewhere, reloaded",
             Self::Unverified(_) => "Could not confirm the change; it may have applied",
             Self::Refused(_) => "Spotify refused the change",
-            Self::Partial { added, total } => {
-                return Some(format!("Added {added} of {total} tracks"));
+            Self::Partial {
+                added,
+                total,
+                unconfirmed,
+            } => {
+                let at_least = if *unconfirmed { "at least " } else { "" };
+                return Some(format!("Added {at_least}{added} of {total} tracks"));
             }
         };
         Some(note.to_string())
@@ -501,7 +541,8 @@ pub fn add_tracks(
 }
 
 /// The error of an add that failed after `added` of `total` tracks verified: the failure
-/// itself when none did, else [EditError::Partial] (the failure's class is logged).
+/// itself when none did, else [EditError::Partial], unconfirmed when the failure is
+/// [EditError::Unverified] (the failure's class is logged).
 fn partial(added: usize, total: usize, err: EditError) -> EditError {
     if added == 0 {
         return err;
@@ -510,7 +551,11 @@ fn partial(added: usize, total: usize, err: EditError) -> EditError {
         "Playlist add stopped after {added} of {total} tracks ({})",
         err.class()
     );
-    EditError::Partial { added, total }
+    EditError::Partial {
+        added,
+        total,
+        unconfirmed: matches!(err, EditError::Unverified(_)),
+    }
 }
 
 /// One verified ADD per [ADD_BATCH] tracks, [PLAYLIST_FETCH_SPACING] between POSTs, each based
@@ -542,7 +587,8 @@ fn add_batches(
     Ok(())
 }
 
-/// Remove the item at `index`, which must still be `uri` once the local copy is current.
+/// Remove the item at server position `index` (its `list_index`), which must still be `uri`
+/// once the local copy is current.
 pub fn remove_track(
     api: &impl PlaylistServer,
     playlist: &mut Playlist,
@@ -552,7 +598,7 @@ pub fn remove_track(
 ) -> Result<(), EditError> {
     let base = prepare_head(api, playlist, known)?;
     let tracks = playlist.tracks.as_deref().unwrap_or_default();
-    if !index_still(tracks, index, uri) {
+    if server_item(tracks, index, uri).is_none() {
         return Err(EditError::Moved);
     }
     let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
@@ -566,9 +612,11 @@ pub fn remove_track(
         ops,
         expected,
     )?;
-    let mut tracks = playlist.tracks.take().unwrap_or_default();
-    tracks.remove(index);
-    set_tracks(playlist, tracks, &after.snapshot_id);
+    if let Some(tracks) = playlist.tracks.as_mut() {
+        remove_server_item(tracks, index);
+        playlist.num_tracks = tracks.len();
+    }
+    playlist.snapshot_id = after.snapshot_id;
     Ok(())
 }
 
@@ -859,12 +907,19 @@ mod tests {
         }
     }
 
+    /// A playable at server position `index`.
+    fn at(uri: &str, index: usize) -> Playable {
+        let mut playable = track_playable(uri);
+        playable.set_list_index(index);
+        playable
+    }
+
     fn local(snapshot: &str, n: usize) -> Playlist {
         Playlist {
             snapshot_id: snapshot.into(),
             tracks: Some(
                 (0..n)
-                    .map(|i| track_playable(&format!("spotify:track:{i}")))
+                    .map(|i| at(&format!("spotify:track:{i}"), i))
                     .collect(),
             ),
             num_tracks: n,
@@ -969,11 +1024,42 @@ mod tests {
     }
 
     #[test]
-    fn index_must_still_point_at_the_selected_item() {
+    fn the_server_item_is_found_by_its_list_index() {
         let tracks = local("s", 3).tracks.unwrap();
-        assert!(index_still(&tracks, 1, "spotify:track:1"));
-        assert!(!index_still(&tracks, 1, "spotify:track:2"));
-        assert!(!index_still(&tracks, 9, "spotify:track:1"));
+        assert_eq!(server_item(&tracks, 1, "spotify:track:1"), Some(1));
+        assert_eq!(server_item(&tracks, 1, "spotify:track:2"), None);
+        assert_eq!(server_item(&tracks, 9, "spotify:track:1"), None);
+        let reversed: Vec<Playable> = tracks.into_iter().rev().collect();
+        assert_eq!(server_item(&reversed, 0, "spotify:track:0"), Some(2));
+    }
+
+    #[test]
+    fn removing_a_server_item_keeps_the_order_and_renumbers() {
+        // Server order a0 b1 c2 d3, held as c2 a0 d3 b1.
+        let mut tracks = vec![
+            at("spotify:track:c", 2),
+            at("spotify:track:a", 0),
+            at("spotify:track:d", 3),
+            at("spotify:track:b", 1),
+        ];
+        assert!(remove_server_item(&mut tracks, 1));
+        let held: Vec<(String, usize)> = tracks.iter().map(|p| (p.uri(), p.list_index())).collect();
+        assert_eq!(
+            held,
+            [
+                ("spotify:track:c".to_string(), 1),
+                ("spotify:track:a".to_string(), 0),
+                ("spotify:track:d".to_string(), 2),
+            ]
+        );
+        assert!(!remove_server_item(&mut tracks, 7));
+    }
+
+    #[test]
+    fn a_copy_out_of_server_order_is_stale() {
+        let mut playlist = local("s", 3);
+        playlist.tracks.as_mut().unwrap().swap(0, 2);
+        assert_eq!(freshness(&playlist, &head("s", 3)), Freshness::Stale);
     }
 
     #[test]
@@ -1112,6 +1198,7 @@ mod tests {
                 EditError::Partial {
                     added: 100,
                     total: 150,
+                    unconfirmed: true,
                 },
                 true,
             ),
@@ -1480,10 +1567,15 @@ mod tests {
             err,
             EditError::Partial {
                 added: ADD_BATCH,
-                total: 150
+                total: 150,
+                unconfirmed: true,
             }
         ));
-        assert_eq!(err.note().as_deref(), Some("Added 100 of 150 tracks"));
+        // The failed batch may have applied too.
+        assert_eq!(
+            err.note().as_deref(),
+            Some("Added at least 100 of 150 tracks")
+        );
         assert!(err.stores_copy());
         assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
         // The copy holds exactly the verified batch, at the head verified after it.
@@ -1589,10 +1681,15 @@ mod tests {
         let api = Fake::default().heads([Ok(no_length)]);
         let mut playlist = local("s", 2);
         let err = overwrite(&api, &mut playlist, &new_tracks(1), &no_known).unwrap_err();
+        // A transient failure: nothing latches, and there is no Web fallback.
         assert!(matches!(
             err,
-            EditError::Internal(InternalError::ProtocolChanged(_))
+            EditError::Internal(InternalError::Transient(_))
         ));
+        {
+            use crate::internal_api::fallback::{Action, decide_after};
+            assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
+        }
         assert!(api.sent.borrow().is_empty(), "nothing sent");
         assert_eq!(api.contents_reads.get(), 0);
         assert_eq!(playlist.num_tracks, 2);
@@ -1614,9 +1711,112 @@ mod tests {
             .posts([Ok(()), Err(InternalError::Transient("timeout".into()))]);
         let mut playlist = local("s", 2);
         let err = overwrite(&api, &mut playlist, &new, &no_known).unwrap_err();
-        assert_eq!(err.note().as_deref(), Some("Added 1000 of 1050 tracks"));
+        assert_eq!(
+            err.note().as_deref(),
+            Some("Added at least 1000 of 1050 tracks")
+        );
         assert!(err.stores_copy());
         assert_eq!(uri_list(&playlist), uris(&new[..OVERWRITE_ATOMIC_MAX]));
         assert_eq!(playlist.snapshot_id, "w");
+    }
+
+    /// A current copy held in another order than the server's: server order a0 b1 c2, held
+    /// as c2 a0 b1.
+    fn held_sorted() -> Playlist {
+        Playlist {
+            tracks: Some(vec![
+                at("spotify:track:c", 2),
+                at("spotify:track:a", 0),
+                at("spotify:track:b", 1),
+            ]),
+            num_tracks: 3,
+            ..local("s", 0)
+        }
+    }
+
+    fn held(playlist: &Playlist) -> Vec<(String, usize)> {
+        playlist
+            .tracks
+            .iter()
+            .flatten()
+            .map(|p| (p.uri(), p.list_index()))
+            .collect()
+    }
+
+    #[test]
+    fn a_remove_sends_the_server_index_and_keeps_the_order() {
+        // In server order (the copy library stores and edits work on), position is list_index.
+        let mut playlist = local("s", 3);
+        let api = Fake::default()
+            .heads([Ok(head("s", 3)), Ok(head("t", 2))])
+            .posts([Ok(())]);
+        remove_track(&api, &mut playlist, 1, "spotify:track:1", &no_known).expect("verified");
+        let rem = &api.sent.borrow()[0].deltas[0].ops[0].rem;
+        assert_eq!((rem.from_index, rem.length), (Some(1), Some(1)));
+        assert_eq!(
+            held(&playlist),
+            [
+                ("spotify:track:0".to_string(), 0),
+                ("spotify:track:2".to_string(), 1)
+            ]
+        );
+        assert_eq!(
+            (playlist.num_tracks, playlist.snapshot_id.as_str()),
+            (2, "t")
+        );
+        assert_eq!(api.contents_reads.get(), 0);
+    }
+
+    #[test]
+    fn a_copy_out_of_server_order_is_reloaded_before_a_remove() {
+        // b is at server position 1; the copy holds it at position 2.
+        let mut playlist = held_sorted();
+        let server: Vec<Playable> = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| at(&format!("spotify:track:{id}"), i))
+            .collect();
+        let api = Fake::default()
+            .heads([Ok(head("s", 3)), Ok(head("t", 2))])
+            .contents(Ok((head("s", 3), server)))
+            .posts([Ok(())]);
+        remove_track(&api, &mut playlist, 1, "spotify:track:b", &no_known).expect("verified");
+        assert_eq!(api.contents_reads.get(), 1, "not current: reloaded");
+        let rem = &api.sent.borrow()[0].deltas[0].ops[0].rem;
+        assert_eq!(rem.from_index, Some(1), "b's server index, not its row");
+        assert_eq!(
+            held(&playlist),
+            [
+                ("spotify:track:a".to_string(), 0),
+                ("spotify:track:c".to_string(), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stale_copy_whose_item_moved_sends_nothing() {
+        let mut playlist = local("s", 3);
+        // On the server, position 1 now holds another track.
+        let server = vec![
+            at("spotify:track:0", 0),
+            at("spotify:track:x", 1),
+            at("spotify:track:2", 2),
+        ];
+        let api = Fake::default()
+            .heads([Ok(head("u", 3))])
+            .contents(Ok((head("u", 3), server)));
+        let err = remove_track(&api, &mut playlist, 1, "spotify:track:1", &no_known).unwrap_err();
+        assert!(matches!(err, EditError::Moved));
+        assert!(api.sent.borrow().is_empty());
+        assert_eq!(
+            playlist.snapshot_id, "u",
+            "the reloaded copy, for the caller to store"
+        );
+    }
+
+    #[test]
+    fn a_later_batch_mismatch_note_is_exact() {
+        let err = partial(100, 150, EditError::Mismatch);
+        assert_eq!(err.note().as_deref(), Some("Added 100 of 150 tracks"));
     }
 }

@@ -198,14 +198,6 @@ impl<I: ListItem + Clone> ListView<I> {
     /// # Panics
     ///
     /// Panics if `index` is out of bounds.
-    pub fn remove(&mut self, index: usize) {
-        let mut c = self.content.write().unwrap();
-        c.remove(index);
-        if self.selected >= c.len() {
-            self.selected = self.selected.saturating_sub(1);
-        }
-    }
-
     /// Get the selected row from a mouse position and offset
     fn get_selected_row(&self, position: XY<usize>, offset: XY<usize>) -> Option<usize> {
         let viewport = self.scroller.content_viewport().top_left();

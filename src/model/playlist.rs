@@ -92,14 +92,22 @@ impl Playlist {
         })
     }
 
-    /// Remove the track at `index`. On failure the error is the status note to show.
+    /// Remove the track at server position `index` (its `list_index`, not its position in a
+    /// sorted view). On failure the error is the status note to show.
     pub fn delete_track(
         &mut self,
         index: usize,
         spotify: Spotify,
         library: &Library,
     ) -> Result<(), String> {
-        let playable = self.tracks.as_ref().unwrap()[index].clone();
+        let Some(playable) = self
+            .tracks
+            .as_ref()
+            .and_then(|tracks| tracks.iter().find(|p| p.list_index() == index))
+            .cloned()
+        else {
+            return Err("Could not delete track.".to_string());
+        };
         debug!("deleting track: {index} {playable:?}");
 
         if playable.track().map(|t| t.is_local) == Some(true) {
@@ -119,7 +127,8 @@ impl Playlist {
             Area::Playlists,
             || {
                 playlist_edit::remove_track(api, self, index, &uri, &known).map_err(|err| {
-                    if err.stores_copy() {
+                    // Also a copy reloaded before the failure (its snapshot changed).
+                    if err.stores_copy() || self.snapshot_id != snapshot_id {
                         library.playlist_update(self);
                     }
                     note.set(err.note());
@@ -142,7 +151,8 @@ impl Playlist {
         if web_used.get()
             && let Some(tracks) = &mut self.tracks
         {
-            tracks.remove(index);
+            playlist_edit::remove_server_item(tracks, index);
+            self.num_tracks = tracks.len();
         }
         library.playlist_update(self);
         Ok(())
@@ -153,12 +163,14 @@ impl Playlist {
         let known = || library.known_playables();
         let web_used = Cell::new(false);
         let id = self.id.clone();
+        let snapshot_id = self.snapshot_id.clone();
         let written = write_through(
             api,
             Area::Playlists,
             || {
                 playlist_edit::add_tracks(api, self, new_tracks, &known).map_err(|err| {
-                    if err.stores_copy() {
+                    // Also a copy reloaded before the failure (its snapshot changed).
+                    if err.stores_copy() || self.snapshot_id != snapshot_id {
                         library.playlist_update(self);
                     }
                     if let Some(note) = err.note() {
@@ -176,7 +188,17 @@ impl Playlist {
         if written {
             if web_used.get() {
                 match &mut self.tracks {
-                    Some(tracks) => tracks.append(&mut new_tracks.to_vec()),
+                    Some(tracks) => {
+                        // The new tracks take the server positions after the old ones.
+                        let start = tracks.len();
+                        tracks.extend(new_tracks.iter().cloned().enumerate().map(
+                            |(i, mut playable)| {
+                                playable.set_list_index(start + i);
+                                playable
+                            },
+                        ));
+                        self.num_tracks = tracks.len();
+                    }
                     None => return,
                 }
             }

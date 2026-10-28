@@ -14,8 +14,11 @@ use crate::spotify::Spotify;
 use crate::traits::ViewExt;
 use crate::ui::listview::ListView;
 
+/// A playlist's tracks. `playlist` stays in server order (it is what edits work on and what
+/// the library stores); only the rows of `list` follow the saved sort order.
 pub struct PlaylistView {
     playlist: Playlist,
+    rows: Arc<RwLock<Vec<Playable>>>,
     list: ListView<Playable>,
     spotify: Spotify,
     library: Arc<Library>,
@@ -27,25 +30,13 @@ impl PlaylistView {
         let mut playlist = playlist.clone();
         playlist.load_tracks(&queue.get_spotify());
 
-        if let Some(order) = library.cfg.state().playlist_orders.get(&playlist.id) {
-            playlist.sort(&order.key, &order.direction);
-        }
-
-        let tracks = if let Some(t) = playlist.tracks.as_ref() {
-            t.clone()
-        } else {
-            Vec::new()
-        };
-
+        let rows = Arc::new(RwLock::new(sorted_rows(&library, &playlist)));
         let spotify = queue.get_spotify();
-        let list = ListView::new(
-            Arc::new(RwLock::new(tracks)),
-            queue.clone(),
-            library.clone(),
-        );
+        let list = ListView::new(rows.clone(), queue.clone(), library.clone());
 
         Self {
             playlist,
+            rows,
             list,
             spotify,
             library,
@@ -53,15 +44,26 @@ impl PlaylistView {
         }
     }
 
-    /// Rebuild the list from the playlist's tracks.
+    /// Rebuild the list from the playlist's tracks in the saved sort order.
     fn show_tracks(&mut self) {
-        let tracks = self.playlist.tracks.as_ref().unwrap_or(&Vec::new()).clone();
-        self.list = ListView::new(
-            Arc::new(RwLock::new(tracks)),
-            self.queue.clone(),
-            self.library.clone(),
-        );
+        self.rows = Arc::new(RwLock::new(sorted_rows(&self.library, &self.playlist)));
+        self.list = ListView::new(self.rows.clone(), self.queue.clone(), self.library.clone());
     }
+}
+
+/// The tracks of `playlist` in its saved sort order (server order when none is saved).
+fn sorted_rows(library: &Library, playlist: &Playlist) -> Vec<Playable> {
+    let order = library
+        .cfg
+        .state()
+        .playlist_orders
+        .get(&playlist.id)
+        .cloned();
+    let mut sorted = playlist.clone();
+    if let Some(order) = order {
+        sorted.sort(&order.key, &order.direction);
+    }
+    sorted.tracks.unwrap_or_default()
 }
 
 impl ViewWrapper for PlaylistView {
@@ -97,29 +99,26 @@ impl ViewExt for PlaylistView {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         if let Command::Delete = cmd {
             let pos = self.list.get_selected_index();
+            // The row's server position: the rows may be sorted, `playlist` is not.
+            let Some(index) = self.rows.read().unwrap().get(pos).map(Playable::list_index) else {
+                return Ok(CommandResult::Consumed(None));
+            };
             let snapshot_id = self.playlist.snapshot_id.clone();
 
             return match self
                 .playlist
-                .delete_track(pos, self.spotify.clone(), &self.library)
+                .delete_track(index, self.spotify.clone(), &self.library)
             {
                 Ok(()) => {
-                    self.list.remove(pos);
+                    // Rebuilt from the copy: a reload before the delete may have changed more
+                    // than the removed row, and the later rows moved one server position up.
+                    self.show_tracks();
+                    self.list.move_focus_to(pos);
                     Ok(CommandResult::Consumed(None))
                 }
                 Err(note) => {
                     // A failed delete may have reloaded the copy (or cleared its snapshot).
                     if self.playlist.snapshot_id != snapshot_id {
-                        let order = self
-                            .library
-                            .cfg
-                            .state()
-                            .playlist_orders
-                            .get(&self.playlist.id)
-                            .cloned();
-                        if let Some(order) = order {
-                            self.playlist.sort(&order.key, &order.direction);
-                        }
                         self.show_tracks();
                     }
                     Err(note)
@@ -145,7 +144,6 @@ impl ViewExt for PlaylistView {
                     .insert(self.playlist.id.clone(), order);
             });
 
-            self.playlist.sort(key, direction);
             self.show_tracks();
             return Ok(CommandResult::Consumed(None));
         }
