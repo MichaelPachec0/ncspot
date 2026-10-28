@@ -405,8 +405,8 @@ pub fn unfollow_recorded(library: &Library, spotify: &Spotify, n: usize) -> Resu
         }
         if listing == RootlistState::Listed {
             unfollowed = playlist_edit::unfollow(api, &id).is_ok();
-            if unfollowed && !library.unpin_deleted(&id) {
-                log::warn!("harness unfollow-recorded: unfollowed, but the pin was left");
+            if unfollowed && library.unpin_deleted(&id).is_some() {
+                log::warn!("harness unfollow-recorded: unfollowed, but the pin may remain");
             }
         }
     }

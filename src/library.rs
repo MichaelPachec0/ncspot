@@ -296,8 +296,8 @@ impl Library {
 
         self.drop_deleted(id);
         self.trigger_redraw();
-        if !self.unpin_deleted(id) {
-            self.post_note(PIN_LEFT_NOTE);
+        if let Some(note) = self.unpin_deleted(id) {
+            self.post_note(note);
         }
         #[cfg(feature = "mpris")]
         self.spotify
@@ -333,13 +333,29 @@ impl Library {
     }
 
     /// After a playlist is deleted: remove its pin when the server's pin set lists it (never
-    /// decided from the layout), retrying a failed unpin once. False when a pin is left.
-    pub fn unpin_deleted(&self, id: &str) -> bool {
+    /// decided from the layout). The set read and a failed unpin are each retried once; the
+    /// retry of an unpin first re-reads the set and is done when the pin is gone. Returns the
+    /// note to post when the pin may or does remain.
+    pub fn unpin_deleted(&self, id: &str) -> Option<&'static str> {
         let api = &self.spotify.api;
-        let listed = pin_listed(id, api.internal_usable(Area::Playlists), || {
-            api.collection_page_all(Area::Playlists, SET_PIN)
-        });
-        !listed || unpin_with_retry(|| self.unpin_playlist(id))
+        let usable = api.internal_usable(Area::Playlists);
+        let read = || api.collection_page_all(Area::Playlists, SET_PIN);
+        match pin_listing(id, usable, read) {
+            PinListing::NotListed => None,
+            PinListing::Unknown => Some(PIN_MAYBE_LEFT_NOTE),
+            PinListing::Listed => {
+                let mut tries = 0;
+                let removed = unpin_with_retry(|| {
+                    tries += 1;
+                    if tries > 1 && pin_listing(id, usable, read) == PinListing::NotListed {
+                        PinOutcome::Done
+                    } else {
+                        self.unpin_playlist(id)
+                    }
+                });
+                (!removed).then_some(PIN_LEFT_NOTE)
+            }
+        }
     }
 
     /// Pin playlist `id`. Internal API only (no Web fallback).
@@ -2690,18 +2706,34 @@ pub fn pin_note(outcome: &PinOutcome) -> Option<&'static str> {
 /// The note for a delete that left its pin behind.
 const PIN_LEFT_NOTE: &str = "Deleted, but the pin could not be removed";
 
-/// Whether the server's pin set lists playlist `id`. False when the area is unusable or the
-/// read fails (nothing to unpin that we know of).
-fn pin_listed(
+/// The note for a delete whose pin state could not be read.
+const PIN_MAYBE_LEFT_NOTE: &str = "Deleted, but the pin may not have been removed";
+
+/// What the server's pin set says about one playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PinListing {
+    Listed,
+    NotListed,
+    /// The read failed twice.
+    Unknown,
+}
+
+/// Whether the server's pin set lists playlist `id`. An unusable area has no pins we can
+/// touch (`NotListed`); a failed read is retried once, then `Unknown`.
+fn pin_listing(
     id: &str,
     usable: bool,
-    read: impl FnOnce() -> Result<crate::internal_api::collection::Listing, InternalError>,
-) -> bool {
+    mut read: impl FnMut() -> Result<crate::internal_api::collection::Listing, InternalError>,
+) -> PinListing {
     if !usable {
-        return false;
+        return PinListing::NotListed;
     }
     let uri = format!("{PLAYLIST_URI_PREFIX}{id}");
-    read().is_ok_and(|listing| listing.items.iter().any(|i| i.uri == uri))
+    match read().or_else(|_| read()) {
+        Ok(listing) if listing.items.iter().any(|i| i.uri == uri) => PinListing::Listed,
+        Ok(_) => PinListing::NotListed,
+        Err(_) => PinListing::Unknown,
+    }
 }
 
 /// Whether `id` is pinned: the layout's `Pinned` entries when the layout is not empty, else
@@ -2713,7 +2745,10 @@ fn pinned_in_layout_or_set(
     read: impl FnOnce() -> Result<crate::internal_api::collection::Listing, InternalError>,
 ) -> bool {
     if layout.is_empty() {
-        pin_listed(id, usable, read)
+        let mut read = Some(read);
+        pin_listing(id, usable, || {
+            read.take().map_or(Err(InternalError::NoSession), |r| r())
+        }) == PinListing::Listed
     } else {
         layout
             .iter()
@@ -2721,9 +2756,14 @@ fn pinned_in_layout_or_set(
     }
 }
 
-/// Run an unpin; when it does not end `Done`, run it once more. True when one succeeded.
+/// Run an unpin; when it fails in a way a retry could change, run it once more. True when
+/// one succeeded.
 fn unpin_with_retry(mut unpin: impl FnMut() -> PinOutcome) -> bool {
-    unpin() == PinOutcome::Done || unpin() == PinOutcome::Done
+    match unpin() {
+        PinOutcome::Done => true,
+        PinOutcome::NeedsInternal | PinOutcome::Full => false,
+        _ => unpin() == PinOutcome::Done,
+    }
 }
 
 /// Whether one more item fits in a pin set that holds `pinned_count`.
@@ -3438,6 +3478,53 @@ mod test {
         let fresh = library.fresh_playlists.read().unwrap();
         assert!(!fresh.contains("p"));
         assert!(fresh.contains("q"));
+    }
+
+    #[test]
+    fn pin_listing_retries_a_failed_read_once() {
+        let mut calls = 0;
+        let l = pin_listing("p", true, || {
+            calls += 1;
+            if calls == 1 {
+                Err(InternalError::NoSession)
+            } else {
+                Ok(pin_items(&["spotify:playlist:p"]))
+            }
+        });
+        assert_eq!((l, calls), (PinListing::Listed, 2));
+        let mut calls = 0;
+        let l = pin_listing("p", true, || {
+            calls += 1;
+            Err(InternalError::NoSession)
+        });
+        assert_eq!((l, calls), (PinListing::Unknown, 2));
+        let l = pin_listing("p", false, || panic!("read"));
+        assert_eq!(l, PinListing::NotListed);
+    }
+
+    #[test]
+    fn unpinning_an_unpinned_playlist_is_done() {
+        let (outcome, _) = run_pin_change(
+            false,
+            "spotify:playlist:p",
+            true,
+            || Ok(pin_items(&["spotify:playlist:q"])),
+            || Ok(()),
+            |_| {},
+        );
+        assert_eq!(outcome, PinOutcome::Done);
+    }
+
+    #[test]
+    fn unpin_does_not_retry_what_a_retry_cannot_change() {
+        for o in [PinOutcome::NeedsInternal, PinOutcome::Full] {
+            let mut calls = 0;
+            assert!(!unpin_with_retry(|| {
+                calls += 1;
+                o.clone()
+            }));
+            assert_eq!(calls, 1);
+        }
     }
 
     #[test]
