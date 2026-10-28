@@ -249,21 +249,18 @@ impl Library {
         self.ev.send(Event::StatusNote(note.to_string()));
     }
 
-    /// Post the status note of a failed internal playlist edit, if it has one, and turn the
-    /// error into its fallback class.
-    pub fn edit_failed(&self, err: EditError) -> InternalError {
-        if let Some(note) = err.note() {
-            self.post_note(&note);
+    /// Finish one playlist write: when it failed, post exactly one note, the specific one an
+    /// edit collected in `note` or else [GENERIC_WRITE_NOTE]. Nothing is posted on success, so
+    /// an internal failure that the Web API then recovered stays silent. Returns `written`.
+    pub fn settle_write(&self, written: bool, note: &Cell<Option<String>>) -> bool {
+        if !written {
+            self.post_note(
+                &note
+                    .take()
+                    .unwrap_or_else(|| GENERIC_WRITE_NOTE.to_string()),
+            );
         }
-        InternalError::from(err)
-    }
-
-    /// [Library::edit_failed] for a rootlist edit (create, follow, delete).
-    fn rootlist_edit_failed(&self, err: EditError) -> InternalError {
-        if let Some(note) = rootlist_note(&err) {
-            self.post_note(&note);
-        }
-        InternalError::from(err)
+        written
     }
 
     /// Delete (unfollow) the playlist with the given `id` if it exists: the internal API
@@ -280,13 +277,14 @@ impl Library {
         }
 
         let api = &self.spotify.api;
+        let note = Cell::new(None);
         let written = write_through(
             api,
             Area::Playlists,
-            || playlist_edit::unfollow(api, id).map_err(|err| self.rootlist_edit_failed(err)),
+            || playlist_edit::unfollow(api, id).map_err(|err| rootlist_edit_failed(err, &note)),
             || api.delete_playlist(id).is_ok(),
         );
-        if !written {
+        if !self.settle_write(written, &note) {
             return;
         }
 
@@ -418,12 +416,13 @@ impl Library {
     pub fn create_playlist(&self, name: &str) -> Option<String> {
         let api = &self.spotify.api;
         let created: RefCell<Option<Playlist>> = RefCell::new(None);
+        let note = Cell::new(None);
         let written = write_through(
             api,
             Area::Playlists,
             || {
                 let playlist = playlist_edit::create(api, name)
-                    .map_err(|err| self.rootlist_edit_failed(err))?;
+                    .map_err(|err| rootlist_edit_failed(err, &note))?;
                 *created.borrow_mut() = Some(playlist);
                 Ok(())
             },
@@ -441,6 +440,7 @@ impl Library {
                 Err(()) => false,
             },
         );
+        self.settle_write(written, &note);
         let mut playlist = created.into_inner().filter(|_| written)?;
         playlist.owner_name.clone_from(&self.display_name);
         let id = playlist.id.clone();
@@ -455,6 +455,7 @@ impl Library {
         let api = &self.spotify.api;
         let known = || self.known_playables();
         let web_used = Cell::new(false);
+        let note = Cell::new(None);
         let written = write_through(
             api,
             Area::Playlists,
@@ -472,7 +473,7 @@ impl Library {
                     if err.stores_copy() {
                         self.playlist_update(&playlist);
                     }
-                    self.edit_failed(err)
+                    edit_failed(err, &note)
                 })?;
                 self.playlist_update(&playlist);
                 Ok(())
@@ -484,6 +485,7 @@ impl Library {
             },
         );
 
+        self.settle_write(written, &note);
         if written && web_used.get() && self.fetch_playlists(false).listing_complete {
             self.save_cache(
                 &config::cache_path(CACHE_PLAYLISTS),
@@ -2069,16 +2071,17 @@ impl Library {
         }
 
         let api = &self.spotify.api;
+        let note = Cell::new(None);
         let written = write_through(
             api,
             Area::Playlists,
             || {
                 playlist_edit::follow(api, &playlist.id)
-                    .map_err(|err| self.rootlist_edit_failed(err))
+                    .map_err(|err| rootlist_edit_failed(err, &note))
             },
             || api.user_playlist_follow_playlist(&playlist.id).is_ok(),
         );
-        if !written {
+        if !self.settle_write(written, &note) {
             return;
         }
 
@@ -2588,6 +2591,23 @@ fn episode_write(api: &WebApi, uris: &[String], removed: bool) -> bool {
             false
         }
     }
+}
+
+/// The status note shown for a failed playlist write that has no specific one.
+const GENERIC_WRITE_NOTE: &str = "Could not change the playlist";
+
+/// Collect the status note of a failed internal playlist edit, if it has one, and turn the
+/// error into its fallback class. The note is posted by [Library::settle_write] only if the
+/// whole write fails, since the Web API may still recover it.
+pub(crate) fn edit_failed(err: EditError, note: &Cell<Option<String>>) -> InternalError {
+    note.set(err.note());
+    InternalError::from(err)
+}
+
+/// [edit_failed] for a rootlist edit (create, follow, delete).
+fn rootlist_edit_failed(err: EditError, note: &Cell<Option<String>>) -> InternalError {
+    note.set(rootlist_note(&err));
+    InternalError::from(err)
 }
 
 /// The status note of a failed rootlist edit (create, follow, delete): its moves and
@@ -3171,16 +3191,22 @@ mod test {
     }
 
     #[test]
-    fn a_failed_edit_posts_its_note_and_keeps_its_class() {
+    fn a_failed_write_posts_its_collected_note_once() {
         let library = test_library();
-        let err = library.edit_failed(EditError::Moved);
+        let note = Cell::new(None);
+        let err = edit_failed(EditError::Moved, &note);
         assert!(matches!(err, InternalError::Transient(_)));
-        let err = library.edit_failed(EditError::Partial {
-            added: 1,
-            total: 3,
-            unconfirmed: false,
-        });
+        assert!(!library.settle_write(false, &note));
+        let err = edit_failed(
+            EditError::Partial {
+                added: 1,
+                total: 3,
+                unconfirmed: false,
+            },
+            &note,
+        );
         assert!(matches!(err, InternalError::Transient(_)));
+        library.settle_write(false, &note);
         assert_eq!(
             posted_notes(&library),
             vec!["Playlist changed, try again", "Added 1 of 3 tracks"]
@@ -3188,26 +3214,42 @@ mod test {
     }
 
     #[test]
-    fn an_edit_without_a_note_posts_nothing() {
+    fn a_failed_write_without_a_note_posts_the_generic_one() {
         let library = test_library();
-        library.edit_failed(EditError::Internal(InternalError::NotFound));
+        let note = Cell::new(None);
+        edit_failed(EditError::Internal(InternalError::RateLimited), &note);
+        library.settle_write(false, &note);
+        library.settle_write(false, &Cell::new(None));
+        assert_eq!(
+            posted_notes(&library),
+            vec!["Could not change the playlist"; 2]
+        );
+    }
+
+    #[test]
+    fn a_web_fallback_that_recovers_posts_nothing() {
+        let library = test_library();
+        let note = Cell::new(None);
+        edit_failed(EditError::Refused(InternalError::Denied), &note);
+        assert!(library.settle_write(true, &note));
         assert!(posted_notes(&library).is_empty());
     }
 
     #[test]
-    fn a_failed_rootlist_edit_posts_a_list_note() {
-        let library = test_library();
-        library.rootlist_edit_failed(EditError::Moved);
-        library.rootlist_edit_failed(EditError::Mismatch);
-        library.rootlist_edit_failed(EditError::Refused(InternalError::Denied));
+    fn a_failed_rootlist_edit_collects_a_list_note() {
+        let note = Cell::new(None);
+        rootlist_edit_failed(EditError::Moved, &note);
         assert_eq!(
-            posted_notes(&library),
-            vec![
-                "Playlist list changed, try again",
-                "Playlist list changed elsewhere; the change may have applied",
-                "Spotify refused the change",
-            ]
+            note.take().as_deref(),
+            Some("Playlist list changed, try again")
         );
+        rootlist_edit_failed(EditError::Mismatch, &note);
+        assert_eq!(
+            note.take().as_deref(),
+            Some("Playlist list changed elsewhere; the change may have applied")
+        );
+        rootlist_edit_failed(EditError::Refused(InternalError::Denied), &note);
+        assert_eq!(note.take().as_deref(), Some("Spotify refused the change"));
     }
 
     #[test]
@@ -3482,6 +3524,11 @@ mod test {
         })];
         list.append_tracks(&new, &spotify, &library);
         assert_eq!(list.tracks.as_ref().map(Vec::len), Some(0));
+        assert_eq!(
+            posted_notes(&library),
+            vec!["Could not change the playlist"],
+            "a failed append posts one note"
+        );
     }
 
     #[test]

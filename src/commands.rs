@@ -290,6 +290,7 @@ impl CommandManager {
             Command::NewPlaylist(name) => {
                 if self.library.create_playlist(name).is_none() {
                     error!("could not create playlist {name}");
+                    return Err("Could not change the playlist".to_string());
                 }
                 Ok(None)
             }

@@ -11,7 +11,7 @@ use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 
 use crate::internal_api::Area;
 use crate::internal_api::fallback::{Action, decide_after, run_with_fallback};
-use crate::library::write_through;
+use crate::library::{edit_failed, write_through};
 use crate::model::playable::Playable;
 use crate::model::track::Track;
 use crate::playlist_edit;
@@ -160,6 +160,7 @@ impl Playlist {
         let web_used = Cell::new(false);
         let id = self.id.clone();
         let snapshot_id = self.snapshot_id.clone();
+        let note = Cell::new(None);
         let written = write_through(
             api,
             Area::Playlists,
@@ -169,7 +170,7 @@ impl Playlist {
                     if err.stores_copy() || self.snapshot_id != snapshot_id {
                         library.playlist_update(self);
                     }
-                    library.edit_failed(err)
+                    edit_failed(err, &note)
                 })
             },
             || {
@@ -178,7 +179,7 @@ impl Playlist {
             },
         );
 
-        if written {
+        if library.settle_write(written, &note) {
             if web_used.get() {
                 match &mut self.tracks {
                     Some(tracks) => {

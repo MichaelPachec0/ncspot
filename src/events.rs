@@ -24,10 +24,10 @@ pub enum Event {
     PersonalClientDisabled {
         reason: String,
     },
-    /// An internal API area hit a protocol change and uses the Web API for the rest of the
-    /// session.
     /// A failed action's status note, shown like a failed command's message.
     StatusNote(String),
+    /// An internal API area hit a protocol change and uses the Web API for the rest of the
+    /// session.
     InternalApiFallback {
         area: &'static str,
         reason: String,
