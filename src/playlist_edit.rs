@@ -246,6 +246,9 @@ pub enum EditError {
     /// The rootlist read stopped at the page cap, so a copy of the playlist may lie past it;
     /// nothing was sent.
     TooLong,
+    /// A delete removed at least one rootlist copy, then a later step failed: the playlist
+    /// may still be in the library, and the action is never repeated through the Web API.
+    PartlyDeleted,
     /// An add stopped after `added` of `total` tracks: the verified batches applied, the local
     /// copy holds them (or the server's copy, when a later batch did not verify). `unconfirmed`
     /// when the failed batch may have applied too.
@@ -266,6 +269,7 @@ impl EditError {
             Self::Moved => "moved",
             Self::Mismatch => "mismatch",
             Self::TooLong => "too_long",
+            Self::PartlyDeleted => "partly_deleted",
             Self::Partial { .. } => "partial",
         }
     }
@@ -279,6 +283,7 @@ impl EditError {
             Self::Unverified(_) => "Could not confirm the change; it may have applied",
             Self::Refused(_) => "Spotify refused the change",
             Self::TooLong => "Playlist list too long to edit",
+            Self::PartlyDeleted => "Removed some copies; the playlist is still in your library",
             Self::Partial {
                 added,
                 total,
@@ -323,6 +328,9 @@ impl From<EditError> for InternalError {
             EditError::Moved => Self::Transient("the selected item moved".into()),
             EditError::Mismatch => Self::Transient("the playlist changed during the write".into()),
             EditError::TooLong => Self::Transient("the playlist list is too long to edit".into()),
+            EditError::PartlyDeleted => {
+                Self::Transient("only some copies of the playlist were removed".into())
+            }
             EditError::Partial { .. } => Self::Transient("only part of the add applied".into()),
         }
     }
@@ -855,10 +863,9 @@ pub fn created_playlist(created: &Created, name: &str, owner: Option<&str>) -> P
     }
 }
 
-/// A failure once part of the action applied (the playlist exists, a rootlist copy was
-/// removed): it must never lead to a repeat through the Web API, so even an error from before
-/// the next POST counts as [EditError::Unverified].
-fn after_applied(err: EditError) -> EditError {
+/// A failure once the playlist exists: it must never lead to a second create through the Web
+/// API, so even an error from before the rootlist POST counts as [EditError::Unverified].
+fn after_create(err: EditError) -> EditError {
     match err {
         EditError::Internal(err) => EditError::Unverified(err),
         other => other,
@@ -904,7 +911,7 @@ pub fn create(api: &WebApi, name: &str) -> Result<Playlist, EditError> {
         Ok(()) => Ok(playlist),
         Err(err) => {
             warn!("Playlist created but not added to your library");
-            Err(after_applied(err))
+            Err(after_create(err))
         }
     }
 }
@@ -946,9 +953,9 @@ fn rootlist_copies(rootlist: &Rootlist, id: &str) -> usize {
 /// before any POST ([EditError::TooLong]).
 ///
 /// Every POST after the first verified remove is a later POST, and any failure after it is
-/// never repeated through the Web API ([after_applied]). At most as many removes are sent as
-/// the first read listed copies; one still listed after them fails with
-/// [EditError::Mismatch] (the list changed elsewhere).
+/// [EditError::PartlyDeleted] (never repeated through the Web API; the next sync reconciles
+/// the store). At most as many removes are sent as the first read listed copies; one still
+/// listed after them fails with [EditError::Mismatch] (the list changed elsewhere).
 pub fn unfollow(api: &impl PlaylistServer, id: &str) -> Result<(), EditError> {
     let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
     let mut removed = 0;
@@ -961,7 +968,13 @@ pub fn unfollow(api: &impl PlaylistServer, id: &str) -> Result<(), EditError> {
         };
         let fail = |err: EditError| match post {
             Post::First => err,
-            Post::Later => after_applied(err),
+            Post::Later => {
+                warn!(
+                    "Removed {removed} rootlist copies, then the delete failed ({})",
+                    err.class()
+                );
+                EditError::PartlyDeleted
+            }
         };
         spaced(&mut spacer);
         let rootlist = api.playlist_rootlist().map_err(|err| fail(err.into()))?;
@@ -972,21 +985,24 @@ pub fn unfollow(api: &impl PlaylistServer, id: &str) -> Result<(), EditError> {
                 }
                 return Ok(());
             }
-            RootlistStep::Incomplete => return Err(EditError::TooLong),
+            RootlistStep::Incomplete => return Err(fail(EditError::TooLong)),
             RootlistStep::Remove(index) => index,
         };
         if removed >= *listed.get_or_insert_with(|| rootlist_copies(&rootlist, id)) {
             warn!("Playlist still in the rootlist after removing every copy listed");
-            return Err(EditError::Mismatch);
+            return Err(fail(EditError::Mismatch));
         }
         // The index walks the raw items, so it is the playlist's own; it must also lie inside
         // the listing the service reported.
         if index >= rootlist.length {
-            return Err(EditError::Moved);
+            return Err(fail(EditError::Moved));
         }
         let base = root_base(&rootlist).map_err(|err| fail(err.into()))?;
-        let expected = expected_len(base.length, Change::Remove).ok_or(EditError::Moved)?;
-        send_rootlist_verified(api, post, base, rootlist_remove_op(index), expected)?;
+        let expected = expected_len(base.length, Change::Remove)
+            .ok_or(EditError::Moved)
+            .map_err(fail)?;
+        send_rootlist_verified(api, post, base, rootlist_remove_op(index), expected)
+            .map_err(fail)?;
         removed += 1;
     }
 }
@@ -1484,7 +1500,7 @@ mod tests {
             EditError::Refused(InternalError::NotFound),
             EditError::Mismatch,
         ] {
-            let after = after_applied(err);
+            let after = after_create(err);
             assert!(!matches!(after, EditError::Internal(_)));
             assert_eq!(decide_after(&InternalError::from(after)), Action::Fail);
         }
@@ -2135,33 +2151,42 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_after_the_first_remove_never_falls_back() {
+    fn a_failure_after_the_first_remove_is_a_partial_delete() {
         use crate::internal_api::fallback::{Action, decide_after};
-        // The re-read, the later POST and its verify read each fail in turn.
+        // After one verified remove, the re-read, the later POST, its verify read, or a re-read
+        // that stopped at the page cap fails in turn.
+        let first = || Ok(rootlist_of("r1", &["p", "p"]));
+        let verified = || Ok(root_head("r2", 1));
         let reread = Fake::default()
+            .rootlists([first(), Err(InternalError::NoSession)])
+            .posts([Ok(())])
+            .root_heads([verified()]);
+        let later_post = Fake::default()
+            .rootlists([first(), Ok(rootlist_of("r2", &["p"]))])
+            .posts([Ok(()), Err(InternalError::NotFound)])
+            .root_heads([verified()]);
+        let later_verify = Fake::default()
+            .rootlists([first(), Ok(rootlist_of("r2", &["p"]))])
+            .posts([Ok(()), Ok(())])
+            .root_heads([verified(), Err(InternalError::NoSession)]);
+        let too_long = Fake::default()
             .rootlists([
-                Ok(rootlist_of("r1", &["p", "p"])),
-                Err(InternalError::NoSession),
+                first(),
+                Ok(Rootlist {
+                    length: 7000,
+                    ..rootlist_of("r2", &["p"])
+                }),
             ])
             .posts([Ok(())])
-            .root_heads([Ok(root_head("r2", 1))]);
-        let later_post = Fake::default()
-            .rootlists([
-                Ok(rootlist_of("r1", &["p", "p"])),
-                Ok(rootlist_of("r2", &["p"])),
-            ])
-            .posts([Ok(()), Err(InternalError::NotFound)])
-            .root_heads([Ok(root_head("r2", 1))]);
-        let later_verify = Fake::default()
-            .rootlists([
-                Ok(rootlist_of("r1", &["p", "p"])),
-                Ok(rootlist_of("r2", &["p"])),
-            ])
-            .posts([Ok(()), Ok(())])
-            .root_heads([Ok(root_head("r2", 1)), Err(InternalError::NoSession)]);
-        for api in [reread, later_post, later_verify] {
+            .root_heads([verified()]);
+        for api in [reread, later_post, later_verify, too_long] {
             let err = unfollow(&api, "p").expect_err("failed after a remove");
-            assert!(matches!(err, EditError::Unverified(_)), "{err:?}");
+            assert!(matches!(err, EditError::PartlyDeleted), "{err:?}");
+            assert_eq!(
+                err.note().as_deref(),
+                Some("Removed some copies; the playlist is still in your library")
+            );
+            assert!(!err.stores_copy());
             assert_eq!(decide_after(&InternalError::from(err)), Action::Fail);
         }
     }
@@ -2179,15 +2204,17 @@ mod tests {
 
     #[test]
     fn a_copy_still_listed_after_every_listed_remove_fails() {
-        // One copy listed, removed and verified; the next read lists it again.
+        // One copy listed, removed and verified (r2, length 1); before the re-read another
+        // client adds it again at the top (r3, length 2).
         let api = Fake::default()
             .rootlists([
                 Ok(rootlist_of("r1", &["a", "p"])),
-                Ok(rootlist_of("r2", &["p", "a"])),
+                Ok(rootlist_of("r3", &["p", "a"])),
             ])
             .posts([Ok(())])
             .root_heads([Ok(root_head("r2", 1))]);
-        assert!(matches!(unfollow(&api, "p"), Err(EditError::Mismatch)));
+        // Past the first remove, the cap's mismatch is a partial delete.
+        assert!(matches!(unfollow(&api, "p"), Err(EditError::PartlyDeleted)));
         assert_eq!(api.removed_at(), [Some(1)]);
     }
 }

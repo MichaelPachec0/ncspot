@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::iter::Iterator;
 use std::path::Path;
@@ -90,6 +90,9 @@ pub struct Library {
     /// The Playlists tab layout from the last complete internal sync; only meaningful while
     /// the internal API playlists area is usable.
     pub playlist_layout: Arc<RwLock<Vec<LayoutEntry>>>,
+    /// Playlists created here that no complete listing has shown yet: a listing read right
+    /// after a create may lag behind it, so a sync never prunes them until one lists them.
+    fresh_playlists: Arc<RwLock<HashSet<String>>>,
     pub shows: Arc<RwLock<Vec<Show>>>,
     /// Saved episodes (Your Episodes), filled only over the internal API.
     pub episodes: Arc<RwLock<Vec<Episode>>>,
@@ -128,6 +131,7 @@ impl Library {
             artists: Arc::new(RwLock::new(Vec::new())),
             playlists: Arc::new(RwLock::new(Vec::new())),
             playlist_layout: Arc::new(RwLock::new(Vec::new())),
+            fresh_playlists: Arc::new(RwLock::new(HashSet::new())),
             shows: Arc::new(RwLock::new(Vec::new())),
             episodes: Arc::new(RwLock::new(Vec::new())),
             episodes_enabled: false,
@@ -154,6 +158,7 @@ impl Library {
             artists: Arc::new(RwLock::new(Vec::new())),
             playlists: Arc::new(RwLock::new(Vec::new())),
             playlist_layout: Arc::new(RwLock::new(Vec::new())),
+            fresh_playlists: Arc::new(RwLock::new(HashSet::new())),
             shows: Arc::new(RwLock::new(Vec::new())),
             episodes: Arc::new(RwLock::new(Vec::new())),
             episodes_enabled: spotify.api.internal_enabled(Area::Library),
@@ -449,6 +454,7 @@ impl Library {
         let mut playlist = created.into_inner().filter(|_| written)?;
         playlist.owner_name.clone_from(&self.display_name);
         let id = playlist.id.clone();
+        self.fresh_playlists.write().unwrap().insert(id.clone());
         self.insert_new_playlist(playlist);
         if web_created.get() {
             let update = self.update_tab(&LibraryTab::Playlists);
@@ -972,6 +978,7 @@ impl Library {
             reconcile_playlists(
                 &mut self.playlists.write().unwrap(),
                 &known_at_start,
+                &mut self.fresh_playlists.write().unwrap(),
                 &list_order,
                 true,
             );
@@ -1120,6 +1127,7 @@ impl Library {
             reconcile_playlists(
                 &mut self.playlists.write().unwrap(),
                 &known_at_start,
+                &mut self.fresh_playlists.write().unwrap(),
                 &order,
                 true,
             );
@@ -2367,17 +2375,22 @@ fn sync_download(
 /// Remove local playlists that existed when the sync started (`known_at_start`) but are missing
 /// from `remote_ids`, and sort the rest in remote order. Only done when the remote listing was
 /// complete; a partial listing must never delete cached playlists, and a playlist created while
-/// the sync was running must survive.
+/// the sync was running must survive, as must a `fresh` one (created here, not listed yet). A
+/// fresh id the complete listing holds leaves `fresh`: from then on it is pruned as usual.
 fn reconcile_playlists(
     local: &mut Vec<Playlist>,
     known_at_start: &[String],
+    fresh: &mut HashSet<String>,
     remote_ids: &[String],
     listing_complete: bool,
 ) {
     if !listing_complete {
         return;
     }
-    local.retain(|p| !known_at_start.contains(&p.id) || remote_ids.contains(&p.id));
+    fresh.retain(|id| !remote_ids.contains(id));
+    local.retain(|p| {
+        !known_at_start.contains(&p.id) || remote_ids.contains(&p.id) || fresh.contains(&p.id)
+    });
     local.sort_by_key(|p| remote_ids.iter().position(|x| x == &p.id));
 }
 
@@ -2947,7 +2960,13 @@ mod test {
     fn incomplete_listing_keeps_all_cached_playlists() {
         let mut local = vec![playlist("a"), playlist("b"), playlist("c")];
         let known = ids_owned(&local);
-        reconcile_playlists(&mut local, &known, &["a".to_string()], false);
+        reconcile_playlists(
+            &mut local,
+            &known,
+            &mut HashSet::new(),
+            &["a".to_string()],
+            false,
+        );
         assert_eq!(ids(&local), ["a", "b", "c"]);
     }
 
@@ -2958,6 +2977,7 @@ mod test {
         reconcile_playlists(
             &mut local,
             &known,
+            &mut HashSet::new(),
             &["c".to_string(), "a".to_string()],
             true,
         );
@@ -2968,8 +2988,39 @@ mod test {
     fn playlist_created_during_sync_is_not_pruned() {
         let mut local = vec![playlist("a"), playlist("b"), playlist("new")];
         let known = vec!["a".to_string(), "b".to_string()];
-        reconcile_playlists(&mut local, &known, &["a".to_string()], true);
+        reconcile_playlists(
+            &mut local,
+            &known,
+            &mut HashSet::new(),
+            &["a".to_string()],
+            true,
+        );
         assert_eq!(ids(&local), ["new", "a"]);
+    }
+
+    #[test]
+    fn a_fresh_playlist_survives_until_a_complete_listing_shows_it() {
+        // Created just before the sync, so known at its start, but the listing lags.
+        let mut local = vec![playlist("new"), playlist("a")];
+        let known = ids_owned(&local);
+        let mut fresh = HashSet::from(["new".to_string()]);
+        reconcile_playlists(&mut local, &known, &mut fresh, &["a".to_string()], true);
+        assert_eq!(ids(&local), ["new", "a"]);
+        assert!(fresh.contains("new"), "still protected until listed");
+
+        // An incomplete listing changes nothing, protection included.
+        reconcile_playlists(&mut local, &known, &mut fresh, &["a".to_string()], false);
+        assert!(fresh.contains("new"));
+
+        // Listed once: no longer protected.
+        let listed = ["a".to_string(), "new".to_string()];
+        reconcile_playlists(&mut local, &known, &mut fresh, &listed, true);
+        assert!(fresh.is_empty());
+        assert_eq!(ids(&local), ["a", "new"]);
+
+        // A later complete listing without it prunes it as usual.
+        reconcile_playlists(&mut local, &known, &mut fresh, &["a".to_string()], true);
+        assert_eq!(ids(&local), ["a"]);
     }
 
     use std::sync::atomic::Ordering;
