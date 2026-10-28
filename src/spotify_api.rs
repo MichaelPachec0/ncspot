@@ -9,6 +9,7 @@ use crate::activity::ACTIVITY;
 use crate::application::ASYNC_RUNTIME;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use librespot_core::{Session, SpotifyUri};
+use librespot_protocol::playlist4_external::ListChanges;
 use log::{debug, error, info, warn};
 use rspotify::http::HttpError;
 use rspotify::model::{
@@ -28,7 +29,8 @@ use crate::internal_api::AreaCounts;
 use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
 use crate::internal_api::metadata::Missing;
-use crate::internal_api::playlist::{self, PlaylistItem, Rootlist};
+use crate::internal_api::playlist::{self, Head, PlaylistItem, RootHead, Rootlist};
+use crate::internal_api::playlist_write::{self, Created};
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -194,6 +196,11 @@ impl WebApi {
         self.user = user;
     }
 
+    /// The username set with [WebApi::set_user].
+    pub fn user_id(&self) -> Option<&str> {
+        self.user.as_deref()
+    }
+
     /// Set the sending end of the channel to the worker thread, managed by
     /// [Spotify](crate::spotify::Spotify).
     pub(crate) fn set_worker_channel(
@@ -267,13 +274,39 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
+        self.run_internal_with(area, true, internal)
+    }
+
+    /// Like [Self::run_internal] but the request is sent at most once on our side: no transient
+    /// retry and no waiting for a rate-limit window. For writes, which a retry could apply twice.
+    pub fn run_internal_once<T, F, Fut>(&self, area: Area, internal: F) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_internal_with(area, false, internal)
+    }
+
+    fn run_internal_with<T, F, Fut>(
+        &self,
+        area: Area,
+        may_retry: bool,
+        internal: F,
+    ) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
         if self.internal.skip(area) {
             return Err(InternalError::ProtocolChanged("area off or latched".into()));
         }
         let session = self.internal.session().ok_or(InternalError::NoSession)?;
         // Inside the runtime (MPRIS handlers, spawn_blocking) a sleeping retry would hold
         // a runtime thread, so treat it like the UI thread: no retries, no throttle waits.
-        let no_waits = is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
+        let no_waits =
+            !may_retry || is_ui_thread() || tokio::runtime::Handle::try_current().is_ok();
         // Held across retries so backoff sleeps and throttle waits count as loading.
         let _call = ACTIVITY.begin();
         let result = run_attempts(
@@ -293,11 +326,16 @@ impl WebApi {
     pub fn latch_area(&self, area: Area, err: &InternalError) {
         if self.internal.latch(area) {
             // The InternalApiFallback handler logs the warning with the user-facing text.
-            debug!("internal API {} latched to the Web API: {err}", area.name());
+            // The class only: error texts may carry endpoint paths with the username.
+            debug!(
+                "internal API {} latched to the Web API ({})",
+                area.name(),
+                err.class()
+            );
             if let Some(events) = &self.events {
                 events.try_send(Event::InternalApiFallback {
                     area: area.name(),
-                    reason: err.to_string(),
+                    reason: err.class().to_string(),
                 });
             }
         }
@@ -344,8 +382,44 @@ impl WebApi {
         self.run_internal(Area::Playlists, playlist::rootlist)
     }
 
-    /// The items of one playlist, by base62 id.
-    pub fn playlist_contents(&self, id: &str) -> Result<Vec<PlaylistItem>, InternalError> {
+    /// The head (revision, length, name) of one playlist, by base62 id, without its items.
+    pub fn playlist_head(&self, id: &str) -> Result<Head, InternalError> {
+        let id = id.to_string();
+        self.run_internal(Area::Playlists, |session| {
+            playlist::head(session, id.clone())
+        })
+    }
+
+    /// The rootlist revision and length, without entries.
+    pub fn rootlist_head(&self) -> Result<RootHead, InternalError> {
+        self.run_internal(Area::Playlists, playlist::rootlist_head)
+    }
+
+    /// Create a playlist named `name`. Sent once: a retried create would make a second playlist.
+    pub fn playlist_create(&self, name: &str) -> Result<Created, InternalError> {
+        let name = name.to_string();
+        self.run_internal_once(Area::Playlists, |session| {
+            playlist_write::create(session, name.clone())
+        })
+    }
+
+    /// Apply a change set to one playlist, by base62 id. Sent once, never retried.
+    pub fn playlist_changes(&self, id: &str, body: ListChanges) -> Result<(), InternalError> {
+        let id = id.to_string();
+        self.run_internal_once(Area::Playlists, |session| {
+            playlist_write::changes(session, id.clone(), body.clone())
+        })
+    }
+
+    /// Apply a change set to the rootlist. Sent once, never retried.
+    pub fn rootlist_changes(&self, body: ListChanges) -> Result<(), InternalError> {
+        self.run_internal_once(Area::Playlists, |session| {
+            playlist_write::rootlist_changes(session, body.clone())
+        })
+    }
+
+    /// The items of one playlist, by base62 id, with the head they were read at.
+    pub fn playlist_contents(&self, id: &str) -> Result<(Head, Vec<PlaylistItem>), InternalError> {
         let id = id.to_string();
         self.run_internal(Area::Playlists, |session| {
             playlist::contents(session, id.clone())
@@ -360,7 +434,18 @@ impl WebApi {
         id: &str,
         known: &HashMap<String, Playable>,
     ) -> Result<Vec<Playable>, InternalError> {
-        let items = self.playlist_contents(id)?;
+        self.playlist_playables_at(id, known)
+            .map(|(_, playables)| playables)
+    }
+
+    /// Like [WebApi::playlist_playables], with the head of the read the items come from (a
+    /// write checked against these items must be based on its revision).
+    pub fn playlist_playables_at(
+        &self,
+        id: &str,
+        known: &HashMap<String, Playable>,
+    ) -> Result<(Head, Vec<Playable>), InternalError> {
+        let (head, items) = self.playlist_contents(id)?;
         let wanted = playlist_items::unknown_uris(&items, known);
         let (episodes, tracks): (Vec<String>, Vec<String>) = wanted
             .into_iter()
@@ -372,9 +457,9 @@ impl WebApi {
         for episode in self.episodes_in(Area::Playlists, &episodes)? {
             fetched.insert(episode.uri.clone(), Playable::Episode(episode));
         }
-        Ok(playlist_items::assemble(&items, |uri| {
-            fetched.get(uri).or_else(|| known.get(uri))
-        }))
+        let playables =
+            playlist_items::assemble(&items, |uri| fetched.get(uri).or_else(|| known.get(uri)));
+        Ok((head, playables))
     }
 
     pub fn collection_delta(&self, set: &'static str, token: &str) -> Result<Delta, InternalError> {
@@ -384,18 +469,19 @@ impl WebApi {
         })
     }
 
-    /// Add or remove `uris` in a collection set: one internal call per [collection::WRITE_BATCH]
-    /// items. A failed batch stops the write; batches before it stay written, and the next
-    /// delta sync brings them into the store.
+    /// Add or remove `uris` in a collection set (calls count in `area`): one internal call per
+    /// [collection::WRITE_BATCH] items. A failed batch stops the write; batches before it stay
+    /// written, and the next delta sync brings them into the store.
     pub fn collection_write(
         &self,
+        area: Area,
         set: &'static str,
         uris: &[String],
         removed: bool,
     ) -> Result<(), InternalError> {
         for batch in uris.chunks(collection::WRITE_BATCH) {
             let batch = batch.to_vec();
-            self.run_internal(Area::Library, |session| {
+            self.run_internal(area, |session| {
                 collection::write(session, set, batch.clone(), removed)
             })?;
         }
@@ -1526,10 +1612,13 @@ mod test {
         let api = WebApi::new(&Config::new_for_test());
         let uris = vec!["spotify:track:4uLU6hMCjMI75M1A2tKUQC".to_string()];
         assert_eq!(
-            api.collection_write("collection", &uris, false),
+            api.collection_write(Area::Library, "collection", &uris, false),
             Err(InternalError::NoSession)
         );
-        assert_eq!(api.collection_write("collection", &[], true), Ok(()));
+        assert_eq!(
+            api.collection_write(Area::Library, "collection", &[], true),
+            Ok(())
+        );
     }
 
     #[test]
@@ -1573,6 +1662,18 @@ mod test {
             api.playlist_playables("37i9dQZF1DXcBWIGoYBM5M", &HashMap::new()),
             Err(InternalError::NoSession)
         ));
+    }
+
+    #[test]
+    fn playlist_writes_without_a_session_are_no_session() {
+        let api = WebApi::new(&crate::config::Config::new_for_test());
+        assert_eq!(api.playlist_create("x"), Err(InternalError::NoSession));
+        let body = playlist_write::list_changes(Vec::new(), Vec::new());
+        assert_eq!(
+            api.playlist_changes("37i9dQZF1DXcBWIGoYBM5M", body.clone()),
+            Err(InternalError::NoSession)
+        );
+        assert_eq!(api.rootlist_changes(body), Err(InternalError::NoSession));
     }
 
     #[test]

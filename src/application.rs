@@ -439,6 +439,10 @@ impl Application {
                             });
                         }
                     }
+                    Event::StatusNote(note) => {
+                        self.cursive
+                            .on_layout(|_, mut layout| layout.set_result(Err(note)));
+                    }
                     Event::InternalApiFallback { area, reason } => {
                         let message = format!(
                             "Spotify internal API changed, using the Web API for {area}: {reason}"

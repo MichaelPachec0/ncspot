@@ -209,9 +209,13 @@ impl CommandManager {
                 Ok(None)
             }
             Command::UpdateLibrary => {
-                self.library.update_library();
+                self.library.update_library(true);
                 Ok(None)
             }
+            // The Playlists tab and the playlist view handle these while on screen.
+            Command::Pin | Command::Unpin => Ok(Some(crate::ui::playlists::PIN_HINT.to_string())),
+            // The library view handles it while on screen.
+            Command::UpdateTab => Ok(Some(crate::ui::library::UPDATE_TAB_HINT.to_string())),
             Command::TogglePlay => {
                 self.queue.toggleplayback();
                 Ok(None)
@@ -284,9 +288,9 @@ impl CommandManager {
                 Ok(None)
             }
             Command::NewPlaylist(name) => {
-                match self.spotify.api.create_playlist(name, None, None) {
-                    Ok(_) => self.library.update_library(),
-                    Err(_) => error!("could not create playlist {name}"),
+                if self.library.create_playlist(name).is_none() {
+                    // create_playlist already posted the failure note.
+                    debug!("could not create playlist");
                 }
                 Ok(None)
             }
@@ -413,8 +417,14 @@ impl CommandManager {
                                 matches!(e, crate::playlist_layout::LayoutEntry::Playlist(_))
                             })
                             .count(),
+                        last_test_len: crate::harness::last_test_len(&self.library),
                     },
                 );
+                let mut dump = dump;
+                if crate::harness::take_test_playlists_request() {
+                    dump.test_playlists =
+                        crate::harness::test_playlist_names(&self.library, &self.spotify)?;
+                }
                 crate::harness::write_dump(std::path::Path::new(path), &dump).map_err(|e| {
                     error!("harness dump to {path} failed: {e}");
                     format!("harness dump failed: {e}")
@@ -438,6 +448,36 @@ impl CommandManager {
                         v.select_tab(&tab)
                     });
                 }
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::NewPlaylistTest) => {
+                crate::harness::new_playlist_test(&self.library)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::TestPlaylists) => {
+                crate::harness::request_test_playlists();
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::PlaylistAddTest(n)) => {
+                crate::harness::playlist_add_test(&self.library, &self.spotify, *n)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::PlaylistRemoveTest(index)) => {
+                crate::harness::playlist_remove_test(&self.library, &self.spotify, *index)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::PlaylistOverwriteTest(n)) => {
+                crate::harness::playlist_overwrite_test(&self.library, *n)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::UnfollowRecorded(n)) => {
+                crate::harness::unfollow_recorded(&self.library, &self.spotify, *n)?;
                 Ok(None)
             }
             #[cfg(feature = "harness")]
@@ -604,6 +644,7 @@ impl CommandManager {
         kb.insert("q".into(), vec![Command::Quit]);
         kb.insert("Ctrl+l".into(), vec![Command::Redraw]);
         kb.insert("Shift+p".into(), vec![Command::TogglePlay]);
+        kb.insert("u".into(), vec![Command::UpdateTab]);
         kb.insert("Shift+u".into(), vec![Command::UpdateLibrary]);
         kb.insert("Shift+s".into(), vec![Command::Stop]);
         kb.insert("<".into(), vec![Command::Previous]);
@@ -845,7 +886,21 @@ impl CommandManager {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_COUNT, accumulate_count};
+    use super::{CommandManager, MAX_COUNT, accumulate_count};
+    use crate::command::Command;
+
+    #[test]
+    fn u_updates_the_tab_and_shift_u_the_whole_library() {
+        let kb = CommandManager::default_keybindings();
+        assert!(matches!(
+            kb.get("u").map(Vec::as_slice),
+            Some([Command::UpdateTab])
+        ));
+        assert!(matches!(
+            kb.get("Shift+u").map(Vec::as_slice),
+            Some([Command::UpdateLibrary])
+        ));
+    }
 
     #[test]
     fn accumulates_digits() {

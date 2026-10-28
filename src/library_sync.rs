@@ -22,6 +22,12 @@ pub(crate) fn full_fetch_due(last: Option<i64>, now: i64) -> bool {
     }
 }
 
+/// Whether a list needs a full fetch now: when one was requested (`forced`), or when
+/// [full_fetch_due] says so for its last full fetch at `last`.
+pub(crate) fn full_fetch_needed(forced: bool, last: Option<i64>, now: i64) -> bool {
+    forced || full_fetch_due(last, now)
+}
+
 /// One item of a saved-list page, reduced to what the sync shortcuts need.
 #[derive(Clone, Debug)]
 pub(crate) struct SavedItem<T> {
@@ -428,6 +434,14 @@ mod test {
     fn full_fetch_due_when_the_clock_went_backwards() {
         let now = 1_000_000;
         assert!(full_fetch_due(Some(now + 3600), now));
+    }
+
+    #[test]
+    fn a_forced_full_fetch_is_needed_even_when_not_due() {
+        let now = 1_000_000;
+        assert!(full_fetch_needed(true, Some(now), now));
+        assert!(!full_fetch_needed(false, Some(now), now));
+        assert!(full_fetch_needed(false, None, now));
     }
 
     // force_full

@@ -33,6 +33,7 @@ mod lyrics;
 mod model;
 mod panic;
 mod pending_load;
+mod playlist_edit;
 mod playlist_items;
 mod playlist_layout;
 #[cfg(test)]
@@ -46,6 +47,8 @@ mod spotify;
 mod spotify_api;
 mod spotify_url;
 mod spotify_worker;
+#[cfg(any(test, feature = "harness"))]
+mod test_playlists;
 mod theme;
 mod traits;
 mod ui;

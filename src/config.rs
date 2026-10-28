@@ -609,7 +609,13 @@ pub fn config_path(file: &str) -> PathBuf {
 ///
 /// This doesn't create the file, only the containing directory.
 pub fn cache_path(file: &str) -> PathBuf {
-    let cache_dir = user_cache_directory().unwrap();
+    // Unit tests get a folder of their own, so a test that saves a store can never
+    // overwrite the user's caches.
+    let cache_dir = if cfg!(test) {
+        std::env::temp_dir().join(format!("ncspot-test-cache-{}", std::process::id()))
+    } else {
+        user_cache_directory().unwrap()
+    };
     if !cache_dir.exists() {
         fs::create_dir_all(&cache_dir).expect("can't create cache folder");
     }
@@ -691,6 +697,15 @@ mod test {
     use super::*;
 
     const PERSONAL_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn tests_never_use_the_user_cache_folder() {
+        let path = cache_path("playlists.db");
+        assert!(path.starts_with(std::env::temp_dir()));
+        if let Some(user) = user_cache_directory() {
+            assert!(!path.starts_with(user));
+        }
+    }
 
     #[test]
     fn episodes_tab_parses_from_its_config_name() {

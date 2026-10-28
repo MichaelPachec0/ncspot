@@ -9,6 +9,7 @@ pub mod error;
 pub mod fallback;
 pub mod metadata;
 pub mod playlist;
+pub mod playlist_write;
 
 #[cfg(test)]
 mod live_tests;

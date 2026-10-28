@@ -50,6 +50,8 @@ enum ContextMenuAction {
     PlayNext(Box<dyn ListItem>),
     TogglePlayback,
     Queue(Box<dyn ListItem>),
+    /// Pin (true) or unpin (false) the playlist with this id.
+    TogglePin(String, bool),
 }
 
 impl ContextMenu {
@@ -289,6 +291,19 @@ impl ContextMenu {
             );
         }
 
+        if let Some(id) = item.playlist_id()
+            && queue
+                .get_spotify()
+                .api
+                .internal_usable(crate::internal_api::Area::Playlists)
+        {
+            let pin = !library.is_pinned(&id);
+            content.add_item(
+                if pin { "Pin" } else { "Unpin" },
+                ContextMenuAction::TogglePin(id, pin),
+            );
+        }
+
         // open detail view of artist/album
         {
             let library = library.clone();
@@ -333,6 +348,11 @@ impl ContextMenu {
                     ContextMenuAction::PlayNext(item) => item.as_listitem().play_next(&queue),
                     ContextMenuAction::TogglePlayback => queue.toggleplayback(),
                     ContextMenuAction::Queue(item) => item.as_listitem().queue(&queue),
+                    ContextMenuAction::TogglePin(id, pin) => {
+                        if let Some(note) = library.pin_command(id, *pin) {
+                            s.call_on_name("main", |v: &mut Layout| v.set_result(Ok(Some(note))));
+                        }
+                    }
                 }
             });
         }

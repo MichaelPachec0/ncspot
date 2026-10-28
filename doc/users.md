@@ -107,7 +107,8 @@ One-shot, toggle and menu commands (e.g. <kbd>O</kbd>, <kbd>A</kbd>,
 | <kbd>D</kbd>                  | Remove the currently playing item from your library.           |
 | <kbd>Shift</kbd>+<kbd>P</kbd> | Toggle playback (i.e. Play/Pause).                             |
 | <kbd>Shift</kbd>+<kbd>S</kbd> | Stop playback.                                                 |
-| <kbd>Shift</kbd>+<kbd>U</kbd> | Update the library cache (tracks, artists, albums, playlists). |
+| <kbd>U</kbd>                  | Sync changes of the current library tab.                       |
+| <kbd>Shift</kbd>+<kbd>U</kbd> | Refetch the whole library (tracks, albums, playlists, ...).    |
 | <kbd><</kbd>                  | Play the previous track.                                       |
 | <kbd>></kbd>                  | Play the next track.                                           |
 | <kbd>F</kbd>                  | Seek forward by 1 second.                                      |
@@ -258,6 +259,10 @@ Note: \<FOO\> - mandatory arg; [BAR] - optional arg
 | `noop`                                                           | Do nothing. Useful for disabling default keybindings. See [custom keybindings](#custom-keybindings).                                                                                                                                                            |
 | `reload`                                                         | Reload the configuration from disk. See [Configuration](#configuration).                                                                                                                                                                                        |
 | `reconnect`                                                      | Reconnect to Spotify (useful when session has expired or connection was lost)                                                                                                                                                                                   |
+| `update`                                                         | Download the whole library again, ignoring what is cached.                                                                                                                                                                                                      |
+| `update tab`                                                     | Sync the changes of the current library tab only (tracks and albums sync together).                                                                                                                                                                             |
+| `pin`                                                            | Pin the selected playlist (Playlists tab or open playlist) to the top of the Playlists tab. At most 4 items can be pinned. Needs the internal API. |
+| `unpin`                                                          | Unpin the selected playlist. Needs the internal API. |
 | `add [current]`                                                  | Add selected track to playlist, if `current` is passed the currently playing track will be added                                                                                                                                                                |
 | `save [current]`                                                 | Save selected item, if `current` is passed the currently playing item will be saved                                                                                                                                                                             |
 
@@ -410,8 +415,11 @@ status bar shows `[rate limited: shared 42s]` and, if built with the `notify`
 feature, a desktop notification appears (disable it with
 `notify_rate_limit = false`).
 
-If a rate limit interrupts a library update, ncspot resumes it on its own
-once the limit has passed.
+At startup ncspot syncs only what changed in your library. <kbd>U</kbd>
+(`update tab`) does the same for the current library tab only;
+<kbd>Shift</kbd>+<kbd>U</kbd> (`update`) downloads the whole library again.
+If a rate limit interrupts the startup sync or a full update, ncspot resumes
+it on its own once the limit has passed, syncing only what is still missing.
 
 You can register your own Spotify app and give ncspot its client ID. Bulk
 traffic (playlist sync, library, track and album metadata) then uses your

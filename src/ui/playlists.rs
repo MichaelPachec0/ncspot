@@ -18,6 +18,9 @@ use crate::traits::ViewExt;
 use crate::ui::listview::ListView;
 use crate::ui::modal::Modal;
 
+/// Status note for `pin` and `unpin` where they have no playlist to act on.
+pub const PIN_HINT: &str = "pin works on a playlist";
+
 pub struct PlaylistsView {
     list: ListView<PlaylistRow>,
     rows: Arc<RwLock<Vec<PlaylistRow>>>,
@@ -105,6 +108,8 @@ fn acts_on_selection(cmd: &Command) -> bool {
         | Command::Save
         | Command::Add
         | Command::Delete
+        | Command::Pin
+        | Command::Unpin
         | Command::Goto(_) => true,
         Command::Open(TargetMode::Selected)
         | Command::ShowRecommendations(TargetMode::Selected) => true,
@@ -144,6 +149,11 @@ impl ViewExt for PlaylistsView {
         "Playlists".to_string()
     }
 
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        self.list.harness_state()
+    }
+
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         if acts_on_selection(cmd) && self.selected_is_header() {
             return Ok(CommandResult::Consumed(None));
@@ -154,6 +164,21 @@ impl ViewExt for PlaylistsView {
                 s.add_layer(dialog);
             }
             return Ok(CommandResult::Consumed(None));
+        }
+
+        if let Command::Pin | Command::Unpin = cmd {
+            let id = self
+                .rows
+                .read()
+                .unwrap()
+                .get(self.list.get_selected_index())
+                .and_then(PlaylistRow::playlist_id)
+                .map(str::to_string);
+            let note = match id {
+                Some(id) => self.library.pin_command(&id, matches!(cmd, Command::Pin)),
+                None => Some(PIN_HINT.to_string()),
+            };
+            return Ok(CommandResult::Consumed(note));
         }
 
         self.list.on_command(s, cmd)

@@ -28,11 +28,15 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REAL_CACHE = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "ncspot"
 )
+TEST_PLAYLISTS_FILE = os.path.join(REAL_CACHE, "test-playlists.txt")
 REAL_CONFIG = os.path.join(
     os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "ncspot"
 )
 SECRET_WORDS = ("token", "bearer", "auth")
 URI_RE = re.compile(r"(spotify[:/])([a-z]+)[:/][A-Za-z0-9]{22}")
+BARE_ID_RE = re.compile(r"(?<![A-Za-z0-9])[A-Za-z0-9]{22}(?![A-Za-z0-9])")
+# ncspot's IPC debug line prints the whole player status: track, artists, ids, cover URL.
+IPC_STATUS = "IPC Status update"
 STATUS_RE = re.compile(r"\[[^\]\n]*\]")
 SOCKET_WAIT = 15.0
 DUMP_WAIT = 15.0
@@ -130,8 +134,10 @@ def redact(lines, username):
         secret = any(w in low for w in SECRET_WORDS)
         if secret or (username and username in line):
             out.append("[redacted]")
+        elif IPC_STATUS in line:
+            out.append("[ipc status update]")
         else:
-            out.append(URI_RE.sub(r"\1\2:[id]", line))
+            out.append(BARE_ID_RE.sub("[id]", URI_RE.sub(r"\1\2:[id]", line)))
     return out
 
 
@@ -263,6 +269,8 @@ class Instance:
 
     def _start(self, binary):
         env = f"XDG_RUNTIME_DIR={shlex.quote(self.run)}"
+        # The cache is isolated, but playlists a run creates are recorded in the real list.
+        env += f" NCSPOT_TEST_PLAYLISTS_FILE={shlex.quote(TEST_PLAYLISTS_FILE)}"
         pulse = os.path.join(os.environ.get("XDG_RUNTIME_DIR", ""), "pulse", "native")
         if os.environ.get("XDG_RUNTIME_DIR") and os.path.exists(pulse):
             env += f" PULSE_SERVER={shlex.quote('unix:' + pulse)}"
@@ -681,6 +689,33 @@ def sc_playlists_area_off(inst, args):
     expect(rows == d["playlists"]["stored"], "flat list: one row per stored playlist", (rows, d["playlists"]))
 
 
+def sc_playlist_write(inst, args):
+    """Create a test playlist, add, remove and overwrite over the internal API, no fallback.
+    The playlist is recorded for the user to remove; nothing is deleted here."""
+    d = inst.wait_library(args.settle_timeout * 4, blocked_on=["internal"])
+    blocked_if_throttled(d, ["internal"])
+    inst.base_dump = d
+    inst.send("harness newplaylist-test")
+    d = inst.wait_settled(args.settle_timeout)
+    blocked_if_throttled(d, ["internal"])
+    expect(d.get("error") is None, "create without error", d.get("error"))
+    # Each command with the test playlist's length after it.
+    steps = (
+        ("harness playlist-add-test 2", 2),
+        ("harness playlist-remove-test 0", 1),
+        ("harness playlist-overwrite-test 3", 3),
+    )
+    for cmd, want in steps:
+        inst.send(cmd)
+        d = inst.wait_settled(args.settle_timeout)
+        blocked_if_throttled(d, ["internal"])
+        expect(d.get("error") is None, f"{cmd}: no error", d.get("error"))
+        expect(d["playlists"]["last_test_len"] == want, f"{cmd}: test playlist holds {want}", d["playlists"])
+    m = area_delta(inst, d, "playlists")
+    expect(m["fallback"] == 0, "no playlists fallback", m)
+    expect(not d["areas"]["playlists"]["latched"], "area not latched", d["areas"]["playlists"])
+
+
 def sc_reconnect(inst, args):
     sc_play_start(inst, args)
     before = inst.dump()["player"]["position_ms"]
@@ -714,11 +749,84 @@ SCENARIOS = {
     "library_write": ({}, sc_library_write, False),
     "playlists": ({}, sc_playlists, False),
     "playlists_area_off": ({"internal_api_areas": {"playlists": False}}, sc_playlists_area_off, False),
+    "playlist_write": ({}, sc_playlist_write, False),
     "reconnect": ({}, sc_reconnect, True),
 }
 
 
+CLEANUP_COMMANDS = ("test-playlists", "unfollow")
+
+
+def positive_int(text):
+    n = int(text)
+    if n < 1:
+        raise argparse.ArgumentTypeError("the playlist number starts at 1")
+    return n
+
+
+def parse_cleanup(argv):
+    """Parse a cleanup subcommand line (`test-playlists` or `unfollow <n>`). These are not
+    scenarios: main() hands them over only when the first argument names one."""
+    p = argparse.ArgumentParser(prog="drive.py", description="Test playlist cleanup")
+    sub = p.add_subparsers(dest="command", required=True)
+    sub.add_parser("test-playlists", help="list the recorded test playlists as '<n> <name>'")
+    unf = sub.add_parser("unfollow", help="unfollow the n-th recorded test playlist")
+    unf.add_argument("n", type=positive_int, help="1-based number from test-playlists")
+    for q in sub.choices.values():
+        q.add_argument("--keep", action="store_true", help="keep the temp dirs")
+        q.add_argument("--no-build", action="store_true", help="skip cargo build")
+        q.add_argument("--settle-timeout", type=float, default=30.0)
+    return p.parse_args(argv)
+
+
+def format_test_playlists(names):
+    """`<n> <name>` lines, 1-based, in file order; no ids."""
+    return [f"{i} {name}" for i, name in enumerate(names, 1)]
+
+
+def run_cleanup(args):
+    """Start a headless instance with the user's login and run one cleanup command. Prints only
+    the result lines. Never part of a scenario run."""
+    if not args.no_build:
+        r = subprocess.run(["cargo", "build", "--features", "harness"], cwd=REPO)
+        if r.returncode != 0:
+            return 2
+    binary = os.path.join(REPO, "target", "debug", "ncspot")
+    inst = None
+    try:
+        inst = Instance(binary, {}, args.keep)
+        inst.start()
+        inst.wait_library(args.settle_timeout * 4)
+        if args.command == "test-playlists":
+            inst.send("harness test-playlists")
+            d = inst.dump()
+            if d.get("error"):
+                print(d["error"])
+                return 1
+            print("\n".join(format_test_playlists(d.get("test_playlists", []))))
+            return 0
+        inst.send(f"harness unfollow-recorded {args.n}")
+        d = inst.wait_settled(args.settle_timeout)
+        if d.get("error"):
+            print(d["error"])
+            return 1
+        print("removed")
+        return 0
+    except SetupError as e:
+        print(f"SETUP: {e}")
+        return 2
+    except Fail as e:
+        print(f"FAIL: {e}")
+        return 1
+    finally:
+        if inst:
+            inst.close()
+
+
 def main(argv=None):
+    raw = sys.argv[1:] if argv is None else argv
+    if raw and raw[0] in CLEANUP_COMMANDS:
+        return run_cleanup(parse_cleanup(raw))
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("scenarios", nargs="*")
     p.add_argument("--play", action="store_true", help="also run playback scenarios")

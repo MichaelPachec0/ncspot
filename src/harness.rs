@@ -4,8 +4,9 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use log::error;
 use serde::Serialize;
 
 use crate::activity::ACTIVITY;
@@ -18,11 +19,14 @@ use crate::model::playable::Playable;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
+use crate::playlist_edit;
+use crate::playlist_items;
 use crate::queue::Queue;
 use crate::rate_limit::{ClientLabel, Stamp};
 use crate::spotify::{PlayerEvent, Spotify, UriType};
 use crate::spotify_api::WebCalls;
 use crate::spotify_url::SpotifyUrl;
+use crate::test_playlists;
 use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
 use crate::ui::{album::AlbumView, artist::ArtistView, playlist::PlaylistView, show::ShowView};
 
@@ -87,6 +91,9 @@ pub struct Dump {
     pub playlists: PlaylistCounts,
     pub player: PlayerState,
     pub session: SessionState,
+    /// Names of the recorded test playlists, in file order; filled only in the first dump after
+    /// `harness test-playlists`, empty otherwise.
+    pub test_playlists: Vec<String>,
 }
 
 /// How many playlists the library holds and how many of them the Playlists tab layout lists.
@@ -95,6 +102,9 @@ pub struct PlaylistCounts {
     pub stored: usize,
     /// Number of `LayoutEntry::Playlist` entries.
     pub layout: usize,
+    /// Track count of the most recently recorded test playlist in the store; `None` when there
+    /// is none (or it is not stored).
+    pub last_test_len: Option<usize>,
 }
 
 /// What the player is doing.
@@ -169,7 +179,255 @@ pub fn build_dump(
             valid: spotify.session_valid(),
             reconnects: spotify.reconnects(),
         },
+        test_playlists: Vec::new(),
     }
+}
+
+/// Set by `harness test-playlists`, taken by the next dump.
+static WANT_TEST_PLAYLISTS: AtomicBool = AtomicBool::new(false);
+
+/// Ask for the recorded test playlists' names in the next dump.
+pub fn request_test_playlists() {
+    WANT_TEST_PLAYLISTS.store(true, Ordering::Relaxed);
+}
+
+/// Whether the next dump should carry the names; clears the request.
+pub fn take_test_playlists_request() -> bool {
+    WANT_TEST_PLAYLISTS.swap(false, Ordering::Relaxed)
+}
+
+/// The playlist id of a recorded URI.
+fn recorded_id(uri: &str) -> Option<String> {
+    SpotifyUrl::parse_any(uri)
+        .filter(|u| matches!(u.uri_type, UriType::Playlist))
+        .map(|u| u.id)
+}
+
+/// Create the next `ncspot-test-<k>` playlist through the library and record its URI at once.
+/// Errors carry no ID or URI.
+pub fn new_playlist_test(library: &Library) -> Result<(), String> {
+    let path = test_playlists::file_path();
+    let recorded = test_playlists::read(&path)
+        .map_err(|e| format!("harness newplaylist-test: cannot read the list: {e}"))?;
+    let name = format!("ncspot-test-{}", recorded.len() + 1);
+    // A create whose rootlist add failed returns None and is not recorded, on purpose: that
+    // playlist exists but is not in the library.
+    let id = library
+        .create_playlist(&name)
+        .ok_or("harness newplaylist-test: create failed")?;
+    test_playlists::append(&path, &format!("spotify:playlist:{id}")).map_err(|e| {
+        error!("recording a test playlist failed: {e}");
+        format!("harness newplaylist-test: created {name} but could not record it: {e}")
+    })
+}
+
+/// The most recently recorded test playlist as stored in the library.
+fn last_test_playlist(library: &Library, verb: &str) -> Result<Playlist, String> {
+    let recorded = test_playlists::read(&test_playlists::file_path())
+        .map_err(|e| format!("harness {verb}: cannot read the list: {e}"))?;
+    let id = recorded
+        .last()
+        .and_then(|uri| recorded_id(uri))
+        .ok_or_else(|| format!("harness {verb}: no recorded test playlist"))?;
+    library
+        .playlists
+        .read()
+        .unwrap()
+        .iter()
+        .find(|p| p.id == id)
+        .cloned()
+        .ok_or_else(|| format!("harness {verb}: the last test playlist is not in the library"))
+}
+
+/// Track count of the most recently recorded test playlist in the store, for the dump.
+pub fn last_test_len(library: &Library) -> Option<usize> {
+    let playlist = last_test_playlist(library, "dump").ok()?;
+    Some(
+        playlist
+            .tracks
+            .as_ref()
+            .map_or(playlist.num_tracks, Vec::len),
+    )
+}
+
+/// The public catalog tracks the playlist-write verbs use.
+const PUBLIC_TEST_TRACKS: [&str; 3] = [
+    "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+    "spotify:track:7ouMYWpwJ422jRcDASZB7P",
+    "spotify:track:0VjIjW4GlUZAMYd2vXMi3b",
+];
+
+/// The first `n` public test tracks, repeating from the first when `n` is above three.
+fn public_test_tracks(n: usize) -> Vec<Playable> {
+    (0..n)
+        .map(|i| playlist_items::placeholder(PUBLIC_TEST_TRACKS[i % PUBLIC_TEST_TRACKS.len()]))
+        .collect()
+}
+
+/// Append the first `n` public test tracks to the most recent test playlist.
+pub fn playlist_add_test(library: &Library, spotify: &Spotify, n: usize) -> Result<(), String> {
+    let mut playlist = last_test_playlist(library, "playlist-add-test")?;
+    playlist.append_tracks(&public_test_tracks(n), spotify, library);
+    Ok(())
+}
+
+/// Remove the track at `index` from the most recent test playlist.
+pub fn playlist_remove_test(
+    library: &Library,
+    spotify: &Spotify,
+    index: usize,
+) -> Result<(), String> {
+    let mut playlist = last_test_playlist(library, "playlist-remove-test")?;
+    let len = playlist.tracks.as_ref().map_or(0, Vec::len);
+    if index >= len {
+        return Err(format!(
+            "harness playlist-remove-test: no track {index} ({len} loaded)"
+        ));
+    }
+    let row = playlist.tracks.as_ref().map(|tracks| tracks[index].clone());
+    let row = row.ok_or("harness playlist-remove-test: no tracks loaded")?;
+    playlist.delete_track(&row, spotify.clone(), library)
+}
+
+/// Replace the contents of the most recent test playlist with the first `n` public test tracks.
+pub fn playlist_overwrite_test(library: &Library, n: usize) -> Result<(), String> {
+    let playlist = last_test_playlist(library, "playlist-overwrite-test")?;
+    library.overwrite_playlist(&playlist.id, &public_test_tracks(n));
+    Ok(())
+}
+
+/// Names of the recorded test playlists, in file order: from the store, else the internal head
+/// read, else `(unknown)`.
+pub fn test_playlist_names(library: &Library, spotify: &Spotify) -> Result<Vec<String>, String> {
+    let recorded = test_playlists::read(&test_playlists::file_path())
+        .map_err(|e| format!("harness test-playlists: cannot read the list: {e}"))?;
+    Ok(recorded
+        .iter()
+        .map(|uri| {
+            let Some(id) = recorded_id(uri) else {
+                return "(unknown)".to_string();
+            };
+            let stored = library
+                .playlists
+                .read()
+                .unwrap()
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone());
+            stored
+                .or_else(|| spotify.api.playlist_head(&id).ok().and_then(|h| h.name))
+                .unwrap_or_else(|| "(unknown)".to_string())
+        })
+        .collect())
+}
+
+/// What a server rootlist read says about a recorded playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootlistState {
+    Listed,
+    /// A complete read that does not list it.
+    Absent,
+    /// The read failed or was incomplete.
+    Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LineDecision {
+    KeepLine,
+    DropLine,
+}
+
+/// Whether to drop a recorded line after an unfollow attempt. Only a playlist known to be out of
+/// the library (deleted from the store, unfollowed, or verified absent) loses its line.
+fn line_decision(
+    was_stored: bool,
+    still_stored: bool,
+    listing: RootlistState,
+    unfollowed: bool,
+) -> LineDecision {
+    let gone = if was_stored {
+        !still_stored
+    } else {
+        match listing {
+            RootlistState::Absent => true,
+            RootlistState::Listed => unfollowed,
+            RootlistState::Unknown => false,
+        }
+    };
+    if gone {
+        LineDecision::DropLine
+    } else {
+        LineDecision::KeepLine
+    }
+}
+
+/// Unfollow the n-th (1-based) recorded test playlist through the normal delete path (which
+/// also unpins), then drop its line. Refuses an `n` out of range, and keeps the line when the
+/// playlist is still in the library afterwards. Errors carry no ID or URI.
+pub fn unfollow_recorded(library: &Library, spotify: &Spotify, n: usize) -> Result<(), String> {
+    let path = test_playlists::file_path();
+    let recorded = test_playlists::read(&path)
+        .map_err(|e| format!("harness unfollow-recorded: cannot read the list: {e}"))?;
+    let uri = n
+        .checked_sub(1)
+        .and_then(|i| recorded.get(i))
+        .ok_or_else(|| {
+            format!(
+                "harness unfollow-recorded: no recorded playlist {n} ({} recorded)",
+                recorded.len()
+            )
+        })?;
+    let id =
+        recorded_id(uri).ok_or("harness unfollow-recorded: the recorded line is not a playlist")?;
+    if !*library.is_done.read().unwrap() {
+        return Err("harness unfollow-recorded: the library is still syncing".into());
+    }
+    let stored = |library: &Library| library.playlists.read().unwrap().iter().any(|p| p.id == id);
+    let was_stored = stored(library);
+    let mut still_stored = false;
+    let mut listing = RootlistState::Unknown;
+    let mut unfollowed = false;
+    if was_stored {
+        library.delete_playlist(&id);
+        still_stored = stored(library);
+    } else {
+        // Absent from the store is not absent from the library (partial sync, stale cache):
+        // ask the server before dropping the record. These reads are unspaced; fine for the
+        // handful of recorded playlists.
+        let api = &spotify.api;
+        if let Ok(rootlist) = api.playlist_rootlist() {
+            let complete = rootlist.read >= rootlist.length;
+            listing = match (playlist_edit::rootlist_index(&rootlist, &id), complete) {
+                (Some(_), _) => RootlistState::Listed,
+                (None, true) => RootlistState::Absent,
+                (None, false) => RootlistState::Unknown,
+            };
+        }
+        if listing == RootlistState::Listed {
+            unfollowed = playlist_edit::unfollow(api, &id).is_ok();
+            if unfollowed && library.unpin_deleted(&id).is_some() {
+                log::warn!("harness unfollow-recorded: unfollowed, but the pin may remain");
+            }
+        }
+    }
+    match line_decision(was_stored, still_stored, listing, unfollowed) {
+        LineDecision::DropLine => {}
+        LineDecision::KeepLine if was_stored => {
+            return Err("harness unfollow-recorded: library unchanged".into());
+        }
+        LineDecision::KeepLine if listing == RootlistState::Unknown => {
+            return Err(
+                "harness unfollow-recorded: could not confirm; not removed from the list".into(),
+            );
+        }
+        LineDecision::KeepLine => {
+            return Err("harness unfollow-recorded: unfollow failed".into());
+        }
+    }
+    test_playlists::remove(&path, n).map_err(|e| {
+        format!("harness unfollow-recorded: unfollowed but could not update the list: {e}")
+    })?;
+    Ok(())
 }
 
 /// Write `dump` to `path` atomically: a reader sees the old file or the new one, never half.
@@ -368,6 +626,41 @@ mod tests {
     }
 
     #[test]
+    fn recorded_id_accepts_only_playlist_uris() {
+        assert_eq!(recorded_id("spotify:playlist:p1").as_deref(), Some("p1"));
+        assert_eq!(recorded_id("spotify:album:a1"), None);
+        assert_eq!(recorded_id("junk"), None);
+    }
+
+    #[test]
+    fn line_decision_drops_only_a_playlist_known_to_be_gone() {
+        use LineDecision::{DropLine, KeepLine};
+        use RootlistState::{Absent, Listed, Unknown};
+        let table = [
+            (true, false, Unknown, false, DropLine),
+            (true, true, Unknown, false, KeepLine),
+            (false, false, Absent, false, DropLine),
+            (false, false, Listed, true, DropLine),
+            (false, false, Listed, false, KeepLine),
+            (false, false, Unknown, false, KeepLine),
+        ];
+        for (was, still, listing, done, expect) in table {
+            assert_eq!(
+                line_decision(was, still, listing, done),
+                expect,
+                "{was} {still} {listing:?} {done}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_playlists_request_is_taken_once() {
+        request_test_playlists();
+        assert!(take_test_playlists_request());
+        assert!(!take_test_playlists_request());
+    }
+
+    #[test]
     fn parse_target_names_a_bad_target() {
         let err = parse_target("not-a-uri").unwrap_err();
         assert!(err.contains("not-a-uri"), "{err}");
@@ -419,6 +712,7 @@ mod tests {
             playlists: PlaylistCounts {
                 stored: 9,
                 layout: 8,
+                last_test_len: Some(3),
             },
             player: PlayerState {
                 status: "playing".into(),
@@ -428,6 +722,7 @@ mod tests {
                 valid: true,
                 reconnects: 1,
             },
+            test_playlists: Vec::new(),
         }
     }
 
@@ -436,7 +731,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1}}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8,"last_test_len":3},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"test_playlists":[]}"#
         );
     }
 
@@ -466,6 +761,7 @@ mod tests {
         let counts = PlaylistCounts {
             stored: 3,
             layout: 2,
+            last_test_len: None,
         };
         let first = build_dump(
             "x".into(),
@@ -482,6 +778,7 @@ mod tests {
         assert!(second.seq > first.seq);
         assert_eq!(first.error.as_deref(), Some("boom"));
         assert_eq!(first.playlists, counts);
+        assert!(first.test_playlists.is_empty());
         assert_eq!(first.view, None);
         assert!(first.tabs.is_empty());
         assert_eq!(first.web, WebCalls::default());

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::{cmp::Ordering, iter::Iterator};
@@ -10,8 +11,10 @@ use rspotify::model::playlist::{FullPlaylist, SimplifiedPlaylist};
 
 use crate::internal_api::Area;
 use crate::internal_api::fallback::{Action, decide_after, run_with_fallback};
+use crate::library::{edit_failed, write_through};
 use crate::model::playable::Playable;
 use crate::model::track::Track;
+use crate::playlist_edit;
 use crate::queue::Queue;
 use crate::spotify::Spotify;
 use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
@@ -34,10 +37,12 @@ pub struct Playlist {
 }
 
 impl Playlist {
-    /// Load the tracks if they are not loaded yet. Returns true if the tracks are loaded; on a
-    /// failed request `tracks` is left untouched.
+    /// Load the tracks if they are not loaded yet; a loaded copy whose snapshot was cleared is
+    /// reloaded instead when the internal API can (see [playlist_edit::reload_cleared]).
+    /// Returns true if the tracks are loaded; on a failed request `tracks` is left untouched.
     pub fn load_tracks(&mut self, spotify: &Spotify) -> bool {
         if self.tracks.is_some() {
+            playlist_edit::reload_cleared(&spotify.api, self);
             return true;
         }
 
@@ -56,7 +61,7 @@ impl Playlist {
                 api.playlist_playables(&self.id, &HashMap::new())
                     .inspect_err(|err| {
                         if decide_after(err) == Action::Fail {
-                            warn!("Could not load a playlist: {err}");
+                            warn!("Could not load a playlist ({})", err.class());
                         }
                     })
             },
@@ -89,46 +94,110 @@ impl Playlist {
         })
     }
 
-    pub fn delete_track(&mut self, index: usize, spotify: Spotify, library: &Library) -> bool {
-        let playable = self.tracks.as_ref().unwrap()[index].clone();
+    /// Remove the track `row` (a row of a view of this playlist): the item at its server
+    /// position (`list_index`, not its place in a sorted view) that is also its uri. On failure
+    /// the error is the status note to show.
+    pub fn delete_track(
+        &mut self,
+        row: &Playable,
+        spotify: Spotify,
+        library: &Library,
+    ) -> Result<(), String> {
+        let index = row.list_index();
+        let uri = row.uri();
+        let Some(playable) = self.tracks.as_ref().and_then(|tracks| {
+            playlist_edit::server_item(tracks, index, &uri).map(|at| tracks[at].clone())
+        }) else {
+            return Err("Could not delete track.".to_string());
+        };
         debug!("deleting track: {index} {playable:?}");
 
         if playable.track().map(|t| t.is_local) == Some(true) {
             warn!("track is a local file, can't delete");
-            return false;
+            return Err("Could not delete track.".to_string());
         }
 
-        match spotify
-            .api
-            .delete_tracks(&self.id, &self.snapshot_id, &[playable])
-            .is_ok()
-        {
-            false => false,
-            true => {
-                if let Some(tracks) = &mut self.tracks {
-                    tracks.remove(index);
-                    library.playlist_update(self);
-                }
-
-                true
+        let api = &spotify.api;
+        let known = || library.known_playables();
+        let note = Cell::new(None);
+        let web_used = Cell::new(false);
+        let id = self.id.clone();
+        let snapshot_id = self.snapshot_id.clone();
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || {
+                playlist_edit::remove_track(api, self, index, &uri, &known).map_err(|err| {
+                    // Also a copy reloaded before the failure (its snapshot changed).
+                    if err.stores_copy() || self.snapshot_id != snapshot_id {
+                        library.playlist_update(self);
+                    }
+                    note.set(err.note());
+                    err.into()
+                })
+            },
+            || {
+                web_used.set(true);
+                api.delete_tracks(&id, &snapshot_id, &[playable]).is_ok()
+            },
+        );
+        if !written {
+            if let Some(note) = note.take() {
+                warn!("{note}");
+                return Err(note);
             }
+            return Err("Could not delete track.".to_string());
         }
+
+        if web_used.get() {
+            playlist_edit::remove_after_web(self, index, &uri);
+        }
+        library.playlist_update(self);
+        Ok(())
     }
 
     pub fn append_tracks(&mut self, new_tracks: &[Playable], spotify: &Spotify, library: &Library) {
-        let mut has_modified = false;
+        let api = &spotify.api;
+        let known = || library.known_playables();
+        let web_used = Cell::new(false);
+        let id = self.id.clone();
+        let snapshot_id = self.snapshot_id.clone();
+        let note = Cell::new(None);
+        let written = write_through(
+            api,
+            Area::Playlists,
+            || {
+                playlist_edit::add_tracks(api, self, new_tracks, &known).map_err(|err| {
+                    // Also a copy reloaded before the failure (its snapshot changed).
+                    if err.stores_copy() || self.snapshot_id != snapshot_id {
+                        library.playlist_update(self);
+                    }
+                    edit_failed(err, &note)
+                })
+            },
+            || {
+                web_used.set(true);
+                api.append_tracks(&id, new_tracks, None).is_ok()
+            },
+        );
 
-        if spotify
-            .api
-            .append_tracks(&self.id, new_tracks, None)
-            .is_ok()
-            && let Some(tracks) = &mut self.tracks
-        {
-            tracks.append(&mut new_tracks.to_vec());
-            has_modified = true;
-        }
-
-        if has_modified {
+        if library.settle_write(written, &note) {
+            if web_used.get() {
+                match &mut self.tracks {
+                    Some(tracks) => {
+                        // The new tracks take the server positions after the old ones.
+                        let start = tracks.len();
+                        tracks.extend(new_tracks.iter().cloned().enumerate().map(
+                            |(i, mut playable)| {
+                                playable.set_list_index(start + i);
+                                playable
+                            },
+                        ));
+                        self.num_tracks = tracks.len();
+                    }
+                    None => return,
+                }
+            }
             library.playlist_update(self);
         }
     }
@@ -364,6 +433,10 @@ impl ListItem for Playlist {
             "https://open.spotify.com/user/{}/playlist/{}",
             self.owner_id, self.id
         ))
+    }
+
+    fn playlist_id(&self) -> Option<String> {
+        Some(self.id.clone())
     }
 
     fn is_saved(&self, library: &Library) -> Option<bool> {

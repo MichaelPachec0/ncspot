@@ -1,6 +1,7 @@
 //! Spotify's playlist v2 service (the rootlist and playlist contents) over the librespot
 //! session.
 
+use http::Method;
 use librespot_core::{Session, SpotifyId};
 use librespot_protocol::playlist4_external::{ListAttributes, MetaItem, SelectedListContent};
 use log::debug;
@@ -50,6 +51,31 @@ pub struct Rootlist {
     pub read: usize,
     /// Pages absorbed.
     pub pages: usize,
+    /// The rootlist revision, from the first page.
+    pub revision: Vec<u8>,
+    /// Raw positions (ascending) of the items left out of `entries`, so an entry's rootlist
+    /// index can be recovered.
+    pub skipped: Vec<usize>,
+}
+
+/// A playlist's (or the rootlist's) head without its items.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Head {
+    /// Empty when the reply carried none (a write must never be based on it).
+    pub revision: Vec<u8>,
+    /// base64 (standard) of `revision`, the form `Playlist.snapshot_id` stores.
+    pub snapshot_id: String,
+    /// None when the reply carried none (a missing length is not 0).
+    pub length: Option<usize>,
+    pub name: Option<String>,
+}
+
+/// The rootlist head: each field only when the reply carried it (a missing length is not 0).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RootHead {
+    /// Non-empty when present.
+    pub revision: Option<Vec<u8>>,
+    pub length: Option<usize>,
 }
 
 /// One item of a playlist.
@@ -63,7 +89,7 @@ pub struct PlaylistItem {
 const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 with padding. The `base64` crate is only built with `jukebox-graphics`.
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
         let n = chunk
@@ -155,10 +181,14 @@ pub fn absorb_rootlist(
     }
     let total = usize::try_from(page.length.unwrap_or(0)).unwrap_or(0);
     list.length = total;
+    if list.pages == 0 {
+        list.revision = page.revision.clone().unwrap_or_default();
+    }
     let Some(contents) = page.contents.into_option() else {
         return Ok(None);
     };
     let count = contents.items.len();
+    let start = list.read;
     list.read += count;
     list.pages += 1;
     let no_meta = MetaItem::default();
@@ -175,6 +205,8 @@ pub fn absorb_rootlist(
             });
         } else if uri.starts_with("spotify:end-group:") {
             list.entries.push(RootEntry::FolderEnd);
+        } else {
+            list.skipped.push(start + i);
         }
     }
     Ok((count > 0 && list.read < total && list.pages < MAX_ROOTLIST_PAGES).then_some(list.read))
@@ -193,6 +225,26 @@ pub fn parse_contents(content: SelectedListContent) -> Vec<PlaylistItem> {
             uri: item.uri.unwrap_or_default(),
         })
         .collect()
+}
+
+/// The head fields of a reply: revision, length and name; a missing revision is empty, a
+/// missing length stays missing.
+pub fn parse_head(content: &SelectedListContent) -> Head {
+    let revision = content.revision.clone().unwrap_or_default();
+    Head {
+        snapshot_id: base64_encode(&revision),
+        revision,
+        length: content.length.and_then(|n| usize::try_from(n).ok()),
+        name: content.attributes.as_ref().and_then(|a| a.name.clone()),
+    }
+}
+
+/// The rootlist head fields of a reply, without defaults for missing ones.
+pub fn parse_root_head(content: &SelectedListContent) -> RootHead {
+    RootHead {
+        revision: content.revision.clone().filter(|r| !r.is_empty()),
+        length: content.length.and_then(|n| usize::try_from(n).ok()),
+    }
 }
 
 fn parse(bytes: &[u8]) -> Result<SelectedListContent, InternalError> {
@@ -218,8 +270,19 @@ pub async fn rootlist(session: Session) -> Result<Rootlist, InternalError> {
     }
 }
 
-/// The items of one playlist. An id that does not parse does not exist.
-pub async fn contents(session: Session, id: String) -> Result<Vec<PlaylistItem>, InternalError> {
+/// The head of a full read with its items: the revision, length and name are those of the
+/// items read, which a later head read may not be.
+pub fn parse_listing(content: SelectedListContent) -> (Head, Vec<PlaylistItem>) {
+    let head = parse_head(&content);
+    (head, parse_contents(content))
+}
+
+/// The items of one playlist with the head they were read at. An id that does not parse does
+/// not exist.
+pub async fn contents(
+    session: Session,
+    id: String,
+) -> Result<(Head, Vec<PlaylistItem>), InternalError> {
     debug!("playlist contents");
     let id = SpotifyId::from_base62(&id).map_err(|_| InternalError::NotFound)?;
     let bytes = session
@@ -227,7 +290,31 @@ pub async fn contents(session: Session, id: String) -> Result<Vec<PlaylistItem>,
         .get_playlist(&id)
         .await
         .map_err(|e| classify(&e))?;
-    Ok(parse_contents(parse(&bytes)?))
+    Ok(parse_listing(parse(&bytes)?))
+}
+
+/// The head of one playlist (`?length=0`: no items). An id that does not parse does not exist.
+pub async fn head(session: Session, id: String) -> Result<Head, InternalError> {
+    debug!("playlist head");
+    let id = SpotifyId::from_base62(&id).map_err(|_| InternalError::NotFound)?;
+    let endpoint = format!("/playlist/v2/playlist/{}?length=0", id.to_base62());
+    let bytes = session
+        .spclient()
+        .request(&Method::GET, &endpoint, None, None)
+        .await
+        .map_err(|e| classify(&e))?;
+    Ok(parse_head(&parse(&bytes)?))
+}
+
+/// The rootlist revision and length, without entries.
+pub async fn rootlist_head(session: Session) -> Result<RootHead, InternalError> {
+    debug!("rootlist head");
+    let bytes = session
+        .spclient()
+        .get_rootlist(0, Some(0))
+        .await
+        .map_err(|e| classify(&e))?;
+    Ok(parse_root_head(&parse(&bytes)?))
 }
 
 #[cfg(test)]
@@ -322,16 +409,27 @@ mod tests {
     fn rootlist_pages_until_length() {
         let pl = |n: u8| item(&format!("spotify:playlist:00000000000000000000{n:02}"));
         let mut list = Rootlist::default();
-        let first = page(
-            3,
-            vec![pl(1), pl(2)],
-            vec![meta(Some("a"), b"r", 200), meta(Some("b"), b"r", 200)],
-        );
+        let first = SelectedListContent {
+            revision: Some(b"root".to_vec()),
+            ..page(
+                3,
+                vec![pl(1), pl(2)],
+                vec![meta(Some("a"), b"r", 200), meta(Some("b"), b"r", 200)],
+            )
+        };
         assert_eq!(absorb_rootlist(&mut list, first), Ok(Some(2)));
-        let second = page(3, vec![pl(3)], vec![meta(Some("c"), b"r", 200)]);
+        let second = SelectedListContent {
+            revision: Some(b"later".to_vec()),
+            ..page(3, vec![pl(3)], vec![meta(Some("c"), b"r", 200)])
+        };
         assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!(list.length, 3);
+        assert_eq!(
+            list.revision,
+            b"root".to_vec(),
+            "the revision of the first page"
+        );
     }
 
     #[test]
@@ -411,6 +509,23 @@ mod tests {
     }
 
     #[test]
+    fn a_full_read_carries_the_revision_of_its_items() {
+        let content = SelectedListContent {
+            revision: Some(b"read".to_vec()),
+            ..page(
+                2,
+                vec![item("spotify:track:a"), item("spotify:track:b")],
+                vec![],
+            )
+        };
+        let (head, items) = parse_listing(content);
+        assert_eq!(head.revision, b"read".to_vec());
+        assert_eq!(head.snapshot_id, base64_encode(b"read"));
+        assert_eq!(head.length, Some(2));
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
     fn cover_prefers_picture_size_then_picture_id() {
         let mut attrs = ListAttributes {
             picture: Some(vec![0xab, 0x01]),
@@ -475,5 +590,66 @@ mod tests {
         assert_eq!(absorb_rootlist(&mut list, second), Ok(None));
         assert_eq!(list.entries.len(), 3);
         assert_eq!((list.read, list.pages), (4, 2));
+        assert_eq!(list.skipped, [1], "the raw position of the skipped item");
+    }
+
+    #[test]
+    fn head_reads_revision_length_and_name() {
+        let content = SelectedListContent {
+            revision: Some(b"rev1".to_vec()),
+            length: Some(5272),
+            attributes: protobuf::MessageField::some(ListAttributes {
+                name: Some("ncspot-test-1".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let head = parse_head(&content);
+        assert_eq!(head.revision, b"rev1".to_vec());
+        assert_eq!(head.snapshot_id, "cmV2MQ==");
+        assert_eq!(head.length, Some(5272));
+        assert_eq!(head.name.as_deref(), Some("ncspot-test-1"));
+    }
+
+    #[test]
+    fn root_head_keeps_missing_fields_missing() {
+        assert_eq!(
+            parse_root_head(&SelectedListContent::default()),
+            RootHead::default()
+        );
+        let empty_revision = SelectedListContent {
+            revision: Some(Vec::new()),
+            length: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_root_head(&empty_revision),
+            RootHead {
+                revision: None,
+                length: Some(0)
+            }
+        );
+        let full = SelectedListContent {
+            revision: Some(b"r".to_vec()),
+            length: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(
+            parse_root_head(&full),
+            RootHead {
+                revision: Some(b"r".to_vec()),
+                length: Some(7)
+            }
+        );
+    }
+
+    #[test]
+    fn head_without_fields_is_empty() {
+        let head = parse_head(&SelectedListContent::default());
+        assert_eq!(
+            (head.length, head.name, head.snapshot_id.as_str()),
+            (None, None, "")
+        );
+        assert!(head.revision.is_empty());
     }
 }

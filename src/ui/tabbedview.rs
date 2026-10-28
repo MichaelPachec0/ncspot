@@ -49,6 +49,11 @@ impl TabbedView {
         self.tab_mut(self.selected)
     }
 
+    /// Return the index of the currently visible tab.
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
     /// Return the amount of tabs in this view.
     pub fn len(&self) -> usize {
         self.tabs.len()

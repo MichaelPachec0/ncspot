@@ -46,6 +46,15 @@ class ScrubTest(unittest.TestCase):
         out = drive.redact(["open spotify:track:4uLU6hMCjMI75M1A2tKUQC now"], None)
         self.assertEqual(out, ["open spotify:track:[id] now"])
 
+    def test_redact_masks_bare_ids_and_drops_ipc_status_lines(self):
+        lines = [
+            'url: "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"',
+            '[ncspot::ipc] [DEBUG] IPC Status update: Status { title: "Some Song" }',
+        ]
+        out = drive.redact(lines, None)
+        self.assertEqual(out[0], 'url: "https://open.spotify.com/track/[id]"')
+        self.assertEqual(out[1], "[ipc status update]")
+
     def test_status_segments_keep_only_bracketed_segments(self):
         pane = ["  Some Artist - Some Song   3:01 |", " >> Song  [rate limited: shared 24s] [R1] 0:02"]
         self.assertEqual(drive.status_segments(pane), ["[rate limited: shared 24s] [R1]"])
@@ -263,22 +272,63 @@ class LibraryWriteTest(unittest.TestCase):
         self.assertIn(f"harness unsave {self.URIS[1]}", sent)
 
 
+class CleanupTest(unittest.TestCase):
+    def test_parses_the_two_subcommands(self):
+        a = drive.parse_cleanup(["test-playlists"])
+        self.assertEqual(a.command, "test-playlists")
+        b = drive.parse_cleanup(["unfollow", "2", "--no-build"])
+        self.assertEqual((b.command, b.n, b.no_build), ("unfollow", 2, True))
+
+    def test_rejects_a_missing_or_bad_number(self):
+        for argv in (["unfollow"], ["unfollow", "x"], ["unfollow", "0"], ["unfollow", "-1"]):
+            with self.assertRaises(SystemExit):
+                drive.parse_cleanup(argv)
+
+    def test_subcommands_are_not_scenarios(self):
+        for name in drive.CLEANUP_COMMANDS:
+            self.assertNotIn(name, drive.SCENARIOS)
+
+    def test_a_scenario_list_naming_a_subcommand_is_unknown(self):
+        self.assertEqual(drive.main(["album", "test-playlists", "--no-build"]), 2)
+
+    def test_formats_numbered_names_only(self):
+        self.assertEqual(drive.format_test_playlists(["ncspot-test-1"]), ["1 ncspot-test-1"])
+        self.assertEqual(
+            drive.format_test_playlists(["ncspot-test-1", "(unknown)"]),
+            ["1 ncspot-test-1", "2 (unknown)"],
+        )
+        self.assertEqual(drive.format_test_playlists([]), [])
+
+    def test_the_child_gets_the_real_list_path(self):
+        self.assertEqual(
+            drive.TEST_PLAYLISTS_FILE, os.path.join(drive.REAL_CACHE, "test-playlists.txt")
+        )
+
+
 class PlaylistsScenarioTest(unittest.TestCase):
     @staticmethod
-    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False, tab=True):
+    def d(fallback=0, latched=False, stored=9, layout=8, rows=9, base=False, tab=True, last_len=3, error=None):
         return {
             "areas": {
                 "playlists": {"internal_ok": 0 if base else 4, "fallback": fallback, "latched": latched}
             },
             "web": {"shared": 0, "personal": 0},
             "throttled": {},
-            "playlists": {"stored": stored, "layout": layout},
+            "playlists": {"stored": stored, "layout": layout, "last_test_len": last_len},
+            "error": error,
             "tabs": [{"name": "Playlists", "rows": rows}] if tab else [{"name": "Albums", "rows": 3}],
         }
 
-    def run_with(self, func, **kw):
+    # The test playlist's length after the create and after each write command.
+    WRITE_LENS = (0, 2, 1, 3)
+
+    def run_with(self, func, lens=None, **kw):
         base = self.d(base=True)
         dump = self.d(**kw)
+        if lens is None and func is drive.sc_playlist_write:
+            lens = self.WRITE_LENS
+        # One dump per settle, in order; past the end (or without lens) the same dump.
+        settled = [self.d(**{**kw, "last_len": n}) for n in lens or ()]
 
         class Inst:
             base_dump = base
@@ -287,10 +337,11 @@ class PlaylistsScenarioTest(unittest.TestCase):
                 pass
 
             def wait_library(self, timeout, blocked_on=()):
-                return dump
+                # The write scenario measures from the dump taken when the library is done.
+                return base if func is drive.sc_playlist_write else dump
 
             def wait_settled(self, timeout):
-                return dump
+                return settled.pop(0) if settled else dump
 
         class Args:
             settle_timeout = 1
@@ -327,6 +378,38 @@ class PlaylistsScenarioTest(unittest.TestCase):
     def test_area_off_missing_tab_fails(self):
         with self.assertRaises(drive.Fail):
             self.run_with(drive.sc_playlists_area_off, tab=False)
+
+    def test_playlist_write_passes(self):
+        self.run_with(drive.sc_playlist_write)
+
+    def test_playlist_write_fallback_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlist_write, fallback=1)
+
+    def test_playlist_write_latched_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlist_write, latched=True)
+
+    def test_playlist_write_wrong_length_fails(self):
+        for lens in ((0, 1, 1, 3), (0, 2, 2, 3), (0, 2, 1, 2), (0, 2, 1, None)):
+            with self.assertRaises(drive.Fail, msg=lens):
+                self.run_with(drive.sc_playlist_write, lens=lens)
+
+    def test_playlist_write_throttled_is_blocked(self):
+        original = self.d
+
+        def throttled(**kw):
+            d = original(**kw)
+            d["throttled"] = {"internal": True}
+            return d
+
+        self.d = throttled
+        with self.assertRaises(drive.Blocked):
+            self.run_with(drive.sc_playlist_write, error="boom")
+
+    def test_playlist_write_error_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_playlist_write, error="boom")
 
 
 if __name__ == "__main__":

@@ -36,6 +36,20 @@ impl fmt::Display for InternalError {
     }
 }
 
+impl InternalError {
+    /// A fixed name of the class, without the detail text (which may carry endpoint paths).
+    pub fn class(&self) -> &'static str {
+        match self {
+            Self::ProtocolChanged(_) => "protocol changed",
+            Self::NoSession => "no session",
+            Self::NotFound => "not found",
+            Self::Denied => "denied",
+            Self::RateLimited => "rate limited",
+            Self::Transient(_) => "transient",
+        }
+    }
+}
+
 /// Map a librespot error to its class. librespot already turns protobuf decode errors into
 /// `FailedPrecondition`, so those count as a protocol change too. librespot files HTTP 451
 /// under `Unavailable` with 500 and 503; a 451 is an item blocked for this account or region,

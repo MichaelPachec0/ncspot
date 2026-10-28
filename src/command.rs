@@ -16,12 +16,15 @@ const QUEUE_CMD: &str = "queue";
 const PLAY_NEXT_CMD: &str = "playnext";
 const PLAY: &str = "play";
 const UPDATE_LIBRARY_CMD: &str = "update";
+const UPDATE_TAB_CMD: &str = "update tab";
 const SAVE_CMD: &str = "save";
 const SAVE_CURRENT_CMD: &str = "save current";
 const SAVE_QUEUE_CMD: &str = "save queue";
 const ADD: &str = "add";
 const ADD_CURRENT_CMD: &str = "add current";
 const DELETE_CMD: &str = "delete";
+const PIN_CMD: &str = "pin";
+const UNPIN_CMD: &str = "unpin";
 const FOCUS: &str = "focus";
 const SEEK: &str = "seek";
 const VOLUME_UP_CMD: &str = "volup";
@@ -79,12 +82,15 @@ pub const ALL_COMMANDS: &[&str] = &[
     PLAY_NEXT_CMD,
     PLAY,
     UPDATE_LIBRARY_CMD,
+    UPDATE_TAB_CMD,
     SAVE_CMD,
     SAVE_CURRENT_CMD,
     SAVE_QUEUE_CMD,
     ADD,
     ADD_CURRENT_CMD,
     DELETE_CMD,
+    PIN_CMD,
+    UNPIN_CMD,
     FOCUS,
     SEEK,
     VOLUME_UP_CMD,
@@ -249,6 +255,18 @@ pub enum HarnessCommand {
     Save(String),
     /// Remove a Spotify URI from the library (refuses one not saved).
     Unsave(String),
+    /// Create the next `ncspot-test-<k>` playlist and record its URI in the test-playlists file.
+    NewPlaylistTest,
+    /// Put the recorded test playlists' names in the next dump.
+    TestPlaylists,
+    /// Unfollow the n-th (1-based) recorded test playlist, then drop it from the file.
+    UnfollowRecorded(usize),
+    /// Append the first n public test tracks to the most recent test playlist.
+    PlaylistAddTest(usize),
+    /// Remove the track at an index from the most recent test playlist.
+    PlaylistRemoveTest(usize),
+    /// Replace the most recent test playlist's contents with the first n public test tracks.
+    PlaylistOverwriteTest(usize),
     /// Shut the playback session down so the worker has to reconnect.
     DropSession,
     /// Write a JSON snapshot of the current view to a file.
@@ -267,12 +285,15 @@ pub enum Command {
     PlayNext,
     Play,
     UpdateLibrary,
+    UpdateTab,
     Save,
     SaveCurrent,
     SaveQueue,
     Add,
     AddCurrent,
     Delete,
+    Pin,
+    Unpin,
     Focus(String),
     Seek(SeekDirection),
     VolumeUp(u16),
@@ -352,6 +373,26 @@ impl fmt::Display for Command {
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::Unsave(uri)) => vec!["unsave".into(), uri.clone()],
             #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::NewPlaylistTest) => vec!["newplaylist-test".into()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::TestPlaylists) => vec!["test-playlists".into()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::UnfollowRecorded(n)) => {
+                vec!["unfollow-recorded".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::PlaylistAddTest(n)) => {
+                vec!["playlist-add-test".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::PlaylistRemoveTest(n)) => {
+                vec!["playlist-remove-test".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::PlaylistOverwriteTest(n)) => {
+                vec!["playlist-overwrite-test".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::DropSession) => vec!["drop-session".into()],
             Self::Goto(mode) => vec![mode.to_string()],
             Self::Move(mode, amount) => match (mode, amount) {
@@ -385,12 +426,15 @@ impl fmt::Display for Command {
             | Self::PlayNext
             | Self::Play
             | Self::UpdateLibrary
+            | Self::UpdateTab
             | Self::Save
             | Self::SaveCurrent
             | Self::SaveQueue
             | Self::Add
             | Self::AddCurrent
             | Self::Delete
+            | Self::Pin
+            | Self::Unpin
             | Self::Back
             | Self::Help
             | Self::ReloadConfig
@@ -431,12 +475,15 @@ impl Command {
             Self::PlayNext => PLAY_NEXT_CMD,
             Self::Play => PLAY,
             Self::UpdateLibrary => UPDATE_LIBRARY_CMD,
+            Self::UpdateTab => UPDATE_TAB_CMD,
             Self::Save => SAVE_CMD,
             Self::SaveCurrent => SAVE_CURRENT_CMD,
             Self::SaveQueue => SAVE_QUEUE_CMD,
             Self::Add => ADD,
             Self::AddCurrent => ADD_CURRENT_CMD,
             Self::Delete => DELETE_CMD,
+            Self::Pin => PIN_CMD,
+            Self::Unpin => UNPIN_CMD,
             Self::Focus(_) => FOCUS,
             Self::Seek(_) => SEEK,
             Self::VolumeUp(_) => VOLUME_UP_CMD,
@@ -652,7 +699,15 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                 QUEUE_CMD => Command::Queue,
                 PLAY_NEXT_CMD => Command::PlayNext,
                 PLAY => Command::Play,
-                UPDATE_LIBRARY_CMD => Command::UpdateLibrary,
+                UPDATE_LIBRARY_CMD => match args.first().cloned() {
+                    Some("tab") => Ok(Command::UpdateTab),
+                    Some(arg) => Err(E::BadEnumArg {
+                        arg: arg.into(),
+                        accept: vec!["tab".into()],
+                        optional: true,
+                    }),
+                    None => Ok(Command::UpdateLibrary),
+                }?,
                 ADD => match args.first().cloned() {
                     Some("current") => Ok(Command::AddCurrent),
                     Some(arg) => Err(E::BadEnumArg {
@@ -673,6 +728,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     None => Ok(Command::Save),
                 }?,
                 DELETE_CMD => Command::Delete,
+                PIN_CMD => Command::Pin,
+                UNPIN_CMD => Command::Unpin,
                 FOCUS => {
                     let &target = args.first().ok_or(E::InsufficientArgs {
                         cmd: command.into(),
@@ -1053,6 +1110,32 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                         HarnessCommand::OpenLibrary(rest.first().map(|s| (*s).to_string())),
                     )),
                     (Some("drop-session"), []) => Ok(Command::Harness(HarnessCommand::DropSession)),
+                    (Some("newplaylist-test"), []) => {
+                        Ok(Command::Harness(HarnessCommand::NewPlaylistTest))
+                    }
+                    (Some("test-playlists"), []) => {
+                        Ok(Command::Harness(HarnessCommand::TestPlaylists))
+                    }
+                    (Some("unfollow-recorded"), [n]) => n
+                        .parse()
+                        .map(|n| Command::Harness(HarnessCommand::UnfollowRecorded(n)))
+                        .map_err(|_| E::InsufficientArgs {
+                            cmd: format!("{command} unfollow-recorded"),
+                            hint: Some("a recorded playlist number".into()),
+                        }),
+                    (Some(sub @ ("playlist-add-test" | "playlist-remove-test" | "playlist-overwrite-test")), [n]) => n
+                        .parse()
+                        .map(|n| {
+                            Command::Harness(match sub {
+                                "playlist-add-test" => HarnessCommand::PlaylistAddTest(n),
+                                "playlist-remove-test" => HarnessCommand::PlaylistRemoveTest(n),
+                                _ => HarnessCommand::PlaylistOverwriteTest(n),
+                            })
+                        })
+                        .map_err(|_| E::InsufficientArgs {
+                            cmd: format!("{command} {sub}"),
+                            hint: Some("a number".into()),
+                        }),
                     (Some("save"), [target]) => Ok(Command::Harness(HarnessCommand::Save(
                         (*target).to_string(),
                     ))),
@@ -1065,14 +1148,23 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     (Some("dump"), rest) if !rest.is_empty() => {
                         Ok(Command::Harness(HarnessCommand::Dump(rest.join(" "))))
                     }
-                    (Some(sub @ ("open" | "dump" | "save" | "unsave")), _) => {
+                    (
+                        Some(
+                            sub @ ("open" | "dump" | "save" | "unsave" | "unfollow-recorded"
+                            | "playlist-add-test" | "playlist-remove-test"
+                            | "playlist-overwrite-test"),
+                        ),
+                        _,
+                    ) => {
                         Err(E::InsufficientArgs {
                             cmd: format!("{command} {sub}"),
                             hint: Some(
-                                if sub != "dump" {
-                                    "a Spotify URI or URL"
-                                } else {
-                                    "a file path"
+                                match sub {
+                                    "dump" => "a file path",
+                                    "unfollow-recorded" => "a recorded playlist number",
+                                    "playlist-add-test" | "playlist-remove-test"
+                                    | "playlist-overwrite-test" => "a number",
+                                    _ => "a Spotify URI or URL",
                                 }
                                 .into(),
                             ),
@@ -1086,12 +1178,21 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                             "drop-session".into(),
                             "save".into(),
                             "unsave".into(),
+                            "newplaylist-test".into(),
+                            "test-playlists".into(),
+                            "unfollow-recorded".into(),
+                            "playlist-add-test".into(),
+                            "playlist-remove-test".into(),
+                            "playlist-overwrite-test".into(),
                         ],
                         optional: false,
                     }),
                     (None, _) => Err(E::InsufficientArgs {
                         cmd: command.into(),
-                        hint: Some("open|dump|drop-session|save|unsave".into()),
+                        hint: Some(
+                            "open|dump|drop-session|save|unsave|newplaylist-test|test-playlists|unfollow-recorded|playlist-add-test|playlist-remove-test|playlist-overwrite-test"
+                                .into(),
+                        ),
                     }),
                 }?,
                 _ => {
@@ -1131,6 +1232,24 @@ mod tests {
                 HarnessCommand::OpenLibrary(Some("episodes".into())),
             ),
             ("harness drop-session", HarnessCommand::DropSession),
+            ("harness newplaylist-test", HarnessCommand::NewPlaylistTest),
+            ("harness test-playlists", HarnessCommand::TestPlaylists),
+            (
+                "harness unfollow-recorded 2",
+                HarnessCommand::UnfollowRecorded(2),
+            ),
+            (
+                "harness playlist-add-test 2",
+                HarnessCommand::PlaylistAddTest(2),
+            ),
+            (
+                "harness playlist-remove-test 0",
+                HarnessCommand::PlaylistRemoveTest(0),
+            ),
+            (
+                "harness playlist-overwrite-test 3",
+                HarnessCommand::PlaylistOverwriteTest(3),
+            ),
             (
                 "harness save spotify:track:4uLU6hMCjMI75M1A2tKUQC",
                 HarnessCommand::Save("spotify:track:4uLU6hMCjMI75M1A2tKUQC".into()),
@@ -1147,6 +1266,46 @@ mod tests {
         assert!(parse("harness").is_err());
         assert!(parse("harness open").is_err());
         assert!(parse("harness fly away").is_err());
+        assert!(parse("harness unfollow-recorded").is_err());
+        assert!(parse("harness unfollow-recorded x").is_err());
+        assert!(parse("harness unfollow-recorded -1").is_err());
+        assert!(parse("harness playlist-add-test").is_err());
+        assert!(parse("harness playlist-remove-test x").is_err());
+        assert!(parse("harness playlist-overwrite-test -1").is_err());
+    }
+
+    #[test]
+    fn parses_pin_and_unpin() {
+        let pin = parse("pin").unwrap();
+        assert!(matches!(pin.as_slice(), [Command::Pin]));
+        assert_eq!(pin[0].to_string(), "pin");
+        assert!(matches!(
+            parse(&pin[0].to_string()).as_deref(),
+            Ok([Command::Pin])
+        ));
+        let unpin = parse("unpin").unwrap();
+        assert!(matches!(unpin.as_slice(), [Command::Unpin]));
+        assert_eq!(unpin[0].to_string(), "unpin");
+        assert!(matches!(
+            parse(&unpin[0].to_string()).as_deref(),
+            Ok([Command::Unpin])
+        ));
+        assert!(!pin[0].accepts_count() && !unpin[0].accepts_count());
+    }
+
+    #[test]
+    fn parses_update_and_update_tab() {
+        let update = parse("update").unwrap();
+        assert!(matches!(update.as_slice(), [Command::UpdateLibrary]));
+        assert_eq!(update[0].to_string(), "update");
+        let tab = parse("update tab").unwrap();
+        assert!(matches!(tab.as_slice(), [Command::UpdateTab]));
+        assert_eq!(tab[0].to_string(), "update tab");
+        assert!(matches!(
+            parse(&tab[0].to_string()).as_deref(),
+            Ok([Command::UpdateTab])
+        ));
+        assert!(parse("update all").is_err());
     }
 
     #[test]
