@@ -290,7 +290,7 @@ impl CommandManager {
             Command::NewPlaylist(name) => {
                 if self.library.create_playlist(name).is_none() {
                     // create_playlist already posted the failure note.
-                    debug!("could not create playlist {name}");
+                    debug!("could not create playlist");
                 }
                 Ok(None)
             }
