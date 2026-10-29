@@ -42,7 +42,7 @@ use crate::playlist_edit::{self, EditError, created_playlist};
 use crate::playlist_items::UNAVAILABLE;
 use crate::playlist_layout::{
     LayoutEntry, PLAYLIST_FETCH_SPACING, Spacer, insert_after_pins, layout_from, pinned_ids,
-    remove_from_layout, set_pins,
+    remove_from_layout, replace_if_unchanged, set_pins,
 };
 use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
@@ -1862,6 +1862,22 @@ impl Library {
         self.trigger_redraw();
     }
 
+    /// Store `updated`, copied from the entry with snapshot `base_snapshot`, unless a sync
+    /// replaced that entry meanwhile; on a replace rewrite the cache and redraw. Returns
+    /// whether it was stored.
+    pub fn playlist_update_if_unchanged(&self, updated: &Playlist, base_snapshot: &str) -> bool {
+        let replaced =
+            replace_if_unchanged(&mut self.playlists.write().unwrap(), updated, base_snapshot);
+        if replaced {
+            self.save_cache(
+                &config::cache_path(CACHE_PLAYLISTS),
+                &self.playlists.read().unwrap(),
+            );
+            self.trigger_redraw();
+        }
+        replaced
+    }
+
     /// Check whether `track` is saved in the user's library.
     pub fn is_saved_track(&self, track: &Playable) -> bool {
         if !*self.is_done.read().unwrap() {
@@ -3527,6 +3543,27 @@ mod test {
             latched += 1;
         }));
         assert_eq!(latched, 1);
+    }
+
+    #[test]
+    fn a_reloaded_copy_does_not_replace_a_newer_sync_copy() {
+        let library = test_library();
+        let cleared = Playlist {
+            tracks: Some(Vec::new()),
+            ..playlist("p")
+        };
+        let reloaded = Playlist {
+            snapshot_id: "reload".into(),
+            ..cleared.clone()
+        };
+        *library.playlists.write().unwrap() = vec![cleared];
+        assert!(library.playlist_update_if_unchanged(&reloaded, ""));
+        assert_eq!(library.playlists.read().unwrap()[0].snapshot_id, "reload");
+
+        // A sync stored a newer copy after the view read the cleared one.
+        library.playlists.write().unwrap()[0].snapshot_id = "sync".into();
+        assert!(!library.playlist_update_if_unchanged(&reloaded, ""));
+        assert_eq!(library.playlists.read().unwrap()[0].snapshot_id, "sync");
     }
 
     #[test]
