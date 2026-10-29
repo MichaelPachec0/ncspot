@@ -31,8 +31,9 @@ impl PlaylistView {
         let cleared = playlist.tracks.is_some() && playlist.snapshot_id.is_empty();
         playlist.load_tracks(&queue.get_spotify());
         if cleared && !playlist.snapshot_id.is_empty() {
-            // Reloaded: store the current copy so the library matches the view.
-            library.playlist_update(&playlist);
+            // Reloaded: store the current copy so the library matches the view, unless a
+            // sync stored a newer one meanwhile.
+            library.playlist_update_if_unchanged(&playlist, "");
         }
 
         let rows = Arc::new(RwLock::new(sorted_rows(&library, &playlist)));

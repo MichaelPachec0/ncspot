@@ -42,7 +42,7 @@ use crate::playlist_edit::{self, EditError, created_playlist};
 use crate::playlist_items::UNAVAILABLE;
 use crate::playlist_layout::{
     LayoutEntry, PLAYLIST_FETCH_SPACING, Spacer, insert_after_pins, layout_from, pinned_ids,
-    remove_from_layout, set_pins,
+    remove_from_layout, replace_if_unchanged, set_pins,
 };
 use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
 use crate::spotify::Spotify;
@@ -522,7 +522,7 @@ impl Library {
     /// The overwrite of [Library::overwrite_playlist]; true when it read the playlist listing
     /// (after a Web overwrite).
     fn overwrite_and_list(&self, id: &str, tracks: &[Playable]) -> bool {
-        debug!("saving {} tracks to list {}", tracks.len(), id);
+        debug!("saving {} tracks to a playlist", tracks.len());
         let api = &self.spotify.api;
         let known = || self.known_playables();
         let web_used = Cell::new(false);
@@ -570,7 +570,7 @@ impl Library {
     /// Create a playlist with the given `name` and add `tracks` to it. One playlist listing
     /// at most: a Web create's sync runs only when the overwrite read no listing itself.
     pub fn save_playlist(&self, name: &str, tracks: &[Playable]) {
-        debug!("saving {} tracks to new list {}", tracks.len(), name);
+        debug!("saving {} tracks to a new playlist", tracks.len());
         match self.create_new_playlist(name) {
             Some((id, web_created)) => {
                 let listed = self.overwrite_and_list(&id, tracks);
@@ -1011,7 +1011,7 @@ impl Library {
             let mut downloaded = if current {
                 None
             } else {
-                info!("updating playlist {} (index: {})", remote.name, index);
+                info!("updating playlist (index: {index})");
                 let mut playlist = remote.clone();
                 playlist.tracks = None;
                 let tracks = playlist
@@ -1019,8 +1019,7 @@ impl Library {
                     .then(|| playlist.tracks.unwrap_or_default());
                 if tracks.is_none() {
                     warn!(
-                        "failed to load tracks for playlist {}, keeping cached copy",
-                        remote.name
+                        "failed to load tracks for playlist (index: {index}), keeping cached copy"
                     );
                 }
                 tracks
@@ -1861,6 +1860,22 @@ impl Library {
             &self.playlists.read().unwrap(),
         );
         self.trigger_redraw();
+    }
+
+    /// Store `updated`, copied from the entry with snapshot `base_snapshot`, unless a sync
+    /// replaced that entry meanwhile; on a replace rewrite the cache and redraw. Returns
+    /// whether it was stored.
+    pub fn playlist_update_if_unchanged(&self, updated: &Playlist, base_snapshot: &str) -> bool {
+        let replaced =
+            replace_if_unchanged(&mut self.playlists.write().unwrap(), updated, base_snapshot);
+        if replaced {
+            self.save_cache(
+                &config::cache_path(CACHE_PLAYLISTS),
+                &self.playlists.read().unwrap(),
+            );
+            self.trigger_redraw();
+        }
+        replaced
     }
 
     /// Check whether `track` is saved in the user's library.
@@ -3528,6 +3543,27 @@ mod test {
             latched += 1;
         }));
         assert_eq!(latched, 1);
+    }
+
+    #[test]
+    fn a_reloaded_copy_does_not_replace_a_newer_sync_copy() {
+        let library = test_library();
+        let cleared = Playlist {
+            tracks: Some(Vec::new()),
+            ..playlist("p")
+        };
+        let reloaded = Playlist {
+            snapshot_id: "reload".into(),
+            ..cleared.clone()
+        };
+        *library.playlists.write().unwrap() = vec![cleared];
+        assert!(library.playlist_update_if_unchanged(&reloaded, ""));
+        assert_eq!(library.playlists.read().unwrap()[0].snapshot_id, "reload");
+
+        // A sync stored a newer copy after the view read the cleared one.
+        library.playlists.write().unwrap()[0].snapshot_id = "sync".into();
+        assert!(!library.playlist_update_if_unchanged(&reloaded, ""));
+        assert_eq!(library.playlists.read().unwrap()[0].snapshot_id, "sync");
     }
 
     #[test]

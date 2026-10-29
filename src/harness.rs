@@ -211,10 +211,11 @@ pub fn new_playlist_test(library: &Library) -> Result<(), String> {
         .map_err(|e| format!("harness newplaylist-test: cannot read the list: {e}"))?;
     let name = format!("ncspot-test-{}", recorded.len() + 1);
     // A create whose rootlist add failed returns None and is not recorded, on purpose: that
-    // playlist exists but is not in the library.
-    let id = library
-        .create_playlist(&name)
-        .ok_or("harness newplaylist-test: create failed")?;
+    // playlist exists but is not in the library. A failed create has already posted its note,
+    // which is also the dump's error, so no second error is returned here.
+    let Some(id) = library.create_playlist(&name) else {
+        return Ok(());
+    };
     test_playlists::append(&path, &format!("spotify:playlist:{id}")).map_err(|e| {
         error!("recording a test playlist failed: {e}");
         format!("harness newplaylist-test: created {name} but could not record it: {e}")

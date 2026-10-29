@@ -113,6 +113,23 @@ pub fn pinned_ids(items: &[Item]) -> Vec<String> {
 /// The playlist store the rows look their playlists up in (`Library::playlists`).
 pub type PlaylistStore = Arc<RwLock<Vec<Playlist>>>;
 
+/// Replace the entry of `updated` in `store` when its snapshot is still `base_snapshot`, the
+/// one `updated` was copied from; a sync that stored another snapshot meanwhile wins. False
+/// when nothing was replaced (also for a playlist no longer in the store).
+pub fn replace_if_unchanged(
+    store: &mut [Playlist],
+    updated: &Playlist,
+    base_snapshot: &str,
+) -> bool {
+    match store.iter_mut().find(|p| p.id == updated.id) {
+        Some(entry) if entry.snapshot_id == base_snapshot => {
+            *entry = updated.clone();
+            true
+        }
+        _ => false,
+    }
+}
+
 /// One row of the Playlists tab.
 #[derive(Clone)]
 pub enum PlaylistRow {
@@ -147,13 +164,21 @@ impl PlaylistRow {
         store.iter().find(|p| &p.id == id).map(f)
     }
 
-    /// `f` on the store entry under the store write lock, so loaded tracks land in the
-    /// store.
-    fn with_mut(&self, f: impl FnOnce(&mut Playlist)) {
-        if let Self::Playlist { id, store, .. } = self
-            && let Some(p) = store.write().unwrap().iter_mut().find(|p| &p.id == id)
-        {
-            f(p);
+    /// `f` on a copy of the store entry with no store lock held (it may load the tracks over
+    /// the network), then a copy whose tracks or snapshot `f` changed goes back to the store
+    /// unless a sync replaced the entry meanwhile (see [replace_if_unchanged]).
+    fn with_copy(&self, f: impl FnOnce(&mut Playlist)) {
+        let Self::Playlist { store, .. } = self else {
+            return;
+        };
+        let Some(mut copy) = self.snapshot() else {
+            return;
+        };
+        let base_snapshot = copy.snapshot_id.clone();
+        let base_loaded = copy.tracks.is_some();
+        f(&mut copy);
+        if copy.snapshot_id != base_snapshot || copy.tracks.is_some() != base_loaded {
+            replace_if_unchanged(&mut store.write().unwrap(), &copy, &base_snapshot);
         }
     }
 
@@ -208,15 +233,15 @@ impl ListItem for PlaylistRow {
     }
 
     fn play(&mut self, queue: &Queue) {
-        self.with_mut(|p| p.play(queue));
+        self.with_copy(|p| p.play(queue));
     }
 
     fn play_next(&mut self, queue: &Queue) {
-        self.with_mut(|p| p.play_next(queue));
+        self.with_copy(|p| p.play_next(queue));
     }
 
     fn queue(&mut self, queue: &Queue) {
-        self.with_mut(|p| p.queue(queue));
+        self.with_copy(|p| p.queue(queue));
     }
 
     fn toggle_saved(&mut self, library: &Library) {
@@ -392,6 +417,73 @@ mod tests {
             collaborative: false,
             cover_url: None,
         }
+    }
+
+    fn with_snapshot(id: &str, snapshot: &str, loaded: bool) -> Playlist {
+        Playlist {
+            snapshot_id: snapshot.into(),
+            tracks: loaded.then(Vec::new),
+            ..p(id)
+        }
+    }
+
+    fn row(id: &str, store: &PlaylistStore) -> PlaylistRow {
+        PlaylistRow::Playlist {
+            id: id.into(),
+            pinned: false,
+            depth: 0,
+            store: store.clone(),
+        }
+    }
+
+    #[test]
+    fn replace_if_unchanged_replaces_only_the_same_snapshot() {
+        let mut store = vec![with_snapshot("a", "s1", false)];
+        assert!(replace_if_unchanged(
+            &mut store,
+            &with_snapshot("a", "s1", true),
+            "s1"
+        ));
+        assert!(store[0].tracks.is_some());
+
+        let mut store = vec![with_snapshot("a", "s2", false)];
+        assert!(!replace_if_unchanged(
+            &mut store,
+            &with_snapshot("a", "s1", true),
+            "s1"
+        ));
+        assert_eq!(
+            (store[0].snapshot_id.as_str(), store[0].tracks.is_none()),
+            ("s2", true)
+        );
+
+        let mut store = vec![with_snapshot("b", "s1", false)];
+        assert!(!replace_if_unchanged(
+            &mut store,
+            &with_snapshot("a", "s1", true),
+            "s1"
+        ));
+    }
+
+    #[test]
+    fn a_row_action_runs_outside_the_store_lock_and_stores_the_loaded_copy() {
+        let store: PlaylistStore = Arc::new(RwLock::new(vec![with_snapshot("a", "s1", false)]));
+        row("a", &store).with_copy(|p| {
+            assert!(store.try_write().is_ok(), "the store lock is held");
+            p.tracks = Some(Vec::new());
+        });
+        assert!(store.read().unwrap()[0].tracks.is_some());
+    }
+
+    #[test]
+    fn a_row_action_keeps_a_newer_sync_copy() {
+        let store: PlaylistStore = Arc::new(RwLock::new(vec![with_snapshot("a", "", true)]));
+        row("a", &store).with_copy(|p| {
+            // A sync stores a newer copy while the action reloads.
+            store.write().unwrap()[0] = with_snapshot("a", "sync", true);
+            p.snapshot_id = "reload".into();
+        });
+        assert_eq!(store.read().unwrap()[0].snapshot_id, "sync");
     }
 
     fn describe(rows: &[PlaylistRow]) -> Vec<String> {
