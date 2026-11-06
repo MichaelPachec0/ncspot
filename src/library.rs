@@ -54,7 +54,7 @@ use crate::playlist_writer::{
     JobKind, PlaylistWriter, QUIT_GRACE, Settled, WRITER_HEALTHY, WorkerExit, WriteJob,
     after_worker_exit, apply_local,
 };
-use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, random_jitter};
+use crate::rate_limit::{MAX_SYNC_RESUMES, RESUME_MIN_DELAY, Stamp, is_ui_thread, random_jitter};
 use crate::save_log::{
     Prior, SaveItem, SaveLog, SaveOp, SavedStore, WriteOutcome, rebuild_artists, run_with_retries,
 };
@@ -102,6 +102,10 @@ struct CacheGates {
     artists: Mutex<()>,
     shows: Mutex<()>,
     episodes: Mutex<()>,
+    /// As above for `playlists.db`, which the UI thread may ask for but never writes itself.
+    playlists: Mutex<()>,
+    /// A background save of `playlists.db` is asked for and has not taken its copy yet.
+    playlists_dirty: AtomicBool,
 }
 
 /// The user library with all their saved tracks, albums, playlists... High level interface to the
@@ -2118,12 +2122,54 @@ impl Library {
             .collect()
     }
 
-    /// Save the store to `playlists.db` (see [Library::cached_playlists]).
+    /// Save the store to `playlists.db` (see [Library::cached_playlists]). The file can be tens
+    /// of megabytes, so from the UI thread this only asks a background thread to do it.
     fn save_playlists(&self) {
+        self.save_playlists_from(is_ui_thread());
+    }
+
+    fn save_playlists_from(&self, ui_thread: bool) {
+        if ui_thread {
+            self.save_playlists_later();
+        } else {
+            self.save_playlists_now();
+        }
+    }
+
+    /// Save `playlists.db` here and now. Under the gate, so the newest copy is written last.
+    fn save_playlists_now(&self) {
+        let _gate = self.cache_gates.playlists.lock();
+        // Before the copy: a change after this point asks for another save.
+        self.cache_gates
+            .playlists_dirty
+            .store(false, Ordering::Release);
         self.save_cache(
             &config::cache_path(CACHE_PLAYLISTS),
             &self.cached_playlists(),
         );
+    }
+
+    /// Save `playlists.db` on a background thread. Requests made before it takes its copy are
+    /// covered by that one save.
+    fn save_playlists_later(&self) {
+        if self
+            .cache_gates
+            .playlists_dirty
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let library = self.clone();
+        thread::spawn(move || library.save_playlists_now());
+    }
+
+    /// For quit: wait for a background save, or do the one still asked for.
+    pub fn finish_playlist_save(&self) {
+        if self.cache_gates.playlists_dirty.load(Ordering::Acquire) {
+            self.save_playlists_now();
+        } else {
+            drop(self.cache_gates.playlists.lock());
+        }
     }
 
     /// For quit: drop queued playlist writes and put back the confirmed copy of every playlist
@@ -2152,7 +2198,7 @@ impl Library {
             self.writer.release(id);
         }
         self.bump_playlists_rev();
-        self.save_playlists();
+        self.save_playlists_now();
     }
 
     /// Wait (on a helper thread) for the write in flight, at most [QUIT_GRACE], then `then`.
@@ -5865,6 +5911,47 @@ mod test {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn the_ui_thread_never_waits_for_a_playlist_save() {
+        let library = library_with_playlist("p", &["a"]);
+        // A save in progress: anything that waits for this gate would hang below.
+        let gate = library.cache_gates.playlists.lock();
+        let (done, returned) = crossbeam_channel::bounded(1);
+        {
+            let library = library.clone();
+            thread::spawn(move || {
+                library.save_playlists_from(true);
+                let _ = done.send(());
+            });
+        }
+        assert!(returned.recv_timeout(Duration::from_secs(10)).is_ok());
+        drop(gate);
+        library.finish_playlist_save();
+        let dirty = &library.cache_gates.playlists_dirty;
+        assert!(!dirty.load(Ordering::Acquire), "the asked for save ran");
+    }
+
+    #[test]
+    fn repeated_ui_saves_share_one_background_save() {
+        let library = library_with_playlist("p", &["a"]);
+        let gate = library.cache_gates.playlists.lock();
+        library.save_playlists_later();
+        library.save_playlists_later();
+        let dirty = &library.cache_gates.playlists_dirty;
+        assert!(dirty.load(Ordering::Acquire));
+        drop(gate);
+        library.finish_playlist_save();
+        assert!(!dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn finishing_with_no_save_asked_for_returns_at_once() {
+        let library = library_with_playlist("p", &["a"]);
+        library.finish_playlist_save();
+        let dirty = &library.cache_gates.playlists_dirty;
+        assert!(!dirty.load(Ordering::Acquire));
     }
 
     #[test]

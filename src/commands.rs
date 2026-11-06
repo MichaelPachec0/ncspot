@@ -179,6 +179,7 @@ impl CommandManager {
                     return Ok(Some("Finishing changes...".into()));
                 }
                 self.library.reset_pending_writes();
+                self.library.finish_playlist_save();
                 let queue = self.queue.queue.read().unwrap();
                 self.config.with_state_mut(move |s| {
                     debug!(
