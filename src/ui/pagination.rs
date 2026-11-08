@@ -1,3 +1,4 @@
+use crate::ext_traits::RwLockExt;
 use crate::library::Library;
 use crate::traits::ListItem;
 use log::debug;
@@ -101,6 +102,40 @@ impl<I: ListItem + Clone> ApiResult<I> {
             None
         }
     }
+}
+
+/// Run `fetch` on a background thread and fill `content` with its first page, so a view can be
+/// built on the UI thread without waiting on the network or the rate limiter. Later pages are
+/// appended to `content` through `pagination`. `redraw` runs once the first page is in.
+pub fn fill_in_background<I, F, R>(
+    content: Arc<RwLock<Vec<I>>>,
+    pagination: Pagination<I>,
+    fetch: F,
+    redraw: R,
+) where
+    I: ListItem + Clone + Send + Sync + 'static,
+    F: FnOnce() -> ApiResult<I> + Send + 'static,
+    R: FnOnce() + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let result = fetch();
+        let first_page = result.items.read_unpoisoned().clone();
+        let loaded = {
+            let mut content = content.write_unpoisoned();
+            content.extend(first_page);
+            content.len()
+        };
+        pagination.set(
+            loaded,
+            result.total as usize,
+            Box::new(move |content| {
+                if let Some(items) = result.next() {
+                    content.write_unpoisoned().extend(items);
+                }
+            }),
+        );
+        redraw();
+    });
 }
 
 pub type Paginator<I> = Box<dyn Fn(Arc<RwLock<Vec<I>>>) + Send + Sync>;
@@ -260,5 +295,41 @@ mod test {
         r.fetch_all();
         assert!(r.failed());
         assert!(calls.load(Ordering::SeqCst) <= 2);
+    }
+
+    #[test]
+    fn fill_in_background_returns_before_the_first_page() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (release, gate) = mpsc::channel::<()>();
+        let (redrawn, redraw_seen) = mpsc::channel::<()>();
+        let content: Arc<RwLock<Vec<Playlist>>> = Arc::new(RwLock::new(Vec::new()));
+        let pagination = Pagination::default();
+
+        fill_in_background(
+            content.clone(),
+            pagination.clone(),
+            move || {
+                gate.recv().unwrap();
+                ApiResult::new(1, three_pages(false))
+            },
+            move || redrawn.send(()).unwrap(),
+        );
+
+        // The first page is still held back, so nothing is loaded yet.
+        assert!(content.read().unwrap().is_empty());
+        assert_eq!(pagination.max_content(), None);
+
+        release.send(()).unwrap();
+        redraw_seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(content.read().unwrap().len(), 1);
+        assert_eq!(pagination.loaded_content(), 1);
+        assert_eq!(pagination.max_content(), Some(3));
+
+        // The paginator appends later pages to the view's own list.
+        let callback = pagination.callback.read().unwrap();
+        callback.as_ref().unwrap()(content.clone());
+        assert_eq!(content.read().unwrap().len(), 2);
     }
 }
