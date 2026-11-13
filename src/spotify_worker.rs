@@ -34,6 +34,17 @@ pub(crate) enum WorkerCommand {
     Shutdown,
 }
 
+/// Why [Worker::run_loop] ended.
+#[derive(Debug)]
+pub(crate) enum WorkerEnd {
+    /// A [WorkerCommand::Shutdown] was received (`:reconnect`, `:logout`).
+    Shutdown,
+    /// The librespot player event channel closed.
+    PlayerChannelDied,
+    /// Every command sender is gone, so nothing can reach this worker any more.
+    Orphaned,
+}
+
 #[derive(Debug)]
 enum PlayerStatus {
     Playing,
@@ -102,7 +113,7 @@ impl Worker {
         }
     }
 
-    pub async fn run_loop(&mut self) {
+    pub async fn run_loop(&mut self) -> WorkerEnd {
         let mut ui_refresh = time::interval(Duration::from_millis(400));
         let mut reconnect: Option<BoxFuture<'static, Result<Session, librespot_core::Error>>> =
             None;
@@ -194,9 +205,12 @@ impl Worker {
                         self.session.shutdown();
                         self.pending.on_stop();
                         self.events.send(Event::Player(PlayerEvent::Stopped));
-                        break;
+                        return WorkerEnd::Shutdown;
                     }
-                    None => info!("empty stream")
+                    None => {
+                        info!("worker command stream closed, terminating worker");
+                        return WorkerEnd::Orphaned;
+                    }
                 },
                 event = self.player_events.next() => match event {
                     Some(LibrespotPlayerEvent::Playing {
@@ -256,7 +270,7 @@ impl Worker {
                     }
                     None => {
                         warn!("Librespot player event channel died, terminating worker");
-                        break
+                        return WorkerEnd::PlayerChannelDied;
                     },
                 },
                 // Update animated parts of the UI (e.g. statusbar during playback).

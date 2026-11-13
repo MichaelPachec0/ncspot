@@ -350,7 +350,7 @@ impl CommandManager {
                 Ok(None)
             }
             Command::Reconnect => {
-                self.spotify.shutdown();
+                self.spotify.reconnect();
                 Ok(None)
             }
             Command::AddCurrent => {
