@@ -335,6 +335,10 @@ impl ListItem for Album {
         true
     }
 
+    fn id(&self) -> Option<String> {
+        self.id.clone()
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
     }

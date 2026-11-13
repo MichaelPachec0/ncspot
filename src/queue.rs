@@ -534,7 +534,8 @@ impl Queue {
             index = rng.random_range(0..queue_length);
         }
 
-        if let Some(track) = &self.queue.read().get(index) {
+        let track = self.queue.read().get(index).cloned();
+        if let Some(track) = &track {
             self.spotify.load(track, true, 0);
             let mut current = self.current_track.write();
             current.replace(index);

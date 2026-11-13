@@ -64,6 +64,12 @@ pub trait ListItem: Sync + Send + 'static {
         false
     }
 
+    /// The Spotify id, used to tell whether a list slot still holds this item.
+    /// `None` never matches.
+    fn id(&self) -> Option<String> {
+        None
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem>;
 }
 

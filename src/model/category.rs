@@ -62,6 +62,10 @@ impl ListItem for Category {
         Some(format!("https://open.spotify.com/genre/{}", self.id))
     }
 
+    fn id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
     }

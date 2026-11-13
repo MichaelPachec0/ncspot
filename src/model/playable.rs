@@ -176,6 +176,10 @@ impl fmt::Display for Playable {
 }
 
 impl ListItem for Playable {
+    fn id(&self) -> Option<String> {
+        Self::id(self)
+    }
+
     fn is_playable(&self) -> bool {
         self.as_listitem().is_playable()
     }

@@ -340,6 +340,10 @@ impl ListItem for Track {
         self.is_playable == Some(true)
     }
 
+    fn id(&self) -> Option<String> {
+        self.id.clone()
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
     }

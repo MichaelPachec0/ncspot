@@ -164,6 +164,10 @@ impl ListItem for Show {
         true
     }
 
+    fn id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
     }

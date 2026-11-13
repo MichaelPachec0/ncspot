@@ -197,16 +197,19 @@ impl<I: ListItem + Clone> ListView<I> {
     /// currently playing track and start playing them. Returns true if adding and playing the
     /// tracks succeeded, false otherwhise.
     fn attempt_play_all_tracks(&self) -> bool {
-        let content = self.content.read();
-        let any = &(*content) as &dyn std::any::Any;
-        let playables = any.downcast_ref::<Vec<Playable>>();
-        let tracks = any.downcast_ref::<Vec<Track>>().map(|t| {
-            t.iter()
-                .map(|t| Playable::Track(t.clone()))
-                .collect::<Vec<Playable>>()
-        });
-        if let Some(tracks) = playables.or(tracks.as_ref()) {
-            let index = self.queue.append_next(tracks);
+        let playables = {
+            let content = self.content.read();
+            let any = &(*content) as &dyn std::any::Any;
+            any.downcast_ref::<Vec<Playable>>().cloned().or_else(|| {
+                any.downcast_ref::<Vec<Track>>().map(|t| {
+                    t.iter()
+                        .map(|t| Playable::Track(t.clone()))
+                        .collect::<Vec<Playable>>()
+                })
+            })
+        };
+        if let Some(playables) = playables {
+            let index = self.queue.append_next(&playables);
             self.queue.play(index + self.selected, true, false);
             true
         } else {
@@ -214,12 +217,37 @@ impl<I: ListItem + Clone> ListView<I> {
         }
     }
 
+    /// Run `f` on a clone of the selected item with no list guard held, then
+    /// store the clone back if that slot still holds the same item (same
+    /// `id()`, both `Some`). `None` if nothing is selected.
+    fn with_selected_item<R>(&self, f: impl FnOnce(&mut I) -> R) -> Option<R> {
+        let index = self.selected;
+        let mut item = self.content.read().get(index).cloned()?;
+        let result = f(&mut item);
+        if let Some(id) = item.id() {
+            let mut content = self.content.write();
+            if let Some(slot) = content.get_mut(index)
+                && slot.id() == Some(id)
+            {
+                *slot = item;
+            }
+        }
+        Some(result)
+    }
+
+    /// The view the selected item opens, if any. No list guard is held while opening.
+    fn open_selected(&self) -> Option<Box<dyn ViewExt>> {
+        let target = self
+            .content
+            .read()
+            .get(self.selected)
+            .map(ListItem::as_listitem);
+        target?.open(self.queue.clone(), self.library.clone())
+    }
+
     /// Appends the currently focused item after the currently playing item and starts playing it.
     fn play_current_item(&mut self) {
-        let mut content = self.content.write();
-        if let Some(listitem) = content.get_mut(self.selected) {
-            listitem.play(&self.queue);
-        }
+        self.with_selected_item(|item| item.play(&self.queue));
     }
 
     /// Get the selected row from a mouse position and offset
@@ -286,14 +314,7 @@ impl<I: ListItem + Clone> ListView<I> {
                         // The clicked position wasn't focused yet or the item is a collection
                         // that can be opened.
                         self.move_focus_to(clicked_row_index);
-                        let content = self.content.read();
-                        let clicked_list_item =
-                            content.get(self.selected).map(ListItem::as_listitem);
-
-                        if let Some(target) = clicked_list_item
-                            && let Some(view) =
-                                target.open(self.queue.clone(), self.library.clone())
-                        {
+                        if let Some(view) = self.open_selected() {
                             return MouseHandleResult::Handled(EventResult::Consumed(Some(
                                 Callback::from_fn_once(move |s| {
                                     s.on_layout(|_, mut l| l.push_view(view));
@@ -561,18 +582,12 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
             }
             Command::PlayNext => {
                 info!("played next");
-                let mut content = self.content.write();
-                if let Some(item) = content.get_mut(self.selected) {
-                    item.play_next(&self.queue);
-                }
+                self.with_selected_item(|item| item.play_next(&self.queue));
 
                 return Ok(CommandResult::Consumed(None));
             }
             Command::Queue => {
-                let mut content = self.content.write();
-                if let Some(item) = content.get_mut(self.selected) {
-                    item.queue(&self.queue);
-                }
+                self.with_selected_item(|item| item.queue(&self.queue));
 
                 return Ok(CommandResult::Consumed(None));
             }
@@ -735,8 +750,8 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 }
             }
             Command::Goto(mode) => {
-                let mut content = self.content.write();
-                if let Some(item) = content.get_mut(self.selected) {
+                let item = self.content.read().get(self.selected).cloned();
+                if let Some(item) = item {
                     let queue = self.queue.clone();
                     let library = self.library.clone();
 
@@ -960,6 +975,182 @@ mod draw_test {
         let finished = searched.recv_timeout(Duration::from_secs(30)).is_ok();
         stop.store(true, Ordering::Relaxed);
         assert!(finished, "a search deadlocked on the store lock");
+        writer.join().unwrap();
+    }
+
+    /// A list item that fails the test if any of its calls runs under a list guard.
+    #[derive(Clone)]
+    struct Probe {
+        id: String,
+        plays: u32,
+        list: Arc<std::sync::OnceLock<Arc<RwLock<Vec<Self>>>>>,
+    }
+
+    impl Probe {
+        fn assert_unlocked(&self) {
+            assert!(
+                !self.list.get().unwrap().is_locked(),
+                "list guard held across a call"
+            );
+        }
+    }
+
+    impl ListItem for Probe {
+        fn is_playing(&self, _queue: &Queue) -> bool {
+            false
+        }
+        fn display_left(&self, _library: &Library) -> String {
+            self.id.clone()
+        }
+        fn display_right(&self, _library: &Library) -> String {
+            String::new()
+        }
+        fn play(&mut self, _queue: &Queue) {
+            self.assert_unlocked();
+            self.plays += 1;
+        }
+        fn play_next(&mut self, _queue: &Queue) {
+            self.assert_unlocked();
+            self.plays += 1;
+        }
+        fn queue(&mut self, _queue: &Queue) {
+            self.assert_unlocked();
+            self.plays += 1;
+        }
+        fn toggle_saved(&mut self, _library: &Library) {}
+        fn save(&mut self, _library: &Library) {}
+        fn unsave(&mut self, _library: &Library) {}
+        fn open(&self, _queue: Arc<Queue>, _library: Arc<Library>) -> Option<Box<dyn ViewExt>> {
+            self.assert_unlocked();
+            None
+        }
+        fn share_url(&self) -> Option<String> {
+            None
+        }
+        fn album(&self, _queue: &Queue) -> Option<Album> {
+            self.assert_unlocked();
+            None
+        }
+        fn id(&self) -> Option<String> {
+            Some(self.id.clone())
+        }
+        fn as_listitem(&self) -> Box<dyn ListItem> {
+            Box::new(self.clone())
+        }
+    }
+
+    /// A list of `n` probes with row 1 selected, and its content handle.
+    fn probe_list(n: usize) -> (ListView<Probe>, Arc<RwLock<Vec<Probe>>>) {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify.clone(), cfg.clone());
+        let queue = Arc::new(Queue::new(spotify, cfg, library.clone()));
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let content = Arc::new(RwLock::new(
+            (0..n)
+                .map(|i| Probe {
+                    id: format!("p{i}"),
+                    plays: 0,
+                    list: cell.clone(),
+                })
+                .collect::<Vec<_>>(),
+        ));
+        cell.set(content.clone()).ok().unwrap();
+        let mut list = ListView::new(content.clone(), queue, library);
+        list.selected = 1;
+        (list, content)
+    }
+
+    #[test]
+    fn play_current_item_holds_no_list_guard() {
+        let (mut list, content) = probe_list(3);
+        list.play_current_item();
+        assert_eq!(content.read()[1].plays, 1);
+    }
+
+    #[test]
+    fn play_next_command_holds_no_list_guard() {
+        let (mut list, content) = probe_list(3);
+        let mut siv = cursive::Cursive::new();
+        list.on_command(&mut siv, &Command::PlayNext).unwrap();
+        assert_eq!(content.read()[1].plays, 1);
+    }
+
+    #[test]
+    fn queue_command_holds_no_list_guard() {
+        let (mut list, content) = probe_list(3);
+        let mut siv = cursive::Cursive::new();
+        list.on_command(&mut siv, &Command::Queue).unwrap();
+        assert_eq!(content.read()[1].plays, 1);
+    }
+
+    #[test]
+    fn goto_album_holds_no_list_guard() {
+        let (mut list, _content) = probe_list(3);
+        let mut siv = cursive::Cursive::new();
+        let result = list.on_command(&mut siv, &Command::Goto(GotoMode::Album));
+        assert!(result.is_ok());
+    }
+
+    /// The click path opens the clicked row through `open_selected`.
+    #[test]
+    fn opening_a_clicked_row_holds_no_list_guard() {
+        let (mut list, _content) = probe_list(3);
+        list.selected = 2;
+        assert!(list.open_selected().is_none());
+    }
+
+    #[test]
+    fn write_back_is_dropped_when_the_item_moved() {
+        let (list, content) = probe_list(3);
+        list.with_selected_item(|item| {
+            let mut moved = content.read()[1].clone();
+            moved.id = "other".into();
+            *content.write() = vec![moved.clone(), moved.clone(), moved];
+            item.plays += 5;
+        });
+        let content = content.read();
+        assert_eq!(content[1].plays, 0);
+        assert_eq!(content[1].id, "other");
+    }
+
+    #[test]
+    fn actions_on_a_selection_past_the_end_do_nothing() {
+        let (mut list, content) = probe_list(3);
+        content.write().truncate(1);
+        let mut siv = cursive::Cursive::new();
+        list.play_current_item();
+        list.on_command(&mut siv, &Command::PlayNext).unwrap();
+        list.on_command(&mut siv, &Command::Queue).unwrap();
+        list.on_command(&mut siv, &Command::Goto(GotoMode::Album))
+            .unwrap();
+        assert!(list.with_selected_item(|_| ()).is_none());
+        assert_eq!(content.read()[0].plays, 0);
+    }
+
+    #[test]
+    fn play_all_tracks_survives_a_waiting_writer() {
+        let (list, library) = track_list();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (library, stop) = (library.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    drop(library.tracks.write());
+                }
+            })
+        };
+        let (done, played) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            for _ in 0..300 {
+                list.attempt_play_all_tracks();
+            }
+            let _ = done.send(());
+        });
+        let finished = played.recv_timeout(Duration::from_secs(30)).is_ok();
+        stop.store(true, Ordering::Relaxed);
+        assert!(finished, "playing all tracks deadlocked on the store lock");
         writer.join().unwrap();
     }
 }

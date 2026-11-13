@@ -305,6 +305,10 @@ impl ListItem for PlaylistRow {
         self.with(ListItem::is_playable).unwrap_or(false)
     }
 
+    fn id(&self) -> Option<String> {
+        self.playlist_id().map(str::to_string)
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
     }
