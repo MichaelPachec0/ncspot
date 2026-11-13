@@ -61,18 +61,30 @@ enum Route {
     Restricted,
 }
 
-/// Whether a call that failed on the personal client with HTTP `status` should be retried once
-/// on the shared client. A 401 means the personal token needs a refresh (started in the
-/// background), so any call is retried. A 403 or 404 on a playlist read means a Spotify-owned
-/// playlist, which Development Mode apps can't read.
 /// Clears `refreshing` when dropped, also while a panicking refresh unwinds, so one failed
 /// refresh cannot block every later one.
 fn refresh_guard(refreshing: Arc<AtomicBool>) -> OnDrop<impl FnOnce()> {
     OnDrop::new(move || refreshing.store(false, Ordering::Release))
 }
 
+/// Whether a call that failed on the personal client with HTTP `status` should be retried once
+/// on the shared client. A 401 means the personal token needs a refresh (started in the
+/// background), so any call is retried. A 403 or 404 on a playlist read means a Spotify-owned
+/// playlist, which Development Mode apps can't read.
 fn should_retry_on_shared(status: u16, playlist_read: bool) -> bool {
     status == 401 || (playlist_read && matches!(status, 403 | 404))
+}
+
+/// rspotify keeps its token in a std Mutex that we cannot replace. This is the
+/// only place the crate locks it; a poisoned lock is cleared and used as is.
+#[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+fn token_slot(
+    m: &std::sync::Mutex<Option<rspotify::Token>>,
+) -> std::sync::MutexGuard<'_, Option<rspotify::Token>> {
+    m.lock().unwrap_or_else(|e| {
+        m.clear_poison();
+        e.into_inner()
+    })
 }
 
 /// How long the personal client skips refreshing after a transient failure.
@@ -678,7 +690,7 @@ impl WebApi {
                     let expires_at = token
                         .expires_at
                         .unwrap_or_else(|| Utc::now() + ChronoDuration::hours(1));
-                    *api_token.lock().unwrap() = Some(token);
+                    *token_slot(&api_token) = Some(token);
                     *api_token_expiration.write() = expires_at;
                     *refresh_backoff_until.write() = None;
                 }
@@ -2144,5 +2156,20 @@ mod test {
             .is_err()
         );
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    #[allow(clippy::disallowed_methods, clippy::disallowed_types)]
+    fn token_slot_clears_poison_and_keeps_the_token() {
+        let m = Arc::new(std::sync::Mutex::new(Some(rspotify::Token::default())));
+        let held = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = held.lock().unwrap();
+            panic!("boom");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        assert!(token_slot(&m).is_some());
+        assert!(!m.is_poisoned());
     }
 }
