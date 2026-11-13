@@ -370,6 +370,12 @@ impl From<&FullPlaylist> for Playlist {
 }
 
 impl ListItem for Playlist {
+    fn merge_loaded(&mut self, loaded: Self) {
+        if self.tracks.is_none() && self.snapshot_id == loaded.snapshot_id {
+            self.tracks = loaded.tracks;
+        }
+    }
+
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = self.tracks.as_ref() {
             let playing: Vec<String> = queue.list().read().iter().filter_map(|t| t.id()).collect();

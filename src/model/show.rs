@@ -76,6 +76,12 @@ impl fmt::Display for Show {
 }
 
 impl ListItem for Show {
+    fn merge_loaded(&mut self, loaded: Self) {
+        if self.episodes.is_none() {
+            self.episodes = loaded.episodes;
+        }
+    }
+
     fn is_playing(&self, _queue: &Queue) -> bool {
         false
     }

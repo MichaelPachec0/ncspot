@@ -219,8 +219,9 @@ impl<I: ListItem + Clone> ListView<I> {
     }
 
     /// Run `f` on a clone of the selected item with no list guard held, then
-    /// store the clone back if that slot still holds the same item (same
-    /// `id()`, both `Some`). `None` if nothing is selected.
+    /// merge what `f` loaded into that slot if it still holds the same item
+    /// (same `id()`, both `Some`). The slot is never replaced, so a sync that
+    /// refreshed it while `f` ran keeps its data. `None` if nothing is selected.
     fn with_selected_item<R>(&self, f: impl FnOnce(&mut I) -> R) -> Option<R> {
         let index = self.selected;
         let mut item = self.content.read().get(index).cloned()?;
@@ -230,7 +231,7 @@ impl<I: ListItem + Clone> ListView<I> {
             if let Some(slot) = content.get_mut(index)
                 && slot.id() == Some(id)
             {
-                *slot = item;
+                slot.merge_loaded(item);
             }
         }
         Some(result)
@@ -984,6 +985,8 @@ mod draw_test {
     struct Probe {
         id: String,
         plays: u32,
+        /// Stands for data a sync refreshes; no action changes it.
+        revision: u32,
         list: Arc<std::sync::OnceLock<Arc<RwLock<Vec<Self>>>>>,
     }
 
@@ -1035,6 +1038,9 @@ mod draw_test {
         fn id(&self) -> Option<String> {
             Some(self.id.clone())
         }
+        fn merge_loaded(&mut self, loaded: Self) {
+            self.plays = loaded.plays;
+        }
         fn as_listitem(&self) -> Box<dyn ListItem> {
             Box::new(self.clone())
         }
@@ -1053,6 +1059,7 @@ mod draw_test {
                 .map(|i| Probe {
                     id: format!("p{i}"),
                     plays: 0,
+                    revision: 0,
                     list: cell.clone(),
                 })
                 .collect::<Vec<_>>(),
@@ -1114,6 +1121,18 @@ mod draw_test {
         let content = content.read();
         assert_eq!(content[1].plays, 0);
         assert_eq!(content[1].id, "other");
+    }
+
+    #[test]
+    fn write_back_keeps_a_refresh_of_the_same_slot() {
+        let (list, content) = probe_list(3);
+        list.with_selected_item(|item| {
+            content.write()[1].revision = 7;
+            item.plays += 5;
+        });
+        let content = content.read();
+        assert_eq!(content[1].revision, 7);
+        assert_eq!(content[1].plays, 5);
     }
 
     #[test]

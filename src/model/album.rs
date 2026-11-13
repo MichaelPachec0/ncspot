@@ -180,6 +180,14 @@ impl fmt::Debug for Album {
 }
 
 impl ListItem for Album {
+    fn merge_loaded(&mut self, loaded: Self) {
+        let have = self.tracks.as_ref().map_or(0, Vec::len);
+        if loaded.tracks.as_ref().is_some_and(|t| t.len() > have) {
+            self.total_tracks = loaded.total_tracks;
+            self.tracks = loaded.tracks;
+        }
+    }
+
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = self.tracks.as_ref() {
             let playing: Vec<String> = queue.list().read().iter().filter_map(|t| t.id()).collect();

@@ -79,6 +79,12 @@ impl fmt::Debug for Artist {
 }
 
 impl ListItem for Artist {
+    fn merge_loaded(&mut self, loaded: Self) {
+        if self.tracks.is_none() {
+            self.tracks = loaded.tracks;
+        }
+    }
+
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = &self.tracks {
             let playing: Vec<String> = queue.list().read().iter().filter_map(|t| t.id()).collect();
