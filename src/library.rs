@@ -61,6 +61,7 @@ use crate::save_log::{
 use crate::spotify::Spotify;
 use crate::spotify_api::WebApi;
 use crate::traits::ListItem;
+use crate::utils::OnDrop;
 
 /// Keys of `UserState::library_full_fetch`.
 const FULL_FETCH_TRACKS: &str = "tracks";
@@ -859,8 +860,8 @@ impl Library {
     /// running. If the sync is left incomplete by a rate limit, a resume (not forced) is
     /// scheduled for when the limit has passed.
     pub fn update_library(&self, force_full: bool) {
-        if self.start_sync() {
-            self.run_update(force_full);
+        if let Some(guard) = self.start_sync() {
+            self.run_update(force_full, guard);
         }
     }
 
@@ -877,14 +878,11 @@ impl Library {
     }
 
     /// The body of [Library::update_library], on a background thread; the caller holds the
-    /// sync slot from [Library::start_sync].
-    fn run_update(&self, force_full: bool) {
+    /// sync slot from [Library::start_sync] and passes its `guard` in.
+    fn run_update(&self, force_full: bool, guard: SyncGuard) {
         let library = self.clone();
         thread::spawn(move || {
-            let _guard = SyncGuard {
-                syncing: library.syncing.clone(),
-                saves: library.saves.clone(),
-            };
+            let _guard = guard;
             let sync_start = Stamp::now();
             let started = Instant::now();
 
@@ -947,17 +945,14 @@ impl Library {
         let Some(set) = tab_set(tab, self.episodes_enabled) else {
             return TabUpdate::NoSet;
         };
-        if !self.start_sync() {
+        let Some(guard) = self.start_sync() else {
             return TabUpdate::Busy;
-        }
+        };
         info!("library tab update: {set:?}");
 
         let library = self.clone();
         thread::spawn(move || {
-            let _guard = SyncGuard {
-                syncing: library.syncing.clone(),
-                saves: library.saves.clone(),
-            };
+            let _guard = guard;
             match set {
                 SyncSet::Collection => {
                     library.sync_collection(false);
@@ -985,19 +980,31 @@ impl Library {
         TabUpdate::Started
     }
 
-    /// Take the one sync slot and clear `is_done`; false (logged) if a sync already runs.
-    /// The sync thread releases the slot with a [SyncGuard].
-    fn start_sync(&self) -> bool {
+    /// Take the one sync slot and clear `is_done`; None (logged) if a sync already runs. The
+    /// returned [SyncGuard] is moved into the sync thread and releases the slot.
+    fn start_sync(&self) -> Option<SyncGuard> {
         if self
             .syncing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             info!("library sync already running, skipped");
-            return false;
+            return None;
         }
         *self.is_done.write() = false;
-        true
+        Some(SyncGuard {
+            syncing: self.syncing.clone(),
+            saves: self.saves.clone(),
+            is_done: self.is_done.clone(),
+            ev: self.ev.clone(),
+        })
+    }
+
+    /// Clears `resume_pending` when dropped, also while a panicking resume thread unwinds.
+    /// Disarm it once the flag has been handed over.
+    fn resume_guard(&self) -> OnDrop<impl FnOnce() + use<>> {
+        let pending = self.resume_pending.clone();
+        OnDrop::new(move || pending.store(false, Ordering::SeqCst))
     }
 
     /// Load the liked songs and saved albums caches and sync the `collection` set. Returns
@@ -1133,6 +1140,7 @@ impl Library {
             info!("library sync resume already pending");
             return;
         }
+        let pending = self.resume_guard();
 
         let longest = self
             .spotify
@@ -1156,14 +1164,16 @@ impl Library {
             // pending: wait for the slot instead of being dropped, without counting the wait.
             loop {
                 let count = library.resume_count.load(Ordering::SeqCst);
-                match resume_attempt(library.start_sync(), count) {
-                    Some(count) => {
+                let guard = library.start_sync();
+                match (resume_attempt(guard.is_some(), count), guard) {
+                    (Some(count), Some(guard)) => {
                         library.resume_pending.store(false, Ordering::SeqCst);
+                        pending.disarm();
                         library.resume_count.store(count, Ordering::SeqCst);
-                        library.run_update(false);
+                        library.run_update(false, guard);
                         break;
                     }
-                    None => {
+                    _ => {
                         info!(
                             "library sync resume waiting {}s for the running sync",
                             RESUME_BUSY_RETRY.as_secs()
@@ -3267,16 +3277,20 @@ fn tab_set(tab: &LibraryTab, episodes_enabled: bool) -> Option<SyncSet> {
     }
 }
 
-/// When dropped, also from a panicking sync thread: forgets the saves that landed during the
-/// sync and clears the `syncing` flag, together under the log lock, which is also where the
-/// worker reads the flag.
+/// When dropped, also from a panicking sync thread: marks the library done and redraws, then
+/// forgets the saves that landed during the sync and clears the `syncing` flag, together under
+/// the log lock, which is also where the worker reads the flag.
 struct SyncGuard {
     syncing: Arc<AtomicBool>,
     saves: Arc<Mutex<SaveLog>>,
+    is_done: Arc<RwLock<bool>>,
+    ev: EventManager,
 }
 
 impl Drop for SyncGuard {
     fn drop(&mut self) {
+        *self.is_done.write() = true;
+        self.ev.trigger();
         let mut saves = self.saves.lock();
         saves.clear_landed();
         self.syncing.store(false, Ordering::Release);
@@ -4186,12 +4200,44 @@ mod test {
             let _guard = SyncGuard {
                 syncing: in_thread,
                 saves: Arc::default(),
+                is_done: Arc::default(),
+                ev: EventManager::new_for_test(),
             };
             panic!("fetch thread failed");
         })
         .join();
         assert!(result.is_err());
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_panicking_sync_frees_the_slot_and_marks_done() {
+        let library = test_library();
+        let guard = library.start_sync().unwrap();
+        assert!(!*library.is_done.read());
+        let result = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("fetch thread failed");
+        })
+        .join();
+        assert!(result.is_err());
+        assert!(*library.is_done.read());
+        assert!(library.start_sync().is_some());
+    }
+
+    #[test]
+    fn resume_guard_clears_the_pending_flag_on_panic() {
+        let library = test_library();
+        library.resume_pending.store(true, Ordering::SeqCst);
+        let guard = library.resume_guard();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = guard;
+                panic!("boom");
+            }))
+            .is_err()
+        );
+        assert!(!library.resume_pending.load(Ordering::SeqCst));
     }
 
     fn test_library() -> Arc<Library> {
@@ -6062,6 +6108,8 @@ mod test {
             let _guard = SyncGuard {
                 syncing: in_thread,
                 saves: log,
+                is_done: Arc::default(),
+                ev: EventManager::new_for_test(),
             };
             panic!("fetch thread failed");
         })

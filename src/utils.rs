@@ -145,6 +145,7 @@ fn xdg_runtime_directory() -> Option<PathBuf> {
 ///
 /// The closure must not panic (a panic while unwinding aborts the process), and it must not
 /// take a lock its creator may still hold when the guard drops.
+#[must_use = "the guard runs its closure when dropped"]
 pub struct OnDrop<F: FnOnce()>(Option<F>);
 
 impl<F: FnOnce()> OnDrop<F> {
@@ -171,8 +172,8 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::sync::{
-        atomic::{AtomicBool, Ordering},
         Arc,
+        atomic::{AtomicBool, Ordering},
     };
 
     fn scratch(name: &str) -> PathBuf {

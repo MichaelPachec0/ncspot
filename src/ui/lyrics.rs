@@ -15,6 +15,7 @@ use crate::lyrics::model::{Lyrics, LyricsState, TrackMeta};
 use crate::lyrics::{FetchOutcome, LyricsManager};
 use crate::queue::Queue;
 use crate::traits::{ListItem, ViewExt};
+use crate::utils::OnDrop;
 
 /// How a single rendered line should be styled.
 enum RowStyle {
@@ -150,8 +151,10 @@ impl LyricsView {
         let cfg = self.cfg.clone();
         let events = self.events.clone();
         let state = self.state.clone();
+        let guard = loading_guard(state.clone(), key.clone(), events.clone());
 
         std::thread::spawn(move || {
+            let _guard = guard;
             let order = cfg
                 .values()
                 .lyrics
@@ -604,6 +607,32 @@ impl ViewExt for LyricsView {
     }
 }
 
+/// When dropped, also while a panicking fetch thread unwinds, turns a `Loading` state for
+/// `key` that is still current into an error, so the view does not show "Loading" forever.
+/// A finished or newer state is left alone.
+fn loading_guard(
+    state: Arc<RwLock<LyricsState>>,
+    key: String,
+    events: EventManager,
+) -> OnDrop<impl FnOnce()> {
+    OnDrop::new(move || {
+        let stuck = {
+            let mut guard = state.write();
+            let stuck = matches!(&*guard, LyricsState::Loading { track_id } if *track_id == key);
+            if stuck {
+                *guard = LyricsState::Error {
+                    track_id: key,
+                    message: "lyrics fetch failed".to_string(),
+                };
+            }
+            stuck
+        };
+        if stuck {
+            events.trigger();
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +666,55 @@ mod tests {
         assert_eq!(move_cursor(Some(0), None, 10, -1), Some(0)); // clamp low
         assert_eq!(move_cursor(Some(9), None, 10, 1), Some(9)); // clamp high
         assert_eq!(move_cursor(Some(0), None, 0, 1), None); // empty list
+    }
+
+    fn guard_state(state: LyricsState) -> Arc<RwLock<LyricsState>> {
+        Arc::new(RwLock::new(state))
+    }
+
+    #[test]
+    fn loading_guard_turns_a_stuck_loading_into_an_error() {
+        let state = guard_state(LyricsState::Loading {
+            track_id: "k".into(),
+        });
+        drop(loading_guard(
+            state.clone(),
+            "k".into(),
+            EventManager::new_for_test(),
+        ));
+        match &*state.read() {
+            LyricsState::Error { track_id, message } => {
+                assert_eq!(track_id, "k");
+                assert_eq!(message, "lyrics fetch failed");
+            }
+            _ => panic!("expected an error state"),
+        }
+    }
+
+    #[test]
+    fn loading_guard_leaves_a_finished_or_newer_state_alone() {
+        let state = guard_state(LyricsState::Loading {
+            track_id: "other".into(),
+        });
+        drop(loading_guard(
+            state.clone(),
+            "k".into(),
+            EventManager::new_for_test(),
+        ));
+        assert!(matches!(
+            &*state.read(),
+            LyricsState::Loading { track_id } if track_id == "other"
+        ));
+
+        let state = guard_state(LyricsState::NotFound {
+            track_id: "k".into(),
+            tried: vec![],
+        });
+        drop(loading_guard(
+            state.clone(),
+            "k".into(),
+            EventManager::new_for_test(),
+        ));
+        assert!(matches!(&*state.read(), LyricsState::NotFound { .. }));
     }
 }

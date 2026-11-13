@@ -1,5 +1,6 @@
 use crate::library::Library;
 use crate::traits::ListItem;
+use crate::utils::OnDrop;
 use log::debug;
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -152,7 +153,7 @@ pub struct Pagination<I: ListItem> {
     loaded_content: Arc<RwLock<usize>>,
     max_content: Arc<RwLock<Option<usize>>>,
     callback: Arc<RwLock<Option<Paginator<I>>>>,
-    busy: Arc<RwLock<bool>>,
+    busy: Arc<AtomicBool>,
 }
 
 impl<I: ListItem> Default for Pagination<I> {
@@ -161,7 +162,7 @@ impl<I: ListItem> Default for Pagination<I> {
             loaded_content: Arc::new(RwLock::new(0)),
             max_content: Arc::new(RwLock::new(None)),
             callback: Arc::new(RwLock::new(None)),
-            busy: Arc::new(RwLock::new(false)),
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -185,26 +186,36 @@ impl<I: ListItem + Clone> Pagination<I> {
         *self.max_content.read()
     }
 
+    #[cfg(any(test, feature = "harness"))]
     pub(crate) fn is_busy(&self) -> bool {
-        *self.busy.read()
+        self.busy.load(Ordering::SeqCst)
     }
 
     pub fn call(&self, content: &Arc<RwLock<Vec<I>>>, library: Arc<Library>) {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let pagination = self.clone();
         let content = content.clone();
-        if !self.is_busy() {
-            *self.busy.write() = true;
-            std::thread::spawn(move || {
-                let cb = pagination.callback.read();
-                if let Some(ref cb) = *cb {
-                    debug!("calling paginator!");
-                    cb(content.clone());
-                    *pagination.loaded_content.write() = content.read().len();
-                    *pagination.busy.write() = false;
-                    library.trigger_redraw();
-                }
-            });
-        }
+        // Created here and moved into the thread, so `busy` is cleared and the length
+        // refreshed whether the paginator returns or panics.
+        let guard = OnDrop::new({
+            let pagination = pagination.clone();
+            let content = content.clone();
+            move || {
+                *pagination.loaded_content.write() = content.read().len();
+                pagination.busy.store(false, Ordering::SeqCst);
+                library.trigger_redraw();
+            }
+        });
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let cb = pagination.callback.read();
+            if let Some(ref cb) = *cb {
+                debug!("calling paginator!");
+                cb(content.clone());
+            }
+        });
     }
 }
 
@@ -331,5 +342,69 @@ mod test {
         let callback = pagination.callback.read();
         callback.as_ref().unwrap()(content.clone());
         assert_eq!(content.read().len(), 2);
+    }
+
+    fn test_library() -> Arc<Library> {
+        let cfg = crate::config::Config::new_for_test();
+        let ev = crate::events::EventManager::new_for_test();
+        let spotify = crate::spotify::Spotify::new_for_test(cfg.clone(), ev.clone());
+        Library::new_for_test(ev, spotify, cfg)
+    }
+
+    fn wait_not_busy(pagination: &Pagination<Playlist>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pagination.is_busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "busy was never cleared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn call_clears_busy_when_the_paginator_panics() {
+        let pagination: Pagination<Playlist> = Pagination::default();
+        pagination.set(0, 3, Box::new(|_| panic!("boom")));
+        let content = Arc::new(RwLock::new(vec![item("a"), item("b")]));
+        pagination.call(&content, test_library());
+        wait_not_busy(&pagination);
+        assert_eq!(pagination.loaded_content(), 2);
+    }
+
+    #[test]
+    fn call_clears_busy_without_a_callback() {
+        let pagination: Pagination<Playlist> = Pagination::default();
+        let content = Arc::new(RwLock::new(vec![item("a")]));
+        pagination.call(&content, test_library());
+        wait_not_busy(&pagination);
+    }
+
+    #[test]
+    fn a_second_call_while_busy_starts_nothing() {
+        let pagination: Pagination<Playlist> = Pagination::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let counted = calls.clone();
+        pagination.set(
+            0,
+            3,
+            Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        );
+        let content = Arc::new(RwLock::new(vec![item("a")]));
+        let library = test_library();
+        pagination.call(&content, library.clone());
+        assert!(pagination.is_busy());
+        pagination.call(&content, library);
+        release.send(()).unwrap();
+        wait_not_busy(&pagination);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

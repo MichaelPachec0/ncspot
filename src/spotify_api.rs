@@ -47,6 +47,7 @@ use crate::rate_limit::{
 };
 use crate::spotify_worker::WorkerCommand;
 use crate::ui::pagination::{ApiPage, ApiResult};
+use crate::utils::OnDrop;
 
 /// Which Web API client a call goes through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,12 @@ enum Route {
 /// on the shared client. A 401 means the personal token needs a refresh (started in the
 /// background), so any call is retried. A 403 or 404 on a playlist read means a Spotify-owned
 /// playlist, which Development Mode apps can't read.
+/// Clears `refreshing` when dropped, also while a panicking refresh unwinds, so one failed
+/// refresh cannot block every later one.
+fn refresh_guard(refreshing: Arc<AtomicBool>) -> OnDrop<impl FnOnce()> {
+    OnDrop::new(move || refreshing.store(false, Ordering::Release))
+}
+
 fn should_retry_on_shared(status: u16, playlist_read: bool) -> bool {
     status == 401 || (playlist_read && matches!(status, 403 | 404))
 }
@@ -649,10 +656,14 @@ impl WebApi {
         let client_id = client.client_id.clone();
         let label = client.label;
         let disabled = client.disabled.clone();
-        let refreshing = client.refreshing.clone();
         let refresh_backoff_until = client.refresh_backoff_until.clone();
         let events = self.events.clone();
+        // Only the personal client set the flag above; the guard clears it even if the
+        // refresh panics.
+        let guard =
+            (label == ClientLabel::Personal).then(|| refresh_guard(client.refreshing.clone()));
         Some(ASYNC_RUNTIME.get().unwrap().spawn_blocking(move || {
+            let _guard = guard;
             let result = match label {
                 ClientLabel::Shared => crate::authentication::get_rspotify_token(&client_id),
                 ClientLabel::Personal => {
@@ -696,7 +707,6 @@ impl WebApi {
                     error!("Failed to update token: {e}");
                 }
             }
-            refreshing.store(false, Ordering::Release);
         }))
     }
 
@@ -2120,5 +2130,19 @@ mod test {
                 .map(|t| t.len()),
             Err(InternalError::NoSession)
         );
+    }
+
+    #[test]
+    fn refresh_guard_clears_the_flag_on_panic() {
+        let flag = Arc::new(AtomicBool::new(true));
+        let guard = refresh_guard(flag.clone());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _guard = guard;
+                panic!("boom");
+            }))
+            .is_err()
+        );
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }
