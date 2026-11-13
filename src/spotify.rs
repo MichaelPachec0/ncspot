@@ -99,11 +99,17 @@ enum EndAction {
 }
 
 /// `end` is Err(()) for a panic, Ok(None) when the session-error path handled itself.
+/// `ours` is false for a worker a newer one replaced: it ends silently, without charging the
+/// budget, so it can never replace or stop the worker that is running now.
 fn end_action(
     end: Result<Option<WorkerEnd>, ()>,
+    ours: bool,
     budget: &mut RestartBudget,
     now: Instant,
 ) -> EndAction {
+    if !ours {
+        return EndAction::Nothing;
+    }
     match end {
         Ok(None) | Ok(Some(WorkerEnd::Orphaned)) => EndAction::Nothing,
         Ok(Some(WorkerEnd::Shutdown)) => EndAction::RestartNow,
@@ -137,18 +143,26 @@ fn reconnect_action(has_channel: bool, gave_up: bool) -> ReconnectAction {
 
 type WorkerSender = mpsc::UnboundedSender<WorkerCommand>;
 
-/// True if `channel` still holds the sender of the worker that owns `own`.
-fn is_ours(
+/// If `channel` still holds the sender of the worker that owns `own`, clear it and return
+/// true. Check and clear happen under one write guard, so a newer worker's sender stored in
+/// between is never cleared.
+fn release_if_ours(
     channel: &RwLock<Option<WorkerSender>>,
     own: &mpsc::WeakUnboundedSender<WorkerCommand>,
 ) -> bool {
     let Some(own) = own.upgrade() else {
         return false;
     };
-    channel
-        .read()
+    let mut slot = channel.write();
+    if slot
         .as_ref()
         .is_some_and(|current| current.same_channel(&own))
+    {
+        *slot = None;
+        true
+    } else {
+        false
+    }
 }
 
 /// Events sent by the [Player].
@@ -278,18 +292,20 @@ impl Spotify {
         &self,
         user_tx: Option<oneshot::Sender<String>>,
     ) -> Result<(), Box<dyn Error>> {
+        let cfg = self.cfg.clone();
+        let backend_name = cfg.values().backend.clone();
+        // Before the channel is stored: on failure no sender may be left without a worker,
+        // or every later command (and `:reconnect`) would go to a dead channel.
+        let backend = Self::init_backend(backend_name)?;
         let (tx, rx) = mpsc::unbounded_channel();
         let own = tx.downgrade();
         *self.channel.write() = Some(tx);
         let worker_channel = self.channel.clone();
         let session_handle = self.session.clone();
         let slot = self.slot.clone();
-        let cfg = self.cfg.clone();
         let events = self.events.clone();
         let volume = self.volume();
         let credentials = self.credentials.clone();
-        let backend_name = cfg.values().backend.clone();
-        let backend = Self::init_backend(backend_name)?;
         ASYNC_RUNTIME.get().unwrap().spawn(Self::worker(
             worker_channel,
             session_handle,
@@ -457,9 +473,7 @@ impl Spotify {
                     // Stop accepting commands into a channel whose worker will never drain them, so
                     // they surface as a logged "no channel" error instead of being silently buffered
                     // and then dropped when this task returns.
-                    if is_ours(&worker_channel, &own) {
-                        *worker_channel.write() = None;
-                    }
+                    release_if_ours(&worker_channel, &own);
 
                     // Back off in the background (this task is now detached from startup) before
                     // asking the application to restart the worker. This path restarts itself, so
@@ -518,13 +532,15 @@ impl Spotify {
         });
 
         // Only clear state that still belongs to this worker: a newer worker may already own it.
-        if is_ours(&worker_channel, &own) {
-            *worker_channel.write() = None;
+        // A worker that is not ours (superseded, or its session-error path already released the
+        // slot) ends without touching anything.
+        let ours = release_if_ours(&worker_channel, &own);
+        if ours {
             *session_handle.write() = None;
             slot.reset();
         }
 
-        let action = end_action(end, &mut budget.lock(), Instant::now());
+        let action = end_action(end, ours, &mut budget.lock(), Instant::now());
         match action {
             EndAction::Nothing => {}
             EndAction::RestartNow => {
@@ -749,15 +765,23 @@ impl Spotify {
     /// already pending, so two workers are never alive at once.
     pub fn reconnect(&self) {
         let has_channel = self.channel.read().is_some();
-        let gave_up = self.budget.lock().gave_up();
-        match reconnect_action(has_channel, gave_up) {
-            ReconnectAction::SendShutdown => self.shutdown(),
+        // Held across the decision and the start, so a new worker that ends at once charges
+        // the budget only after it was reset. `start_worker` is sync and never takes it.
+        let mut budget = self.budget.lock();
+        match reconnect_action(has_channel, budget.gave_up()) {
+            ReconnectAction::SendShutdown => {
+                drop(budget);
+                self.shutdown();
+            }
             ReconnectAction::Nothing => info!("reconnect: a restart is already pending"),
             ReconnectAction::StartWorker => match self.start_worker(None) {
-                Ok(()) => self.budget.lock().reset(),
-                Err(e) => self.events.send(Event::StatusNote(format!(
-                    "Could not restart the player: {e}"
-                ))),
+                Ok(()) => budget.reset(),
+                Err(e) => {
+                    drop(budget);
+                    self.events.send(Event::StatusNote(format!(
+                        "Could not restart the player: {e}"
+                    )));
+                }
             },
         }
     }
@@ -908,24 +932,103 @@ mod tests {
     fn end_action_per_kind() {
         let t = Instant::now();
         let mut b = RestartBudget::default();
-        assert_eq!(end_action(Ok(None), &mut b, t), EndAction::Nothing);
+        assert_eq!(end_action(Ok(None), true, &mut b, t), EndAction::Nothing);
         assert_eq!(
-            end_action(Ok(Some(WorkerEnd::Orphaned)), &mut b, t),
+            end_action(Ok(Some(WorkerEnd::Orphaned)), true, &mut b, t),
             EndAction::Nothing
         );
         assert_eq!(
-            end_action(Ok(Some(WorkerEnd::Shutdown)), &mut b, t),
+            end_action(Ok(Some(WorkerEnd::Shutdown)), true, &mut b, t),
             EndAction::RestartNow
         );
         // none of the above charged the budget
         assert_eq!(
-            end_action(Ok(Some(WorkerEnd::PlayerChannelDied)), &mut b, t),
+            end_action(Ok(Some(WorkerEnd::PlayerChannelDied)), true, &mut b, t),
             EndAction::RestartAfterDelay
         );
-        assert_eq!(end_action(Err(()), &mut b, t), EndAction::RestartAfterDelay);
-        assert_eq!(end_action(Err(()), &mut b, t), EndAction::RestartAfterDelay);
-        assert_eq!(end_action(Err(()), &mut b, t), EndAction::GiveUp);
+        assert_eq!(
+            end_action(Err(()), true, &mut b, t),
+            EndAction::RestartAfterDelay
+        );
+        assert_eq!(
+            end_action(Err(()), true, &mut b, t),
+            EndAction::RestartAfterDelay
+        );
+        assert_eq!(end_action(Err(()), true, &mut b, t), EndAction::GiveUp);
         assert!(b.gave_up());
+    }
+
+    #[test]
+    fn end_action_of_a_superseded_worker_is_nothing_and_free() {
+        let t = Instant::now();
+        let mut b = RestartBudget::default();
+        for _ in 0..4 {
+            assert_eq!(end_action(Err(()), false, &mut b, t), EndAction::Nothing);
+            assert_eq!(
+                end_action(Ok(Some(WorkerEnd::PlayerChannelDied)), false, &mut b, t),
+                EndAction::Nothing
+            );
+        }
+        assert!(!b.gave_up());
+        // the budget is untouched: three restarts are still allowed
+        for _ in 0..3 {
+            assert_eq!(
+                end_action(Err(()), true, &mut b, t),
+                EndAction::RestartAfterDelay
+            );
+        }
+    }
+
+    #[test]
+    fn release_if_ours_clears_our_sender() {
+        let (tx, _rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let own = tx.downgrade();
+        let channel = RwLock::new(Some(tx));
+        assert!(release_if_ours(&channel, &own));
+        assert!(channel.read().is_none());
+    }
+
+    #[test]
+    fn release_if_ours_leaves_a_newer_sender_alone() {
+        let (old_tx, _old_rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let own = old_tx.downgrade();
+        let (new_tx, _new_rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let channel = RwLock::new(Some(new_tx.clone()));
+        assert!(!release_if_ours(&channel, &own));
+        assert!(channel.read().as_ref().unwrap().same_channel(&new_tx));
+        drop(old_tx);
+    }
+
+    #[test]
+    fn release_if_ours_on_an_empty_slot_is_false() {
+        let (tx, _rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let own = tx.downgrade();
+        let channel = RwLock::new(None);
+        assert!(!release_if_ours(&channel, &own));
+        assert!(channel.read().is_none());
+        drop(tx);
+    }
+
+    #[test]
+    fn release_if_ours_after_our_sender_dropped_is_false() {
+        let (tx, _rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let own = tx.downgrade();
+        drop(tx);
+        let (new_tx, _new_rx) = mpsc::unbounded_channel::<WorkerCommand>();
+        let channel = RwLock::new(Some(new_tx));
+        assert!(!release_if_ours(&channel, &own));
+        assert!(channel.read().is_some());
+    }
+
+    #[test]
+    fn start_worker_with_a_bad_backend_leaves_no_channel() {
+        let cfg = config::Config::new_for_test_with_values(config::ConfigValues {
+            backend: Some("no-such-backend".into()),
+            ..Default::default()
+        });
+        let spotify = Spotify::new_for_test(cfg, EventManager::new_for_test());
+        assert!(spotify.start_worker(None).is_err());
+        assert!(spotify.channel.read().is_none());
     }
 
     #[test]
