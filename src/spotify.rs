@@ -98,6 +98,12 @@ enum EndAction {
     GiveUp,
 }
 
+/// True when the worker died without announcing that playback stopped, so the UI would keep
+/// showing a song as playing. A clean shutdown already sent Stopped from the run loop.
+fn stops_playback(action: &EndAction) -> bool {
+    matches!(action, EndAction::RestartAfterDelay | EndAction::GiveUp)
+}
+
 /// `end` is Err(()) for a panic, Ok(None) when the session-error path handled itself.
 /// `ours` is false for a worker a newer one replaced: it ends silently, without charging the
 /// budget, so it can never replace or stop the worker that is running now.
@@ -435,17 +441,28 @@ impl Spotify {
         budget: Arc<parking_lot::Mutex<RestartBudget>>,
     ) {
         let body = async {
-            let bitrate_str = cfg.values().bitrate.unwrap_or(320).to_string();
+            // One guard, dropped before the config is built: a second read of the same lock
+            // while a writer waits would deadlock.
+            let (bitrate_cfg, gapless, volnorm, volnorm_pregain) = {
+                let values = cfg.values();
+                (
+                    values.bitrate.unwrap_or(320),
+                    values.gapless.unwrap_or(true),
+                    values.volnorm.unwrap_or(false),
+                    values.volnorm_pregain.unwrap_or(0.0),
+                )
+            };
+            let bitrate_str = bitrate_cfg.to_string();
             let bitrate = Bitrate::from_str(&bitrate_str);
             if bitrate.is_err() {
                 error!("invalid bitrate, will use 320 instead")
             }
 
             let player_config = PlayerConfig {
-                gapless: cfg.values().gapless.unwrap_or(true),
+                gapless,
                 bitrate: bitrate.unwrap_or(Bitrate::Bitrate320),
-                normalisation: cfg.values().volnorm.unwrap_or(false),
-                normalisation_pregain_db: cfg.values().volnorm_pregain.unwrap_or(0.0),
+                normalisation: volnorm,
+                normalisation_pregain_db: volnorm_pregain,
                 ..Default::default()
             };
 
@@ -541,6 +558,9 @@ impl Spotify {
         }
 
         let action = end_action(end, ours, &mut budget.lock(), Instant::now());
+        if stops_playback(&action) {
+            events.send(Event::Player(PlayerEvent::Stopped));
+        }
         match action {
             EndAction::Nothing => {}
             EndAction::RestartNow => {
@@ -926,6 +946,14 @@ mod tests {
         b.reset();
         assert!(!b.gave_up());
         assert!(b.charge(t));
+    }
+
+    #[test]
+    fn only_unexpected_worker_ends_stop_playback() {
+        assert!(!stops_playback(&EndAction::Nothing));
+        assert!(!stops_playback(&EndAction::RestartNow));
+        assert!(stops_playback(&EndAction::RestartAfterDelay));
+        assert!(stops_playback(&EndAction::GiveUp));
     }
 
     #[test]

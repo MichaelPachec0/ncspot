@@ -1595,7 +1595,7 @@ mod tests {
         assert_eq!(order, (0..q.len()).collect::<Vec<_>>());
     }
 
-    // --- Task 4: order/current fixes and snapshot ---
+    // --- order/current fixes and snapshot ---
 
     fn assert_invariant(q: &Queue) {
         let len = q.queue.read().len();
@@ -1732,7 +1732,7 @@ mod tests {
         assert!(q.get_current().is_none());
     }
 
-    // --- Task 6: atomic mutators ---
+    // --- atomic mutators ---
 
     type Step = Box<dyn Fn(&Queue)>;
 
