@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use cursive::Cursive;
 use cursive::event::{Event, EventResult, Key};
@@ -92,7 +93,7 @@ pub struct JukeboxView {
     #[cfg(feature = "jukebox-graphics")]
     blit_count: std::sync::atomic::AtomicU32,
     #[cfg(feature = "jukebox-graphics")]
-    last_blit: std::sync::Mutex<std::time::Instant>,
+    last_blit: parking_lot::Mutex<std::time::Instant>,
 }
 
 impl JukeboxView {
@@ -111,7 +112,7 @@ impl JukeboxView {
             #[cfg(feature = "jukebox-graphics")]
             blit_count: std::sync::atomic::AtomicU32::new(0),
             #[cfg(feature = "jukebox-graphics")]
-            last_blit: std::sync::Mutex::new(std::time::Instant::now()),
+            last_blit: parking_lot::Mutex::new(std::time::Instant::now()),
         }
     }
 
@@ -166,13 +167,13 @@ impl JukeboxView {
         if total == 0 {
             return;
         }
-        let mut sel = self.selected_beat.write().unwrap();
+        let mut sel = self.selected_beat.write();
         let cur = sel.unwrap_or(state.current_beat);
         *sel = Some((cur as i64 + delta).clamp(0, total as i64 - 1) as usize);
     }
 
     fn seek_to_selection(&self) {
-        if let Some(sel) = *self.selected_beat.read().unwrap() {
+        if let Some(sel) = *self.selected_beat.read() {
             self.jukebox.request_seek_to_beat(sel);
         }
     }
@@ -365,7 +366,7 @@ impl JukeboxView {
             p.print((cx, track_row), "▮");
             p.print((cx, track_row + 1), "▲");
         });
-        if let Some(sel) = *self.selected_beat.read().unwrap() {
+        if let Some(sel) = *self.selected_beat.read() {
             let sx = Self::x_of(sel, total, w);
             printer.with_color(cursor, |p| p.print((sx, track_row + 2), "┃"));
         }
@@ -438,7 +439,7 @@ impl JukeboxView {
         }
         let (ccx, ccy) = pos(state.current_beat);
         printer.with_color(cursor, |p| p.print((ccx, ccy), "●"));
-        if let Some(sel) = *self.selected_beat.read().unwrap() {
+        if let Some(sel) = *self.selected_beat.read() {
             let (sx, sy) = pos(sel);
             printer.with_color(cursor, |p| p.print((sx, sy), "◉"));
         }
@@ -535,7 +536,7 @@ impl JukeboxView {
         let w = printer.size.x;
         let h = printer.size.y;
         if w == 0 || h < 2 || state.graph.beats.is_empty() {
-            *self.desired.write().unwrap() = None;
+            *self.desired.write() = None;
             self.draw_linear(printer, state);
             return;
         }
@@ -576,7 +577,7 @@ impl JukeboxView {
             max,
         );
         let bg = theme_bg_rgba(printer.theme.palette[PaletteColor::Background]);
-        *self.desired.write().unwrap() = Some(ImageRequest {
+        *self.desired.write() = Some(ImageRequest {
             offset: printer.offset,
             size: region,
             key,
@@ -588,8 +589,8 @@ impl JukeboxView {
     pub fn render_to_terminal(&self) {
         use std::sync::atomic::Ordering;
 
-        let desired = self.desired.read().unwrap().clone();
-        let mut rendered = self.rendered.write().unwrap();
+        let desired = self.desired.read().clone();
+        let mut rendered = self.rendered.write();
         if *rendered == desired {
             return;
         }
@@ -607,7 +608,7 @@ impl JukeboxView {
                 // Rate-limit: keep `desired` and blit it on a later tick if we blitted too
                 // recently. Avoids starving keyboard input on fast-changing songs.
                 {
-                    let mut last = self.last_blit.lock().unwrap();
+                    let mut last = self.last_blit.lock();
                     if last.elapsed().as_millis() < MIN_BLIT_INTERVAL_MS {
                         return;
                     }
@@ -820,7 +821,7 @@ impl View for JukeboxView {
         let Some(state) = self.jukebox.state() else {
             #[cfg(feature = "jukebox-graphics")]
             {
-                *self.desired.write().unwrap() = None;
+                *self.desired.write() = None;
             }
             Self::draw_status(printer, "Jukebox is off. Run :jukeboxtoggle to start.");
             return;
@@ -828,7 +829,7 @@ impl View for JukeboxView {
         if state.no_analysis {
             #[cfg(feature = "jukebox-graphics")]
             {
-                *self.desired.write().unwrap() = None;
+                *self.desired.write() = None;
             }
             Self::draw_status(printer, "No analysis available for this track.");
             return;
@@ -841,7 +842,7 @@ impl View for JukeboxView {
         }
         #[cfg(feature = "jukebox-graphics")]
         {
-            *self.desired.write().unwrap() = None;
+            *self.desired.write() = None;
         }
 
         match self.jukebox.view_mode() {
@@ -915,14 +916,14 @@ impl ViewExt for JukeboxView {
     fn on_leave(&self) {
         #[cfg(feature = "jukebox-graphics")]
         {
-            if let Some(old) = self.rendered.write().unwrap().take() {
+            if let Some(old) = self.rendered.write().take() {
                 if crate::ui::image_render::can_use_kitty_graphics() {
                     crate::ui::image_render::delete_kitty_image(JUKEBOX_KITTY_ID);
                 } else {
                     crate::ui::image_render::clear_terminal_area(old.offset, old.size);
                 }
             }
-            *self.desired.write().unwrap() = None;
+            *self.desired.write() = None;
         }
     }
 

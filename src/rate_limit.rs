@@ -1,8 +1,9 @@
 //! Rate-limit (HTTP 429) state of the Web API clients, and how it is shown to the user.
 
+use parking_lot::RwLock;
 use std::fmt;
 use std::ops::{Add, AddAssign};
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
 use std::thread::{self, ThreadId};
 use std::time::Duration;
 
@@ -330,7 +331,7 @@ pub fn notification_body(client: ClientLabel, retry_after: Duration) -> String {
 /// replaces it instead of stacking. Separate from the now-playing notification so neither
 /// overwrites the other.
 #[cfg(feature = "notify")]
-static WARNING_NOTIFICATION_ID: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+static WARNING_NOTIFICATION_ID: parking_lot::Mutex<Option<u32>> = parking_lot::Mutex::new(None);
 
 /// Show a warning desktop notification. Blocks on the notification service, so call it from a
 /// separate thread.
@@ -344,7 +345,7 @@ pub fn send_warning_notification(summary: &str, body: &str) {
     {
         n.urgency(notify_rust::Urgency::Normal)
             .hint(notify_rust::Hint::DesktopEntry("ncspot".into()));
-        if let Some(id) = *WARNING_NOTIFICATION_ID.lock().unwrap() {
+        if let Some(id) = *WARNING_NOTIFICATION_ID.lock() {
             n.id(id);
         }
     }
@@ -353,7 +354,7 @@ pub fn send_warning_notification(summary: &str, body: &str) {
         Ok(handle) => {
             #[cfg(all(unix, not(target_os = "macos")))]
             {
-                *WARNING_NOTIFICATION_ID.lock().unwrap() = Some(handle.id());
+                *WARNING_NOTIFICATION_ID.lock() = Some(handle.id());
             }
             #[cfg(not(all(unix, not(target_os = "macos"))))]
             drop(handle);
@@ -403,11 +404,11 @@ pub fn run_rate_limited<R>(
     loop {
         let probing = loop {
             let now = Stamp::now();
-            let remaining = throttle.read().unwrap().remaining(now);
+            let remaining = throttle.read().remaining(now);
             match gate(remaining, on_ui_thread, jitter()) {
                 Gate::Send => break false,
                 Gate::Wait(delay) => thread::sleep(delay),
-                Gate::FailFast if !on_ui_thread && throttle.write().unwrap().claim_probe(now) => {
+                Gate::FailFast if !on_ui_thread && throttle.write().claim_probe(now) => {
                     debug!("probing the rate-limit window of the {}", label.describe());
                     break true;
                 }
@@ -419,7 +420,7 @@ pub fn run_rate_limited<R>(
         };
         match send() {
             Attempt::Done(value) => {
-                throttle.write().unwrap().record_success(Stamp::now());
+                throttle.write().record_success(Stamp::now());
                 return Ok(value);
             }
             Attempt::RateLimited(retry_after) => {
@@ -448,7 +449,7 @@ pub fn run_rate_limited<R>(
             }
             Attempt::Failed(status) => {
                 if probing {
-                    throttle.write().unwrap().abandon_probe();
+                    throttle.write().abandon_probe();
                 }
                 return Err(status);
             }
@@ -753,7 +754,7 @@ mod test {
     #[test]
     fn run_sends_nothing_inside_a_long_window() {
         let throttle = RwLock::new(ThrottleState::default());
-        throttle.write().unwrap().record_429(Stamp::now(), SECS(60));
+        throttle.write().record_429(Stamp::now(), SECS(60));
         let calls = Cell::new(0);
         let result: Result<(), _> = run_rate_limited(
             ClientLabel::Personal,
@@ -773,7 +774,7 @@ mod test {
     #[test]
     fn run_on_the_ui_thread_sends_nothing_inside_a_short_window() {
         let throttle = RwLock::new(ThrottleState::default());
-        throttle.write().unwrap().record_429(Stamp::now(), SECS(1));
+        throttle.write().record_429(Stamp::now(), SECS(1));
         let calls = Cell::new(0);
         let result: Result<(), _> = run_rate_limited(
             ClientLabel::Shared,
@@ -794,7 +795,7 @@ mod test {
     fn run_waits_out_a_short_window_in_the_background() {
         let throttle = RwLock::new(ThrottleState::default());
         let start = std::time::Instant::now();
-        throttle.write().unwrap().record_429(Stamp::now(), MS(50));
+        throttle.write().record_429(Stamp::now(), MS(50));
         let result = run_rate_limited(
             ClientLabel::Shared,
             &throttle,
@@ -867,7 +868,7 @@ mod test {
                 Attempt::RateLimited(Some(SECS(2)))
             },
             |window| {
-                throttle.write().unwrap().record_429(Stamp::now(), window);
+                throttle.write().record_429(Stamp::now(), window);
             },
         );
         assert_eq!(result, Err(Some(429)));
@@ -888,7 +889,7 @@ mod test {
                 Attempt::RateLimited(Some(Duration::ZERO))
             },
             |window| {
-                throttle.write().unwrap().record_429(Stamp::now(), window);
+                throttle.write().record_429(Stamp::now(), window);
             },
         );
         assert_eq!(result, Err(Some(429)));
@@ -932,7 +933,7 @@ mod test {
         );
         assert_eq!(result, Ok("ok"));
         assert_eq!(calls.get(), 2);
-        assert_eq!(throttle.read().unwrap().remaining(Stamp::now()), None);
+        assert_eq!(throttle.read().remaining(Stamp::now()), None);
     }
 
     #[test]
@@ -1039,7 +1040,7 @@ mod test {
     fn throttle_with_probe_due(window: Duration) -> RwLock<ThrottleState> {
         let throttle = RwLock::new(ThrottleState::default());
         let now = Stamp::now();
-        let mut state = throttle.write().unwrap();
+        let mut state = throttle.write();
         state.record_429(now, window);
         state.next_probe = Some(now);
         drop(state);
@@ -1063,7 +1064,7 @@ mod test {
         );
         assert_eq!(result, Ok("ok"));
         assert_eq!(calls.get(), 1);
-        assert_eq!(throttle.read().unwrap().remaining(Stamp::now()), None);
+        assert_eq!(throttle.read().remaining(Stamp::now()), None);
     }
 
     #[test]
@@ -1083,7 +1084,7 @@ mod test {
         );
         assert_eq!(result, Err(Some(429)));
         assert_eq!(calls.get(), 0);
-        assert!(throttle.read().unwrap().is_active(Stamp::now()));
+        assert!(throttle.read().is_active(Stamp::now()));
     }
 
     #[test]
@@ -1100,12 +1101,12 @@ mod test {
                 Attempt::RateLimited(Some(SECS(120)))
             },
             |window| {
-                throttle.write().unwrap().record_429(Stamp::now(), window);
+                throttle.write().record_429(Stamp::now(), window);
             },
         );
         assert_eq!(result, Err(Some(429)));
         assert_eq!(calls.get(), 1);
-        let remaining = throttle.read().unwrap().remaining(Stamp::now()).unwrap();
+        let remaining = throttle.read().remaining(Stamp::now()).unwrap();
         assert!(remaining <= SECS(120) && remaining > SECS(110));
     }
 
@@ -1121,7 +1122,7 @@ mod test {
             |_| {},
         );
         assert_eq!(result, Err(Some(500)));
-        let mut state = throttle.write().unwrap();
+        let mut state = throttle.write();
         state.record_success(Stamp::now());
         assert!(state.is_active(Stamp::now()));
     }

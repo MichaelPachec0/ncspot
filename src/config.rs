@@ -1,7 +1,7 @@
+use parking_lot::{RwLock, RwLockReadGuard};
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::{RwLock, RwLockReadGuard};
 use std::{fs, process};
 
 use cursive::theme::Theme;
@@ -339,7 +339,7 @@ impl Config {
     #[cfg(test)]
     pub fn new_for_test_with_client_id(id: &str) -> std::sync::Arc<Self> {
         let cfg = Self::new_for_test();
-        *cfg.personal_client_id.write().unwrap() = Some(PersonalClientId {
+        *cfg.personal_client_id.write() = Some(PersonalClientId {
             id: id.to_string(),
             source: ClientIdSource::Config,
         });
@@ -350,7 +350,7 @@ impl Config {
     #[cfg(test)]
     pub fn new_for_test_with_values(values: ConfigValues) -> std::sync::Arc<Self> {
         let cfg = Self::new_for_test();
-        *cfg.values.write().unwrap() = values;
+        *cfg.values.write() = values;
         cfg
     }
 
@@ -415,23 +415,23 @@ impl Config {
 
     /// Get the user configuration values.
     pub fn values(&self) -> RwLockReadGuard<'_, ConfigValues> {
-        self.values.read().unwrap()
+        self.values.read()
     }
 
     /// Get the runtime user state values.
     pub fn state(&self) -> RwLockReadGuard<'_, UserState> {
-        self.state.read().unwrap()
+        self.state.read()
     }
 
     /// The personal Web API client ID, if one is configured and still in use.
     pub fn personal_client_id(&self) -> Option<PersonalClientId> {
-        self.personal_client_id.read().unwrap().clone()
+        self.personal_client_id.read().clone()
     }
 
     /// Stop using the personal Web API client ID, for example after its authorization failed.
     /// All Web API traffic then uses the shared client ID.
     pub fn disable_personal_client_id(&self) {
-        *self.personal_client_id.write().unwrap() = None;
+        *self.personal_client_id.write() = None;
     }
 
     /// Modify the internal user state through a shared reference using a closure.
@@ -439,7 +439,7 @@ impl Config {
     where
         F: Fn(&mut UserState),
     {
-        let mut state_guard = self.state.write().unwrap();
+        let mut state_guard = self.state.write();
         cb(&mut state_guard);
     }
 
@@ -481,7 +481,7 @@ impl Config {
         ) {
             warn!("client_id changed in the configuration file; restart ncspot to apply it");
         }
-        *self.values.write().unwrap() = cfg;
+        *self.values.write() = cfg;
         Ok(())
     }
 }
@@ -557,10 +557,7 @@ pub fn preload_proxy_environment(filename: Option<String>) {
 /// Returns the plaform app directories for ncspot if they could be determined,
 /// or an error otherwise.
 pub fn try_proj_dirs() -> Result<AppDirs, String> {
-    match *BASE_PATH
-        .read()
-        .map_err(|_| String::from("Poisoned RWLock"))?
-    {
+    match *BASE_PATH.read() {
         Some(ref basepath) => Ok(AppDirs {
             cache_dir: basepath.join(".cache"),
             config_dir: basepath.join(".config"),
@@ -630,7 +627,7 @@ pub fn set_configuration_base_path(base_path: Option<PathBuf>) {
         if !basepath.exists() {
             fs::create_dir_all(&basepath).expect("could not create basepath directory");
         }
-        *BASE_PATH.write().unwrap() = Some(basepath);
+        *BASE_PATH.write() = Some(basepath);
     }
 }
 

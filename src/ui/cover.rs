@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use cursive::theme::{ColorStyle, ColorType, PaletteColor};
 use cursive::{Cursive, Printer, Vec2, View};
@@ -80,7 +81,7 @@ impl CoverView {
         draw_offset.x += (draw_size.x - size.x) / 2;
         draw_offset.y += (draw_size.y - size.y) - (draw_size.y - size.y) / 2;
 
-        let mut desired_cover = self.desired_cover.write().unwrap();
+        let mut desired_cover = self.desired_cover.write();
         *desired_cover = Some(CoverRequest {
             url,
             path,
@@ -90,7 +91,7 @@ impl CoverView {
     }
 
     fn clear_cover(&self) {
-        let mut desired_cover = self.desired_cover.write().unwrap();
+        let mut desired_cover = self.desired_cover.write();
         *desired_cover = None;
     }
 
@@ -116,7 +117,7 @@ impl CoverView {
     fn cache_path(&self, url: String) -> Option<PathBuf> {
         let path = crate::utils::cache_path_for_url(url.clone());
 
-        let mut loading = self.loading.write().unwrap();
+        let mut loading = self.loading.write();
         if loading.contains(&url) {
             return None;
         }
@@ -132,7 +133,7 @@ impl CoverView {
             if let Err(e) = crate::utils::download(url.clone(), path.clone()) {
                 error!("Failed to download cover: {e}");
             }
-            let mut loading = loading_thread.write().unwrap();
+            let mut loading = loading_thread.write();
             loading.remove(&url.clone());
         });
 
@@ -140,8 +141,8 @@ impl CoverView {
     }
 
     pub fn render_to_terminal(&self) {
-        let desired_cover = self.desired_cover.read().unwrap().clone();
-        let mut rendered_cover = self.rendered_cover.write().unwrap();
+        let desired_cover = self.desired_cover.read().clone();
+        let mut rendered_cover = self.rendered_cover.write();
 
         if *rendered_cover == desired_cover {
             return;

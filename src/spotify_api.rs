@@ -1,7 +1,8 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -617,13 +618,12 @@ impl WebApi {
             && client
                 .refresh_backoff_until
                 .read()
-                .unwrap()
                 .is_some_and(|until| until > Instant::now())
         {
             return None;
         }
         if !force {
-            let token_expiration = client.token_expiration.read().unwrap();
+            let token_expiration = client.token_expiration.read();
             let now = Utc::now();
             let delta = *token_expiration - now;
 
@@ -668,8 +668,8 @@ impl WebApi {
                         .expires_at
                         .unwrap_or_else(|| Utc::now() + ChronoDuration::hours(1));
                     *api_token.lock().unwrap() = Some(token);
-                    *api_token_expiration.write().unwrap() = expires_at;
-                    *refresh_backoff_until.write().unwrap() = None;
+                    *api_token_expiration.write() = expires_at;
+                    *refresh_backoff_until.write() = None;
                 }
                 Err(e)
                     if label == ClientLabel::Personal
@@ -679,7 +679,7 @@ impl WebApi {
                         "Temporary failure refreshing the personal client ID's token, retrying \
                          later: {e}"
                     );
-                    *refresh_backoff_until.write().unwrap() =
+                    *refresh_backoff_until.write() =
                         Some(Instant::now() + TRANSIENT_REFRESH_BACKOFF);
                 }
                 Err(e) if label == ClientLabel::Personal => {
@@ -719,11 +719,7 @@ impl WebApi {
 
     /// What is left of the internal API's rate-limit window.
     pub fn internal_window(&self) -> Option<Duration> {
-        self.internal
-            .throttle
-            .read()
-            .unwrap()
-            .remaining(Stamp::now())
+        self.internal.throttle.read().remaining(Stamp::now())
     }
 
     /// Remaining rate-limit window of each throttled client, personal first.
@@ -740,7 +736,6 @@ impl WebApi {
             .filter_map(|(label, throttle)| {
                 throttle
                     .read()
-                    .unwrap()
                     .remaining(now)
                     .map(|remaining| (label, remaining))
             })
@@ -759,7 +754,7 @@ impl WebApi {
     ) {
         let now = Stamp::now();
         let (new_episode, announce) = {
-            let mut throttle = throttle.write().unwrap();
+            let mut throttle = throttle.write();
             let new_episode = throttle.record_429(now, window);
             (new_episode, new_episode && throttle.should_announce(now))
         };
@@ -780,7 +775,7 @@ impl WebApi {
         // from here until the window has passed, then once more to clear it.
         let throttle = throttle.clone();
         thread::spawn(move || {
-            while throttle.read().unwrap().is_active(Stamp::now()) {
+            while throttle.read().is_active(Stamp::now()) {
                 if !events.try_trigger() {
                     return;
                 }
@@ -795,13 +790,8 @@ impl WebApi {
         self.personal
             .iter()
             .chain(std::iter::once(&self.shared))
-            .any(|client| client.throttle.read().unwrap().rate_limited_since(since))
-            || self
-                .internal
-                .throttle
-                .read()
-                .unwrap()
-                .rate_limited_since(since)
+            .any(|client| client.throttle.read().rate_limited_since(since))
+            || self.internal.throttle.read().rate_limited_since(since)
     }
 
     /// Send `api_call` once on `client` and classify the result for [run_rate_limited].
@@ -1359,7 +1349,7 @@ impl WebApi {
                         let (artist, ids_cache) = (artist.clone(), ids_cache.clone());
                         async move {
                             // Clone out of the lock so no guard is held across an await.
-                            let cached = ids_cache.lock().unwrap().clone();
+                            let cached = ids_cache.lock().clone();
                             let all = match cached {
                                 Some(all) => all,
                                 None => {
@@ -1369,7 +1359,7 @@ impl WebApi {
                                         album_type,
                                     )
                                     .await?;
-                                    *ids_cache.lock().unwrap() = Some(all.clone());
+                                    *ids_cache.lock() = Some(all.clone());
                                     all
                                 }
                             };
@@ -1422,13 +1412,13 @@ impl WebApi {
                         let (show, ids_cache) = (show.clone(), ids_cache.clone());
                         async move {
                             // Clone out of the lock so no guard is held across an await.
-                            let cached = ids_cache.lock().unwrap().clone();
+                            let cached = ids_cache.lock().clone();
                             let all = match cached {
                                 Some(all) => all,
                                 None => {
                                     let all =
                                         metadata::show_episode_ids(session.clone(), show).await?;
-                                    *ids_cache.lock().unwrap() = Some(all.clone());
+                                    *ids_cache.lock() = Some(all.clone());
                                     all
                                 }
                             };
@@ -1820,8 +1810,7 @@ mod test {
     fn refresh_client_waits_out_the_backoff() {
         let api = WebApi::new(&Config::new_for_test_with_client_id(PERSONAL_ID));
         let personal = api.personal.as_ref().unwrap();
-        *personal.refresh_backoff_until.write().unwrap() =
-            Some(Instant::now() + Duration::from_secs(60));
+        *personal.refresh_backoff_until.write() = Some(Instant::now() + Duration::from_secs(60));
         assert!(api.refresh_client(personal, true).is_none());
     }
 
@@ -1905,14 +1894,12 @@ mod test {
         api.shared
             .throttle
             .write()
-            .unwrap()
             .record_429(now, Duration::from_secs(60));
         api.personal
             .as_ref()
             .unwrap()
             .throttle
             .write()
-            .unwrap()
             .record_429(now, Duration::from_secs(30));
         let labels: Vec<ClientLabel> = api
             .rate_limit_status()

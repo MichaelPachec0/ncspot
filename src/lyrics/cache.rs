@@ -1,6 +1,6 @@
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::RwLock;
 
 use crate::lyrics::model::Lyrics;
 
@@ -23,30 +23,24 @@ impl LyricsCache {
     }
 
     pub fn get(&self, key: &str) -> Option<Lyrics> {
-        if let Some(hit) = self.mem.read().unwrap().get(key).cloned() {
+        if let Some(hit) = self.mem.read().get(key).cloned() {
             return Some(hit);
         }
         let bytes = std::fs::read(self.path(key)).ok()?;
         let lyrics: Lyrics = serde_json::from_slice(&bytes).ok()?;
-        self.mem
-            .write()
-            .unwrap()
-            .insert(key.to_string(), lyrics.clone());
+        self.mem.write().insert(key.to_string(), lyrics.clone());
         Some(lyrics)
     }
 
     pub fn put(&self, key: &str, lyrics: &Lyrics) {
-        self.mem
-            .write()
-            .unwrap()
-            .insert(key.to_string(), lyrics.clone());
+        self.mem.write().insert(key.to_string(), lyrics.clone());
         if let Ok(json) = serde_json::to_vec(lyrics) {
             let _ = std::fs::write(self.path(key), json);
         }
     }
 
     pub fn remove(&self, key: &str) {
-        self.mem.write().unwrap().remove(key);
+        self.mem.write().remove(key);
         let _ = std::fs::remove_file(self.path(key));
     }
 }

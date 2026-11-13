@@ -1,6 +1,7 @@
+use parking_lot::RwLock;
 use std::error::Error;
 use std::str::FromStr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{env, fmt};
 
@@ -56,7 +57,7 @@ pub struct Spotify {
     events: EventManager,
     /// The credentials for the currently logged in user, used to authenticate to the Spotify API.
     #[cfg(feature = "mpris")]
-    mpris: Arc<std::sync::Mutex<Option<MprisManager>>>,
+    mpris: Arc<parking_lot::Mutex<Option<MprisManager>>>,
     credentials: Credentials,
     cfg: Arc<config::Config>,
     /// Playback status of the [Player] owned by the worker thread.
@@ -165,7 +166,7 @@ impl Spotify {
         user_tx: Option<oneshot::Sender<String>>,
     ) -> Result<(), Box<dyn Error>> {
         let (tx, rx) = mpsc::unbounded_channel();
-        *self.channel.write().unwrap() = Some(tx);
+        *self.channel.write() = Some(tx);
         let worker_channel = self.channel.clone();
         let session_handle = self.session.clone();
         let slot = self.slot.clone();
@@ -337,7 +338,7 @@ impl Spotify {
                 // Stop accepting commands into a channel whose worker will never drain them, so
                 // they surface as a logged "no channel" error instead of being silently buffered
                 // and then dropped when this task returns.
-                *worker_channel.write().unwrap() = None;
+                *worker_channel.write() = None;
 
                 // Back off in the background (this task is now detached from startup) before
                 // asking the application to restart the worker.
@@ -348,7 +349,7 @@ impl Spotify {
         };
         // Set the handle before unblocking startup: the library's first current_user call runs
         // right after Spotify::new returns and must find the session.
-        *session_handle.write().unwrap() = Some(session.clone());
+        *session_handle.write() = Some(session.clone());
         user_tx.map(|tx| tx.send(session.username()));
 
         let mixer_factory_opt = librespot_playback::mixer::find(Some(SoftMixer::NAME));
@@ -382,15 +383,15 @@ impl Spotify {
         worker.run_loop().await;
 
         error!("worker thread died, requesting restart");
-        *worker_channel.write().unwrap() = None;
-        *session_handle.write().unwrap() = None;
+        *worker_channel.write() = None;
+        *session_handle.write() = None;
         slot.reset();
         events.send(Event::SessionDied)
     }
 
     /// Get the current playback status of the [Player].
     pub fn get_current_status(&self) -> PlayerEvent {
-        let status = self.status.read().unwrap();
+        let status = self.status.read();
         (*status).clone()
     }
 
@@ -404,22 +405,22 @@ impl Spotify {
     }
 
     fn set_elapsed(&self, new_elapsed: Option<Duration>) {
-        let mut elapsed = self.elapsed.write().unwrap();
+        let mut elapsed = self.elapsed.write();
         *elapsed = new_elapsed;
     }
 
     fn get_elapsed(&self) -> Option<Duration> {
-        let elapsed = self.elapsed.read().unwrap();
+        let elapsed = self.elapsed.read();
         *elapsed
     }
 
     fn set_since(&self, new_since: Option<SystemTime>) {
-        let mut since = self.since.write().unwrap();
+        let mut since = self.since.write();
         *since = new_since;
     }
 
     fn get_since(&self) -> Option<SystemTime> {
-        let since = self.since.read().unwrap();
+        let since = self.since.read();
         *since
     }
 
@@ -463,7 +464,7 @@ impl Spotify {
             }
         }
 
-        let mut status = self.status.write().unwrap();
+        let mut status = self.status.write();
         *status = new_status;
 
         #[cfg(feature = "mpris")]
@@ -496,7 +497,7 @@ impl Spotify {
     #[cfg(feature = "mpris")]
     pub(crate) fn send_mpris(&self, cmd: MprisCommand) {
         debug!("Sending mpris command: {cmd:?}");
-        match self.mpris.lock().unwrap().as_ref() {
+        match self.mpris.lock().as_ref() {
             Some(mpris_manager) => {
                 mpris_manager.send(cmd);
             }
@@ -509,7 +510,7 @@ impl Spotify {
     /// Send a [WorkerCommand] to the worker thread.
     fn send_worker(&self, cmd: WorkerCommand) {
         info!("sending command to worker: {cmd:?}");
-        let channel = self.channel.read().unwrap();
+        let channel = self.channel.read();
         match channel.as_ref() {
             Some(channel) => {
                 if let Err(e) = channel.send(cmd) {
@@ -591,7 +592,7 @@ impl Spotify {
 
     #[cfg(feature = "mpris")]
     pub fn set_mpris(&mut self, mpris: MprisManager) {
-        *self.mpris.lock().unwrap() = Some(mpris);
+        *self.mpris.lock() = Some(mpris);
     }
 
     /// Whether the worker is reconnecting its session.
@@ -608,7 +609,7 @@ impl Spotify {
     /// Shut the current session down, so the worker sees it invalid and reconnects.
     #[cfg(feature = "harness")]
     pub fn drop_session(&self) {
-        if let Some(session) = self.session.read().unwrap().clone() {
+        if let Some(session) = self.session.read().clone() {
             session.shutdown();
         }
     }
@@ -618,7 +619,6 @@ impl Spotify {
     pub fn session_valid(&self) -> bool {
         self.session
             .read()
-            .unwrap()
             .as_ref()
             .is_some_and(|s| !s.is_invalid())
     }
@@ -626,7 +626,7 @@ impl Spotify {
     /// Return a clone of the current librespot [Session], or `None` if the worker has not yet
     /// connected (or has exited). [Session] is cheaply cloneable (Arc-backed).
     pub fn session(&self) -> Option<Session> {
-        self.session.read().unwrap().clone()
+        self.session.read().clone()
     }
 }
 

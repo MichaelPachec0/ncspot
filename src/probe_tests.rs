@@ -2,7 +2,8 @@
 //! paths the views use and check that metadata stays on the internal API. Run with
 //! `cargo test probe -- --ignored`. They never print credentials, tokens or the username.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use librespot_core::{Session, SessionConfig, cache::Cache};
 use rspotify::model::AlbumType;

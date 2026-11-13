@@ -14,9 +14,10 @@ pub mod playlist_write;
 #[cfg(test)]
 mod live_tests;
 
+use parking_lot::RwLock;
 use std::cell::RefCell;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use librespot_core::Session;
@@ -164,7 +165,6 @@ impl InternalApi {
     pub fn session(&self) -> Option<Session> {
         self.session
             .read()
-            .unwrap()
             .clone()
             .filter(|session| !session.is_invalid())
     }
@@ -271,8 +271,8 @@ mod tests {
     use super::*;
     use crate::config::ConfigValues;
     use crate::rate_limit::ThrottleState;
+    use parking_lot::RwLock;
     use std::cell::RefCell;
-    use std::sync::RwLock;
 
     fn settings(toml: &str) -> Settings {
         let values: ConfigValues = toml::from_str(toml).expect("valid toml");

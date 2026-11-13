@@ -1,6 +1,7 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
@@ -33,20 +34,17 @@ impl AnalysisCache {
     }
 
     pub fn get(&self, key: &str) -> Option<AudioAnalysis> {
-        if let Some(hit) = self.mem.read().unwrap().get(key).cloned() {
+        if let Some(hit) = self.mem.read().get(key).cloned() {
             return Some(hit);
         }
         let bytes = std::fs::read(self.path(key)).ok()?;
         let a: AudioAnalysis = serde_json::from_slice(&bytes).ok()?;
-        self.mem.write().unwrap().insert(key.to_string(), a.clone());
+        self.mem.write().insert(key.to_string(), a.clone());
         Some(a)
     }
 
     pub fn put(&self, key: &str, analysis: &AudioAnalysis) {
-        self.mem
-            .write()
-            .unwrap()
-            .insert(key.to_string(), analysis.clone());
+        self.mem.write().insert(key.to_string(), analysis.clone());
         if let Ok(json) = serde_json::to_vec(analysis) {
             let _ = std::fs::write(self.path(key), json);
         }
@@ -197,7 +195,6 @@ impl AnalysisSource for EternalboxSource {
     fn enabled(&self) -> bool {
         self.down_until
             .lock()
-            .unwrap()
             .is_none_or(|until| until <= Instant::now())
     }
 
@@ -215,7 +212,7 @@ impl AnalysisSource for EternalboxSource {
         let resp = match sent {
             Ok(resp) => resp,
             Err(e) => {
-                *self.down_until.lock().unwrap() = Some(Instant::now() + ETERNALBOX_COOLDOWN);
+                *self.down_until.lock() = Some(Instant::now() + ETERNALBOX_COOLDOWN);
                 return Err(anyhow!(
                     "{} unreachable, skipped for {}s: {e}",
                     self.base_url,

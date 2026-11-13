@@ -7,9 +7,10 @@ pub mod remixer;
 pub mod render;
 pub mod settings;
 
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
@@ -179,13 +180,13 @@ impl Jukebox {
         self.inner.bouncing.store(new, Ordering::Relaxed);
     }
     pub fn request_seek_to_beat(&self, beat: usize) {
-        *self.inner.seek_request.lock().unwrap() = Some(beat);
+        *self.inner.seek_request.lock() = Some(beat);
     }
     pub fn view_mode(&self) -> ViewMode {
-        *self.inner.view_mode.read().unwrap()
+        *self.inner.view_mode.read()
     }
     pub fn cycle_view_mode(&self) -> ViewMode {
-        let mut g = self.inner.view_mode.write().unwrap();
+        let mut g = self.inner.view_mode.write();
         *g = g.next();
         *g
     }
@@ -198,13 +199,13 @@ impl Jukebox {
         new
     }
     pub fn state(&self) -> Option<SongState> {
-        self.inner.state.read().unwrap().clone()
+        self.inner.state.read().clone()
     }
     pub fn settings(&self) -> JukeboxSettings {
-        self.inner.settings.read().unwrap().clone()
+        self.inner.settings.read().clone()
     }
     pub fn apply_settings(&self, settings: JukeboxSettings) {
-        *self.inner.settings.write().unwrap() = settings;
+        *self.inner.settings.write() = settings;
         self.request_rebuild();
     }
     /// Force the driver to rebuild the current track on its next tick.
@@ -243,7 +244,7 @@ pub fn resolve_effective(
 
 fn publish_no_analysis(inner: &JukeboxInner, events: &EventManager, playable: &Playable) {
     let title = playable.track().map(|t| t.title).unwrap_or_default();
-    *inner.state.write().unwrap() = Some(SongState {
+    *inner.state.write() = Some(SongState {
         track_title: title,
         graph: Arc::new(SongGraph::default()),
         current_beat: 0,
@@ -331,7 +332,7 @@ fn run_driver_loop(
             if driver.is_some() {
                 driver = None;
                 current_track_id = None;
-                *inner.state.write().unwrap() = None;
+                *inner.state.write() = None;
                 events.trigger();
             }
             continue;
@@ -364,7 +365,7 @@ fn run_driver_loop(
             && let Some(id) = current_track_id.clone()
         {
             let (eff, src, partial) = {
-                let base = inner.settings.read().unwrap().clone();
+                let base = inner.settings.read().clone();
                 let st = cfg.state();
                 resolve_effective(
                     &base,
@@ -397,7 +398,7 @@ fn run_driver_loop(
             && let Some(id) = current_track_id.clone()
         {
             let (eff, src, partial) = {
-                let base = inner.settings.read().unwrap().clone();
+                let base = inner.settings.read().clone();
                 let st = cfg.state();
                 resolve_effective(
                     &base,
@@ -421,7 +422,7 @@ fn run_driver_loop(
         };
         d.set_bouncing(inner.bouncing.load(Ordering::Relaxed));
 
-        if let Some(beat) = inner.seek_request.lock().unwrap().take()
+        if let Some(beat) = inner.seek_request.lock().take()
             && let Some(b) = d.graph().beats.get(beat)
         {
             spotify.seek(b.start_ms.max(0.0) as u32);
@@ -438,7 +439,7 @@ fn run_driver_loop(
             }
         }
 
-        *inner.state.write().unwrap() = Some(SongState {
+        *inner.state.write() = Some(SongState {
             track_title: current_title.clone(),
             graph: current_graph.clone(),
             current_beat: d.current_beat().unwrap_or(0),
@@ -544,7 +545,7 @@ mod tests {
     fn seek_request_is_stored() {
         let j = Jukebox::test_instance();
         j.request_seek_to_beat(7);
-        assert_eq!(*j.inner.seek_request.lock().unwrap(), Some(7));
+        assert_eq!(*j.inner.seek_request.lock(), Some(7));
     }
 
     #[test]
