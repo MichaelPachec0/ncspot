@@ -29,9 +29,9 @@ repository = "https://github.com/hrkfdn/ncspot"
 enum_glob_use = "warn"
 use_self = "deny"
 multiple_inherent_impl = "deny"
-# Opted into per module (see clippy.toml); allowed elsewhere until the whole crate moves.
-disallowed_methods = "allow"
-disallowed_types = "allow"
+# std locks are banned crate-wide (see clippy.toml).
+disallowed_methods = "deny"
+disallowed_types = "deny"
 
 [lints]
 workspace = true

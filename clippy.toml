@@ -1,10 +1,21 @@
-# Enforced only in modules that opt in with #![deny(clippy::disallowed_methods,
-# clippy::disallowed_types)]: the library stores, the playlist writer and their views.
-disallowed-methods = [
-    { path = "std::sync::RwLock::read", reason = "a poisoned lock panics on unwrap; use ext_traits::RwLockExt::read_unpoisoned" },
-    { path = "std::sync::RwLock::write", reason = "a poisoned lock panics on unwrap; use ext_traits::RwLockExt::write_unpoisoned" },
-]
+# Denied for the whole workspace (Cargo.toml [workspace.lints.clippy]). std locks
+# poison: one panic under a guard makes every later unwrap on that lock panic too.
+# The methods are listed as well because disallowed-types only sees a type that is
+# written out, not one reached through inference.
 disallowed-types = [
+    { path = "std::sync::RwLock", reason = "std locks poison; use parking_lot::RwLock" },
     { path = "std::sync::Mutex", reason = "std locks poison; use parking_lot::Mutex" },
     { path = "std::sync::Condvar", reason = "pairs with std::sync::Mutex; use parking_lot::Condvar" },
+]
+disallowed-methods = [
+    { path = "std::sync::RwLock::read", reason = "std locks poison; use parking_lot::RwLock" },
+    { path = "std::sync::RwLock::write", reason = "std locks poison; use parking_lot::RwLock" },
+    { path = "std::sync::RwLock::try_read", reason = "std locks poison; use parking_lot::RwLock" },
+    { path = "std::sync::RwLock::try_write", reason = "std locks poison; use parking_lot::RwLock" },
+    { path = "std::sync::Mutex::lock", reason = "std locks poison; use parking_lot::Mutex" },
+    { path = "std::sync::Mutex::try_lock", reason = "std locks poison; use parking_lot::Mutex" },
+    { path = "std::sync::Condvar::wait", reason = "use parking_lot::Condvar" },
+    { path = "std::sync::Condvar::wait_while", reason = "use parking_lot::Condvar" },
+    { path = "std::sync::Condvar::wait_timeout", reason = "use parking_lot::Condvar" },
+    { path = "std::sync::Condvar::wait_timeout_while", reason = "use parking_lot::Condvar" },
 ]

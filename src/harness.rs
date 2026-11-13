@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
 //! Drive harness (feature `harness`): IPC commands that open a view by URI and write a JSON
 //! snapshot of the current view, so a script can drive ncspot and check what it shows.
 

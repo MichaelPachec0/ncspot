@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;

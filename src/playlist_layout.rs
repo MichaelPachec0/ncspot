@@ -1,8 +1,6 @@
 //! The Playlists tab layout from the rootlist (folders, pinned playlists first), and the
 //! spacing between playlist downloads in a sync.
 
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::sync::Arc;

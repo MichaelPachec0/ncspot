@@ -385,17 +385,14 @@ mod test {
         let pagination: Pagination<Playlist> = Pagination::default();
         let calls = Arc::new(AtomicUsize::new(0));
         let (release, wait) = std::sync::mpsc::channel::<()>();
-        let wait = std::sync::Mutex::new(wait);
+        let wait = parking_lot::Mutex::new(wait);
         let counted = calls.clone();
         pagination.set(
             0,
             3,
             Box::new(move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
-                let _ = wait
-                    .lock()
-                    .unwrap()
-                    .recv_timeout(std::time::Duration::from_secs(5));
+                let _ = wait.lock().recv_timeout(std::time::Duration::from_secs(5));
             }),
         );
         let content = Arc::new(RwLock::new(vec![item("a")]));

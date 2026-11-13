@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
 use std::sync::Arc;
 
 use cursive::Cursive;

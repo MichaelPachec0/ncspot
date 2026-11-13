@@ -114,11 +114,7 @@ impl ViewExt for QueueView {
     fn title_sub(&self) -> String {
         let track_count = self.queue.len();
         let list = self.queue.list();
-        let duration_secs: u64 = list
-            .read()
-            .iter()
-            .map(|p| p.duration() as u64 / 1000)
-            .sum();
+        let duration_secs: u64 = list.read().iter().map(|p| p.duration() as u64 / 1000).sum();
 
         if duration_secs > 0 {
             let duration = std::time::Duration::from_secs(duration_secs);

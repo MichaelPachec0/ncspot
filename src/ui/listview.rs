@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
 use cursive::view::scroll::Scroller;
 use log::info;
 use parking_lot::RwLock;
