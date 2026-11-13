@@ -44,6 +44,73 @@ pub struct QueueSnapshot {
     pub current_track: Option<usize>,
 }
 
+/// The three values every play-order question needs, borrowed.
+#[derive(Clone, Copy)]
+struct Fields<'a> {
+    queue: &'a [Playable],
+    order: Option<&'a [usize]>,
+    current: Option<usize>,
+}
+
+impl<'a> Fields<'a> {
+    /// Position of the current track within the play order (shuffle-aware).
+    /// None if nothing is playing or the current track is not in the order.
+    fn order_pos(self) -> Option<usize> {
+        let current = self.current?;
+        match self.order {
+            Some(order) => order.iter().position(|&i| i == current),
+            None => Some(current),
+        }
+    }
+
+    /// The `queue` index at play-order position `pos`. None if out of range.
+    fn index_at(self, pos: usize) -> Option<usize> {
+        match self.order {
+            Some(order) => order.get(pos).copied(),
+            None => (pos < self.queue.len()).then_some(pos),
+        }
+    }
+
+    fn next_index(self) -> Option<usize> {
+        self.index_at(self.order_pos()? + 1)
+    }
+
+    fn previous_index(self) -> Option<usize> {
+        self.index_at(self.order_pos()?.checked_sub(1)?)
+    }
+
+    fn skip_index(self, offset: isize) -> Option<usize> {
+        let pos = self.order_pos()?;
+        let len = self.queue.len();
+        if len == 0 {
+            return None;
+        }
+        let target = (pos as isize + offset).clamp(0, len as isize - 1) as usize;
+        self.index_at(target)
+    }
+
+    fn current_item(self) -> Option<&'a Playable> {
+        self.queue.get(self.current?)
+    }
+}
+
+/// Read guards on queue, random_order and current_track, taken in lock order.
+struct QueueRead<'a> {
+    queue: parking_lot::RwLockReadGuard<'a, Vec<Playable>>,
+    order: parking_lot::RwLockReadGuard<'a, Option<Vec<usize>>>,
+    current: parking_lot::RwLockReadGuard<'a, Option<usize>>,
+}
+
+impl QueueRead<'_> {
+    fn fields(&self) -> Fields<'_> {
+        Fields {
+            queue: &self.queue,
+            order: self.order.as_deref(),
+            current: *self.current,
+        }
+    }
+}
+
 /// The queue determines the playback order of [Playable] items, and is also used to control
 /// playback itself.
 pub struct Queue {
@@ -53,7 +120,7 @@ pub struct Queue {
     // methods resolve an id->index under `queue.write()` without racing.
     /// The internal data, which doesn't change with shuffle or repeat. This is
     /// the raw data only.
-    pub queue: Arc<RwLock<Vec<Playable>>>,
+    queue: Arc<RwLock<Vec<Playable>>>,
     /// The playback order of the queue, as indices into `self.queue`.
     random_order: RwLock<Option<Vec<usize>>>,
     current_track: RwLock<Option<usize>>,
@@ -91,48 +158,41 @@ impl Queue {
         }
     }
 
-    /// Position of the current track within the play order (shuffle-aware).
-    /// None if nothing is playing.
-    fn current_order_pos(&self) -> Option<usize> {
-        let current = (*self.current_track.read())?;
-        Some(match self.random_order.read().as_ref() {
-            Some(order) => order.iter().position(|&i| i == current).unwrap(),
-            None => current,
-        })
+    /// Read guards on the queue, play order and current track, taken once in
+    /// lock order. Every play-order question is answered from one of these.
+    fn read_all(&self) -> QueueRead<'_> {
+        let queue = self.queue.read();
+        let order = self.random_order.read();
+        let current = self.current_track.read();
+        QueueRead {
+            queue,
+            order,
+            current,
+        }
     }
 
-    /// The `self.queue` index at play-order position `pos` (shuffle-aware).
-    fn queue_index_at(&self, pos: usize) -> usize {
-        match self.random_order.read().as_ref() {
-            Some(order) => order[pos],
-            None => pos,
-        }
+    /// The song list, for display. Callers must not change its length.
+    pub fn list(&self) -> Arc<RwLock<Vec<Playable>>> {
+        self.queue.clone()
     }
 
     /// The index of the next item in `self.queue` that should be played. None
     /// if at the end of the queue.
     pub fn next_index(&self) -> Option<usize> {
-        let next = self.current_order_pos()? + 1;
-        (next < self.queue.read().len()).then(|| self.queue_index_at(next))
+        self.read_all().fields().next_index()
     }
 
     /// The index of the previous item in `self.queue` that should be played.
     /// None if at the start of the queue.
     pub fn previous_index(&self) -> Option<usize> {
-        let pos = self.current_order_pos()?;
-        (pos > 0).then(|| self.queue_index_at(pos - 1))
+        self.read_all().fields().previous_index()
     }
 
     /// The `self.queue` index `offset` items from the current one in play
     /// order (negative = backward), clamped to the queue bounds. None if
     /// nothing is playing or the queue is empty.
     fn skip_index(&self, offset: isize) -> Option<usize> {
-        let pos = self.current_order_pos()?;
-        let len = self.queue.read().len();
-        (len > 0).then(|| {
-            let target = (pos as isize + offset).clamp(0, len as isize - 1) as usize;
-            self.queue_index_at(target)
-        })
+        self.read_all().fields().skip_index(offset)
     }
 
     /// Skip `offset` items forward (positive) or backward (negative) in play
@@ -153,8 +213,7 @@ impl Queue {
 
     /// The currently playing item from `self.queue`.
     pub fn get_current(&self) -> Option<Playable> {
-        self.get_current_index()
-            .map(|index| self.queue.read()[index].clone())
+        self.read_all().fields().current_item().cloned()
     }
 
     /// The index of the currently playing item from `self.queue`.
@@ -267,13 +326,11 @@ impl Queue {
 
     /// One consistent copy, read under the read guards in lock order.
     pub fn snapshot(&self) -> QueueSnapshot {
-        let queue = self.queue.read();
-        let random_order = self.random_order.read();
-        let current_track = self.current_track.read();
+        let all = self.read_all();
         QueueSnapshot {
-            queue: queue.clone(),
-            random_order: random_order.clone(),
-            current_track: *current_track,
+            queue: all.queue.clone(),
+            random_order: all.order.clone(),
+            current_track: *all.current,
         }
     }
 
@@ -653,6 +710,8 @@ impl Queue {
     /// used, and the next track will actually be played. This should be used
     /// when going to the next entry in the queue is the wanted behavior.
     pub fn next(&self, manual: bool) {
+        // Taken before the guards below: the getter locks queue itself.
+        let next_index = self.next_index();
         let q = self.queue.read();
         let current = *self.current_track.read();
         let repeat = self.cfg.state().repeat;
@@ -663,7 +722,7 @@ impl Queue {
             {
                 self.play(index, false, false);
             }
-        } else if let Some(index) = self.next_index() {
+        } else if let Some(index) = next_index {
             self.play(index, false, false);
             if repeat == RepeatSetting::RepeatTrack && manual {
                 self.set_repeat(RepeatSetting::RepeatPlaylist);
@@ -685,11 +744,13 @@ impl Queue {
 
     /// Play the previous item in the queue.
     pub fn previous(&self) {
+        // Taken before the guards below: the getter locks queue itself.
+        let previous_index = self.previous_index();
         let q = self.queue.read();
         let current = *self.current_track.read();
         let repeat = self.cfg.state().repeat;
 
-        if let Some(index) = self.previous_index() {
+        if let Some(index) = previous_index {
             self.play(index, false, false);
         } else if repeat == RepeatSetting::RepeatPlaylist && !q.is_empty() {
             if self.get_shuffle() {
@@ -767,8 +828,12 @@ impl Queue {
     pub fn handle_event(&self, event: QueueEvent) {
         match event {
             QueueEvent::PreloadTrackRequest => {
-                if let Some(next_index) = self.next_index() {
-                    let track = self.queue.read()[next_index].clone();
+                let next = {
+                    let all = self.read_all();
+                    let f = all.fields();
+                    f.next_index().and_then(|i| f.queue.get(i).cloned())
+                };
+                if let Some(track) = next {
                     debug!("Preloading track {track} as requested by librespot");
                     self.spotify.preload(&track);
                 }
@@ -1509,5 +1574,30 @@ mod tests {
         q.remove(0);
         assert_invariant(&q);
         assert_eq!(q.get_current_index(), None);
+    }
+
+    #[test]
+    fn getters_do_not_panic_on_a_cleared_shuffled_queue() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(1));
+        q.set_shuffle(true);
+        q.clear();
+        assert_eq!(q.next_index(), None);
+        assert_eq!(q.previous_index(), None);
+        assert!(q.get_current().is_none());
+        q.handle_event(QueueEvent::PreloadTrackRequest);
+    }
+
+    #[test]
+    fn getters_return_none_for_a_current_song_missing_from_the_order() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(2));
+        *q.random_order.write() = Some(vec![0, 1]);
+        assert_eq!(q.next_index(), None);
+        assert_eq!(q.previous_index(), None);
+    }
+
+    #[test]
+    fn get_current_returns_none_past_the_end() {
+        let q = make_queue((0..2).map(make_track).collect(), Some(5));
+        assert!(q.get_current().is_none());
     }
 }

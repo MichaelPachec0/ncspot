@@ -25,7 +25,7 @@ pub struct QueueView {
 
 impl QueueView {
     pub fn new(queue: Arc<Queue>, library: Arc<Library>) -> Self {
-        let list = ListView::new(queue.queue.clone(), queue.clone(), library.clone());
+        let list = ListView::new(queue.list().clone(), queue.clone(), library.clone());
 
         Self {
             list,
@@ -40,7 +40,7 @@ impl QueueView {
         library: Arc<Library>,
         id: Option<String>,
     ) {
-        let tracks = queue.queue.read().clone();
+        let tracks = queue.list().read().clone();
         match id {
             Some(id) => {
                 library.queue_overwrite(&id, &tracks);
@@ -113,9 +113,8 @@ impl ViewExt for QueueView {
 
     fn title_sub(&self) -> String {
         let track_count = self.queue.len();
-        let duration_secs: u64 = self
-            .queue
-            .queue
+        let list = self.queue.list();
+        let duration_secs: u64 = list
             .read()
             .iter()
             .map(|p| p.duration() as u64 / 1000)

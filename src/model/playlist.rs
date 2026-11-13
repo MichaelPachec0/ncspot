@@ -372,7 +372,7 @@ impl From<&FullPlaylist> for Playlist {
 impl ListItem for Playlist {
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = self.tracks.as_ref() {
-            let playing: Vec<String> = queue.queue.read().iter().filter_map(|t| t.id()).collect();
+            let playing: Vec<String> = queue.list().read().iter().filter_map(|t| t.id()).collect();
             let ids: Vec<String> = tracks.iter().filter_map(|t| t.id()).collect();
             !ids.is_empty() && playing == ids
         } else {

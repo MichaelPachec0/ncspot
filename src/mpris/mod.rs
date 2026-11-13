@@ -189,7 +189,7 @@ impl MprisManager {
                     let playable = tl
                         .queue
                         .index_for_id(id)
-                        .and_then(|index| tl.queue.queue.read().get(index).cloned());
+                        .and_then(|index| tl.queue.list().read().get(index).cloned());
                     if let Some(p) = playable {
                         let spotify = tl.spotify.clone();
                         let library = tl.library.clone();
@@ -214,7 +214,7 @@ impl MprisManager {
                     if let Some(index) = tl.queue.index_for_id(id) {
                         // Separate the lock read from the await to avoid holding
                         // a RwLockReadGuard across an await point.
-                        let p = tl.queue.queue.read().get(index).cloned();
+                        let p = tl.queue.list().read().get(index).cloned();
                         if let Some(p) = p {
                             let spotify = tl.spotify.clone();
                             let library = tl.library.clone();
