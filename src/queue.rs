@@ -37,6 +37,13 @@ pub enum QueueEvent {
     PreloadTrackRequest,
 }
 
+/// A consistent copy of the persistable queue state.
+pub struct QueueSnapshot {
+    pub queue: Vec<Playable>,
+    pub random_order: Option<Vec<usize>>,
+    pub current_track: Option<usize>,
+}
+
 /// The queue determines the playback order of [Playable] items, and is also used to control
 /// playback itself.
 pub struct Queue {
@@ -258,23 +265,48 @@ impl Queue {
         }
     }
 
+    /// One consistent copy, read under the read guards in lock order.
+    pub fn snapshot(&self) -> QueueSnapshot {
+        let queue = self.queue.read();
+        let random_order = self.random_order.read();
+        let current_track = self.current_track.read();
+        QueueSnapshot {
+            queue: queue.clone(),
+            random_order: random_order.clone(),
+            current_track: *current_track,
+        }
+    }
+
     /// Append `tracks` after the currently playing item, taking into account
     /// shuffle status. Returns the first index(in `self.queue`) of added items.
     pub fn append_next(&self, tracks: &[Playable]) -> usize {
         let first = {
             let mut q = self.queue.write();
 
-            {
-                let mut random_order = self.random_order.write();
-                if let Some(order) = random_order.as_mut() {
-                    order.extend((q.len().saturating_sub(1))..(q.len() + tracks.len()));
-                }
-            }
-
             let first = match *self.current_track.read() {
                 Some(index) => index + 1,
                 None => q.len(),
             };
+            let k = tracks.len();
+
+            {
+                let mut random_order = self.random_order.write();
+                if let Some(order) = random_order.as_mut() {
+                    for v in order.iter_mut() {
+                        if *v >= first {
+                            *v += k;
+                        }
+                    }
+                    let at = match *self.current_track.read() {
+                        Some(cur) => order
+                            .iter()
+                            .position(|&v| v == cur)
+                            .map_or(order.len(), |p| p + 1),
+                        None => order.len(),
+                    };
+                    order.splice(at..at, first..first + k);
+                }
+            }
 
             for (i, track) in (first..).zip(tracks.iter()) {
                 q.insert(i, track.clone());
@@ -332,6 +364,9 @@ impl Queue {
         let len = self.queue.read().len();
         if len == 0 {
             self.stop();
+            if let Some(order) = self.random_order.write().as_mut() {
+                order.clear();
+            }
             #[cfg(feature = "mpris")]
             if let Some(id) = removed_id {
                 self.spotify
@@ -346,7 +381,19 @@ impl Queue {
                 Ordering::Equal => {
                     if current_track == len {
                         if self.get_repeat() == RepeatSetting::RepeatPlaylist {
-                            self.next(false);
+                            if self.get_shuffle() {
+                                // current_track is stale (== len); clear it so the
+                                // regenerated order holds only valid indices.
+                                *self.current_track.write() = None;
+                                self.generate_random_order();
+                            }
+                            let first = self
+                                .random_order
+                                .read()
+                                .as_ref()
+                                .and_then(|o| o.first().copied())
+                                .unwrap_or(0);
+                            self.play(first, false, false);
                         } else {
                             self.stop();
                         }
@@ -482,6 +529,9 @@ impl Queue {
     pub fn shift(&self, from: usize, to: usize) {
         {
             let mut queue = self.queue.write();
+            if from == to || from >= queue.len() || to >= queue.len() {
+                return;
+            }
             let item = queue.remove(from);
             queue.insert(to, item);
             let mut ids = self.ids.write();
@@ -509,10 +559,10 @@ impl Queue {
             if let Some(index) = *current {
                 if index == from {
                     current.replace(to);
-                } else if index == to && from > index {
-                    current.replace(to + 1);
-                } else if index == to && from < index {
-                    current.replace(to - 1);
+                } else if from < to && index > from && index <= to {
+                    current.replace(index - 1);
+                } else if from > to && index >= to && index < from {
+                    current.replace(index + 1);
                 }
             }
         }
@@ -1347,5 +1397,117 @@ mod tests {
         let mut order = q.get_random_order().unwrap();
         order.sort_unstable();
         assert_eq!(order, (0..q.len()).collect::<Vec<_>>());
+    }
+
+    // --- Task 4: order/current fixes and snapshot ---
+
+    fn assert_invariant(q: &Queue) {
+        let len = q.queue.read().len();
+        assert_eq!(q.ids.read().len(), len);
+        if let Some(order) = q.random_order.read().as_ref() {
+            let mut sorted = order.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..len).collect::<Vec<_>>());
+        }
+        if let Some(c) = *q.current_track.read() {
+            assert!(c < len);
+        }
+    }
+
+    #[test]
+    fn append_next_keeps_a_valid_shuffle_order() {
+        let q = make_queue((0..4).map(make_track).collect(), Some(1));
+        *q.random_order.write() = Some(vec![1, 3, 0, 2]);
+        let first = q.append_next(&[make_track(10), make_track(11)]);
+        assert_eq!(first, 2);
+        // old indices >= 2 moved up by 2; the new ones follow the current song
+        assert_eq!(*q.random_order.read(), Some(vec![1, 2, 3, 5, 0, 4]));
+        assert_invariant(&q);
+    }
+
+    #[test]
+    fn append_next_without_a_current_song_appends_to_the_order() {
+        let q = make_queue((0..2).map(make_track).collect(), None);
+        *q.random_order.write() = Some(vec![1, 0]);
+        assert_eq!(q.append_next(&[make_track(10)]), 2);
+        assert_eq!(*q.random_order.read(), Some(vec![1, 0, 2]));
+    }
+
+    #[test]
+    fn shift_keeps_the_current_song_when_it_lies_between() {
+        let q = make_queue((0..5).map(make_track).collect(), Some(2));
+        q.shift(0, 4);
+        assert_eq!(q.get_current_index(), Some(1));
+        assert_eq!(track_id(&q.get_current().unwrap()), "id_2");
+        q.shift(4, 0);
+        assert_eq!(track_id(&q.get_current().unwrap()), "id_2");
+    }
+
+    #[test]
+    fn shift_to_the_same_or_a_missing_row_does_nothing() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(1));
+        let ids = q.track_ids();
+        q.shift(1, 1);
+        q.shift(0, 3);
+        q.shift(7, 0);
+        assert_eq!(q.track_ids(), ids);
+        assert_eq!(q.get_current_index(), Some(1));
+    }
+
+    #[test]
+    fn removing_the_last_playing_song_wraps_with_repeat_playlist() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(2));
+        q.set_repeat(RepeatSetting::RepeatPlaylist);
+        q.remove(2);
+        assert_eq!(q.get_current_index(), Some(0));
+        assert_invariant(&q);
+    }
+
+    #[test]
+    fn removing_the_last_playing_song_stops_without_repeat() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(2));
+        q.remove(2);
+        assert_eq!(q.get_current_index(), None);
+    }
+
+    #[test]
+    fn snapshot_is_one_consistent_state() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(1));
+        q.set_shuffle(true);
+        let s = q.snapshot();
+        assert_eq!(s.queue.len(), 3);
+        assert_eq!(s.current_track, Some(1));
+        let mut order = s.random_order.unwrap();
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn removing_the_last_playing_song_wraps_in_shuffle_order() {
+        let q = make_queue((0..4).map(make_track).collect(), Some(3));
+        q.set_shuffle(true);
+        q.set_repeat(RepeatSetting::RepeatPlaylist);
+        q.remove(3);
+        assert_invariant(&q);
+        let order = q.get_random_order().unwrap();
+        assert_eq!(q.get_current_index(), Some(order[0]));
+    }
+
+    #[test]
+    fn removing_the_playing_song_in_shuffle_keeps_a_valid_order() {
+        let q = make_queue((0..4).map(make_track).collect(), Some(3));
+        q.set_shuffle(true);
+        q.remove(3);
+        assert_eq!(q.get_current_index(), None);
+        assert_invariant(&q);
+    }
+
+    #[test]
+    fn emptying_the_queue_in_shuffle_leaves_an_empty_order() {
+        let q = make_queue(vec![make_track(0)], Some(0));
+        q.set_shuffle(true);
+        q.remove(0);
+        assert_invariant(&q);
+        assert_eq!(q.get_current_index(), None);
     }
 }

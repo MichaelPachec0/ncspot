@@ -180,17 +180,18 @@ impl CommandManager {
                 }
                 self.library.reset_pending_writes();
                 self.library.finish_playlist_save();
-                let queue = self.queue.queue.read();
-                self.config.with_state_mut(move |s| {
+                let snap = self.queue.snapshot();
+                let progress = self.spotify.get_current_progress();
+                self.config.with_state_mut(|s| {
                     debug!(
                         "saving state, {} items, current track: {:?}",
-                        queue.len(),
-                        self.queue.get_current_index()
+                        snap.queue.len(),
+                        snap.current_track
                     );
-                    s.queuestate.queue.clone_from(&queue);
-                    s.queuestate.random_order = self.queue.get_random_order();
-                    s.queuestate.current_track = self.queue.get_current_index();
-                    s.queuestate.track_progress = self.spotify.get_current_progress();
+                    s.queuestate.queue.clone_from(&snap.queue);
+                    s.queuestate.random_order.clone_from(&snap.random_order);
+                    s.queuestate.current_track = snap.current_track;
+                    s.queuestate.track_progress = progress;
                 });
                 self.config.save_state();
                 s.quit();
