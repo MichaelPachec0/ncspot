@@ -1,5 +1,4 @@
-use parking_lot::RwLock;
-use std::cmp::Ordering;
+use parking_lot::{RwLock, RwLockWriteGuard};
 use std::sync::Arc;
 
 use log::debug;
@@ -63,12 +62,14 @@ impl<'a> Fields<'a> {
         }
     }
 
-    /// The `queue` index at play-order position `pos`. None if out of range.
+    /// The `queue` index at play-order position `pos`. None if `pos` is past
+    /// the order or the order holds an index outside the queue.
     fn index_at(self, pos: usize) -> Option<usize> {
-        match self.order {
-            Some(order) => order.get(pos).copied(),
-            None => (pos < self.queue.len()).then_some(pos),
-        }
+        let index = match self.order {
+            Some(order) => *order.get(pos)?,
+            None => pos,
+        };
+        (index < self.queue.len()).then_some(index)
     }
 
     fn next_index(self) -> Option<usize> {
@@ -85,7 +86,9 @@ impl<'a> Fields<'a> {
         if len == 0 {
             return None;
         }
-        let target = (pos as isize + offset).clamp(0, len as isize - 1) as usize;
+        let last = isize::try_from(len - 1).unwrap_or(isize::MAX);
+        let start = isize::try_from(pos).unwrap_or(isize::MAX);
+        let target = start.saturating_add(offset).clamp(0, last) as usize;
         self.index_at(target)
     }
 
@@ -108,6 +111,186 @@ impl QueueRead<'_> {
             order: self.order.as_deref(),
             current: *self.current,
         }
+    }
+}
+
+/// What a locked section decided about playback, carried out by
+/// [Queue::apply] after the queue locks are released. Lives for one call,
+/// so the unboxed track costs nothing worth an allocation.
+#[allow(clippy::large_enum_variant)]
+enum Playback {
+    /// Leave playback as it is.
+    Keep,
+    /// Load and start this track.
+    Load(Playable),
+    /// Stop the player.
+    Stop,
+}
+
+/// The four write guards, taken in lock order. A mutator reads and writes
+/// all queue state through one of these so no other thread sees a half-done
+/// edit. Never call a public [Queue] method while holding one.
+struct QueueState<'a> {
+    queue: RwLockWriteGuard<'a, Vec<Playable>>,
+    random_order: RwLockWriteGuard<'a, Option<Vec<usize>>>,
+    ids: RwLockWriteGuard<'a, Vec<u64>>,
+    current: RwLockWriteGuard<'a, Option<usize>>,
+}
+
+impl QueueState<'_> {
+    fn fields(&self) -> Fields<'_> {
+        Fields {
+            queue: &self.queue,
+            order: self.random_order.as_deref(),
+            current: *self.current,
+        }
+    }
+
+    /// Whether the queue is shuffled: it has a play order.
+    fn shuffled(&self) -> bool {
+        self.random_order.is_some()
+    }
+
+    /// Build a new random play order, with the current song first if any.
+    fn reshuffle(&mut self) {
+        let len = self.queue.len();
+        let current = self.current.filter(|&c| c < len);
+        let mut rest: Vec<usize> = (0..len).filter(|&i| Some(i) != current).collect();
+        rest.shuffle(&mut rand::rng());
+        let mut order = Vec::with_capacity(len);
+        order.extend(current);
+        order.extend(rest);
+        *self.random_order = Some(order);
+    }
+
+    /// Make `index` the current song. `Keep` (and no change) if it is out of
+    /// range.
+    fn play(&mut self, index: usize) -> Playback {
+        match self.queue.get(index) {
+            Some(track) => {
+                let track = track.clone();
+                *self.current = Some(index);
+                Playback::Load(track)
+            }
+            None => Playback::Keep,
+        }
+    }
+
+    /// Play-order position right after the current song, or the end of the
+    /// order. Only meaningful when shuffled.
+    fn order_slot_after_current(&self) -> usize {
+        match self.random_order.as_ref() {
+            Some(order) => self
+                .current
+                .and_then(|c| order.iter().position(|&i| i == c))
+                .map_or(order.len(), |p| p + 1),
+            None => 0,
+        }
+    }
+
+    /// Insert `tracks` with `new_ids` at queue index `at` (clamped to the
+    /// length). When shuffled the new entries go into the play order at
+    /// `order_at` (clamped). Returns the id of the entry before them, if any.
+    fn insert(
+        &mut self,
+        at: usize,
+        tracks: Vec<Playable>,
+        new_ids: Vec<u64>,
+        order_at: usize,
+    ) -> Option<u64> {
+        let at = at.min(self.queue.len());
+        let k = tracks.len();
+        if let Some(order) = self.random_order.as_mut() {
+            for v in order.iter_mut() {
+                if *v >= at {
+                    *v += k;
+                }
+            }
+            let slot = order_at.min(order.len());
+            order.splice(slot..slot, at..at + k);
+        }
+        self.queue.splice(at..at, tracks);
+        let after_id = at.checked_sub(1).and_then(|i| self.ids.get(i).copied());
+        self.ids.splice(at..at, new_ids);
+        if let Some(c) = *self.current
+            && c >= at
+        {
+            *self.current = Some(c + k);
+        }
+        after_id
+    }
+
+    /// Remove the entry at `index` (must be in range) and fix the order and
+    /// current song. Returns the removed id and what playback should do.
+    fn remove_at(&mut self, index: usize, repeat: RepeatSetting) -> (u64, Playback) {
+        self.queue.remove(index);
+        let id = self.ids.remove(index);
+        let len = self.queue.len();
+        let was_current = *self.current == Some(index);
+        match *self.current {
+            Some(c) if c == index => *self.current = None,
+            Some(c) if c > index => *self.current = Some(c - 1),
+            _ => {}
+        }
+        if self.current.is_some_and(|c| c >= len) {
+            *self.current = None;
+        }
+
+        if len == 0 {
+            *self.current = None;
+            if let Some(order) = self.random_order.as_mut() {
+                order.clear();
+            }
+            return (id, Playback::Stop);
+        }
+        if !was_current {
+            if self.shuffled() {
+                self.reshuffle();
+            }
+            return (id, Playback::Keep);
+        }
+        if index < len {
+            // Another song moved into the removed one's place: play it.
+            *self.current = Some(index);
+            if self.shuffled() {
+                self.reshuffle();
+            }
+            return (id, self.play(index));
+        }
+        // Removed the current and last song. The current song is cleared, so
+        // a rebuilt order holds only valid indices.
+        if self.shuffled() {
+            self.reshuffle();
+        }
+        if repeat == RepeatSetting::RepeatPlaylist {
+            let first = self.fields().index_at(0).unwrap_or(0);
+            (id, self.play(first))
+        } else {
+            (id, Playback::Stop)
+        }
+    }
+
+    /// The `next(manual)` decision. Returns the playback and whether repeat
+    /// must flip from RepeatTrack to RepeatPlaylist.
+    fn advance(&mut self, manual: bool, repeat: RepeatSetting) -> (Playback, bool) {
+        let f = self.fields();
+        if repeat == RepeatSetting::RepeatTrack && !manual {
+            let replay = f
+                .current_item()
+                .is_some_and(|t| t.is_playable())
+                .then_some(f.current)
+                .flatten();
+            return (replay.map_or(Playback::Keep, |c| self.play(c)), false);
+        }
+        if let Some(index) = f.next_index() {
+            let flip = repeat == RepeatSetting::RepeatTrack && manual;
+            return (self.play(index), flip);
+        }
+        if repeat == RepeatSetting::RepeatPlaylist && f.queue.iter().any(|t| t.is_playable()) {
+            let first = f.index_at(0).unwrap_or(0);
+            return (self.play(first), false);
+        }
+        (Playback::Stop, false)
     }
 }
 
@@ -171,6 +354,69 @@ impl Queue {
         }
     }
 
+    /// Write guards on all four queue values, taken in lock order.
+    fn lock_all(&self) -> QueueState<'_> {
+        let queue = self.queue.write();
+        let random_order = self.random_order.write();
+        let ids = self.ids.write();
+        let current = self.current_track.write();
+        QueueState {
+            queue,
+            random_order,
+            ids,
+            current,
+        }
+    }
+
+    /// Run `f` as one locked section over all queue state. `f` must not call
+    /// a public Queue method or run side effects; it returns what the caller
+    /// needs to carry them out after the locks are released.
+    fn with_state<R>(&self, f: impl FnOnce(&mut QueueState<'_>) -> R) -> R {
+        let mut st = self.lock_all();
+        f(&mut st)
+    }
+
+    /// Carry out a section's playback decision. Call with no queue guard held.
+    fn apply(&self, playback: Playback) {
+        match playback {
+            Playback::Keep => {}
+            Playback::Stop => self.spotify.stop(),
+            Playback::Load(track) => {
+                self.spotify.load(&track, true, 0);
+                self.spotify.update_track();
+
+                #[cfg(feature = "notify")]
+                self.notify_track(&track);
+
+                // Send a Seeked signal at start of new track
+                #[cfg(feature = "mpris")]
+                self.spotify.notify_seeked(0);
+            }
+        }
+    }
+
+    /// Show a desktop notification for `track` if enabled.
+    #[cfg(feature = "notify")]
+    fn notify_track(&self, track: &Playable) {
+        let format = {
+            let values = self.cfg.values();
+            if !values.notify.unwrap_or(false) {
+                return;
+            }
+            values.notification_format.clone().unwrap_or_default()
+        };
+        // use same parser as track_format, Playable::format
+        let default_title = crate::config::NotificationFormat::default().title.unwrap();
+        let title = format.title.unwrap_or(default_title);
+        let default_body = crate::config::NotificationFormat::default().body.unwrap();
+        let body = format.body.unwrap_or(default_body);
+
+        let summary_txt = Playable::format(track, &title, &self.library);
+        let body_txt = Playable::format(track, &body, &self.library);
+        let cover_url = track.cover_url();
+        std::thread::spawn(move || send_notification(&summary_txt, &body_txt, cover_url));
+    }
+
     /// The song list, for display. Callers must not change its length.
     pub fn list(&self) -> Arc<RwLock<Vec<Playable>>> {
         self.queue.clone()
@@ -191,6 +437,7 @@ impl Queue {
     /// The `self.queue` index `offset` items from the current one in play
     /// order (negative = backward), clamped to the queue bounds. None if
     /// nothing is playing or the queue is empty.
+    #[cfg(test)]
     fn skip_index(&self, offset: isize) -> Option<usize> {
         self.read_all().fields().skip_index(offset)
     }
@@ -206,9 +453,11 @@ impl Queue {
     /// A bulk count-skip is a jump to a position, not a sequence of
     /// end-of-queue transitions.
     pub fn skip(&self, offset: isize) {
-        if let Some(index) = self.skip_index(offset) {
-            self.play(index, false, false);
-        }
+        let playback = self.with_state(|st| match st.fields().skip_index(offset) {
+            Some(index) => st.play(index),
+            None => Playback::Keep,
+        });
+        self.apply(playback);
     }
 
     /// The currently playing item from `self.queue`.
@@ -269,59 +518,40 @@ impl Queue {
             .collect()
     }
 
-    /// Insert `track` as the item that should logically follow the currently
-    /// playing item, taking into account shuffle status.
-    pub fn insert_after_current(&self, track: Playable) {
-        let Some(index) = self.get_current_index() else {
-            // No current track — append handles ids/order/emit.
-            self.append(track);
-            return;
-        };
-        let id = self.next_id();
-        let after_id = {
-            let mut q = self.queue.write();
-            let mut random_order = self.random_order.write();
-            if let Some(order) = random_order.as_mut() {
-                let next_i = order.iter().position(|&i| i == index).unwrap();
-                for item in order.iter_mut() {
-                    if *item > index {
-                        *item += 1;
-                    }
-                }
-                order.insert(next_i + 1, index + 1);
-            }
-            q.insert(index + 1, track);
-            self.ids.write().insert(index + 1, id);
-            self.ids.read().get(index).copied()
-        };
-        #[cfg(not(feature = "mpris"))]
-        let _ = after_id;
+    /// Emit MPRIS TrackAdded for a new entry. Call with no queue guard held.
+    fn emit_track_added(&self, id: u64, after_id: Option<u64>) {
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
+        #[cfg(not(feature = "mpris"))]
+        let _ = (id, after_id);
+    }
+
+    /// Insert `track` as the item that should logically follow the currently
+    /// playing item, taking into account shuffle status. With no current
+    /// song it is appended.
+    pub fn insert_after_current(&self, track: Playable) {
+        let id = self.next_id();
+        let after_id = self.with_state(|st| {
+            let len = st.queue.len();
+            let at = match *st.current {
+                Some(c) if c < len => c + 1,
+                _ => len,
+            };
+            let slot = st.order_slot_after_current();
+            st.insert(at, vec![track], vec![id], slot)
+        });
+        self.emit_track_added(id, after_id);
     }
 
     /// Add `track` to the end of the queue.
     pub fn append(&self, track: Playable) {
         let id = self.next_id();
-        {
-            let mut q = self.queue.write();
-            let mut random_order = self.random_order.write();
-            if let Some(order) = random_order.as_mut() {
-                order.push(order.len());
-            }
-            q.push(track);
-            self.ids.write().push(id);
-        }
-        #[cfg(feature = "mpris")]
-        {
-            let after_id = {
-                let ids = self.ids.read();
-                (ids.len() >= 2).then(|| ids[ids.len() - 2])
-            };
-            self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
-        }
+        let after_id = self.with_state(|st| {
+            let len = st.queue.len();
+            st.insert(len, vec![track], vec![id], usize::MAX)
+        });
+        self.emit_track_added(id, after_id);
     }
 
     /// One consistent copy, read under the read guards in lock order.
@@ -337,43 +567,17 @@ impl Queue {
     /// Append `tracks` after the currently playing item, taking into account
     /// shuffle status. Returns the first index(in `self.queue`) of added items.
     pub fn append_next(&self, tracks: &[Playable]) -> usize {
-        let first = {
-            let mut q = self.queue.write();
-
-            let first = match *self.current_track.read() {
-                Some(index) => index + 1,
-                None => q.len(),
+        let new_ids: Vec<u64> = tracks.iter().map(|_| self.next_id()).collect();
+        let first = self.with_state(|st| {
+            let len = st.queue.len();
+            let first = match *st.current {
+                Some(c) if c < len => c + 1,
+                _ => len,
             };
-            let k = tracks.len();
-
-            {
-                let mut random_order = self.random_order.write();
-                if let Some(order) = random_order.as_mut() {
-                    for v in order.iter_mut() {
-                        if *v >= first {
-                            *v += k;
-                        }
-                    }
-                    let at = match *self.current_track.read() {
-                        Some(cur) => order
-                            .iter()
-                            .position(|&v| v == cur)
-                            .map_or(order.len(), |p| p + 1),
-                        None => order.len(),
-                    };
-                    order.splice(at..at, first..first + k);
-                }
-            }
-
-            for (i, track) in (first..).zip(tracks.iter()) {
-                q.insert(i, track.clone());
-            }
-
-            let new_ids: Vec<u64> = (0..tracks.len()).map(|_| self.next_id()).collect();
-            self.ids.write().splice(first..first, new_ids);
-
+            let slot = st.order_slot_after_current();
+            st.insert(first, tracks.to_vec(), new_ids, slot);
             first
-        };
+        });
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
@@ -382,99 +586,35 @@ impl Queue {
 
     /// Remove the item at `index` in `self.queue`. No-op if out of bounds.
     pub fn remove(&self, index: usize) {
-        let removed_id = {
-            let mut q = self.queue.write();
-            if index >= q.len() {
-                return;
-            }
-            #[cfg(feature = "mpris")]
-            let rid = self.ids.read().get(index).copied();
-            #[cfg(not(feature = "mpris"))]
-            let rid: Option<u64> = None;
-            q.remove(index);
-            self.ids.write().remove(index);
-            rid
-        };
-        self.after_remove(index, removed_id);
+        let repeat = self.get_repeat();
+        let removed =
+            self.with_state(|st| (index < st.queue.len()).then(|| st.remove_at(index, repeat)));
+        if let Some((id, playback)) = removed {
+            self.after_remove(id, playback);
+        }
     }
 
     /// Remove the queue entry with stable id `id`, resolving the index atomically.
     /// No-op if the id is no longer present.
     pub fn remove_by_id(&self, id: u64) {
-        let (index, removed_id) = {
-            let mut q = self.queue.write();
-            let index = match self.ids.read().iter().position(|&i| i == id) {
-                Some(i) => i,
-                None => return,
-            };
-            q.remove(index);
-            self.ids.write().remove(index);
-            (index, Some(id))
-        };
-        self.after_remove(index, removed_id);
+        let repeat = self.get_repeat();
+        let removed = self.with_state(|st| {
+            let index = st.ids.iter().position(|&i| i == id)?;
+            Some(st.remove_at(index, repeat))
+        });
+        if let Some((id, playback)) = removed {
+            self.after_remove(id, playback);
+        }
     }
 
-    /// Shared post-removal bookkeeping: stop/advance playback as needed, fix the
-    /// current index, regenerate shuffle order, and emit TrackRemoved.
-    fn after_remove(&self, index: usize, removed_id: Option<u64>) {
-        let _ = removed_id;
-        let len = self.queue.read().len();
-        if len == 0 {
-            self.stop();
-            if let Some(order) = self.random_order.write().as_mut() {
-                order.clear();
-            }
-            #[cfg(feature = "mpris")]
-            if let Some(id) = removed_id {
-                self.spotify
-                    .send_mpris(crate::mpris::MprisCommand::EmitTrackRemoved(id));
-            }
-            return;
-        }
-
-        let current = *self.current_track.read();
-        if let Some(current_track) = current {
-            match current_track.cmp(&index) {
-                Ordering::Equal => {
-                    if current_track == len {
-                        if self.get_repeat() == RepeatSetting::RepeatPlaylist {
-                            if self.get_shuffle() {
-                                // current_track is stale (== len); clear it so the
-                                // regenerated order holds only valid indices.
-                                *self.current_track.write() = None;
-                                self.generate_random_order();
-                            }
-                            let first = self
-                                .random_order
-                                .read()
-                                .as_ref()
-                                .and_then(|o| o.first().copied())
-                                .unwrap_or(0);
-                            self.play(first, false, false);
-                        } else {
-                            self.stop();
-                        }
-                    } else {
-                        self.play(index, false, false);
-                    }
-                }
-                Ordering::Greater => {
-                    let mut current = self.current_track.write();
-                    current.replace(current_track - 1);
-                }
-                _ => (),
-            }
-        }
-
-        if self.get_shuffle() {
-            self.generate_random_order();
-        }
-
+    /// Effects of a removal, run with no queue guard held.
+    fn after_remove(&self, id: u64, playback: Playback) {
+        self.apply(playback);
         #[cfg(feature = "mpris")]
-        if let Some(id) = removed_id {
-            self.spotify
-                .send_mpris(crate::mpris::MprisCommand::EmitTrackRemoved(id));
-        }
+        self.spotify
+            .send_mpris(crate::mpris::MprisCommand::EmitTrackRemoved(id));
+        #[cfg(not(feature = "mpris"))]
+        let _ = id;
     }
 
     /// Insert `track` at `index` (clamped to the queue length), maintaining
@@ -482,94 +622,49 @@ impl Queue {
     /// carrying the predecessor's id. Returns the new entry's id.
     pub fn insert_at(&self, index: usize, track: Playable) -> u64 {
         let id = self.next_id();
-        let after_id = {
-            let mut q = self.queue.write();
-            let index = index.min(q.len());
-
-            let mut random_order = self.random_order.write();
-            if let Some(order) = random_order.as_mut() {
-                for item in order.iter_mut() {
-                    if *item >= index {
-                        *item += 1;
-                    }
-                }
-                order.push(index);
-            }
-            drop(random_order);
-
-            q.insert(index, track);
-
-            let mut ids = self.ids.write();
-            let after_id = (index > 0).then(|| ids[index - 1]);
-            ids.insert(index, id);
-            drop(ids);
-
-            let mut current = self.current_track.write();
-            if let Some(ci) = *current
-                && ci >= index
-            {
-                current.replace(ci + 1);
-            }
-            after_id
-        };
-        #[cfg(feature = "mpris")]
-        self.spotify
-            .send_mpris(crate::mpris::MprisCommand::EmitTrackAdded { id, after_id });
-        #[cfg(not(feature = "mpris"))]
-        let _ = after_id;
+        let after_id = self.with_state(|st| st.insert(index, vec![track], vec![id], usize::MAX));
+        self.emit_track_added(id, after_id);
         id
     }
 
-    /// Resolve `after_id` -> index and insert `track` immediately after it.
-    /// `after_id == None` inserts at the front. Returns the index inserted at,
-    /// or None if `after_id` is no longer present in the queue.
-    ///
-    /// The id->index resolution is race-free (done under `queue.write()` so ids
-    /// cannot change during the lookup), but `insert_at` re-acquires the lock.
-    /// The residual gap is benign: `insert_at` clamps the index, so it never
-    /// panics and the track lands at the correct position.
+    /// Resolve `after_id` -> index and insert `track` immediately after it,
+    /// in one locked section. `after_id == None` inserts at the front.
+    /// Returns the index inserted at, or None if `after_id` is no longer
+    /// present in the queue.
     pub fn insert_after_id(&self, after_id: Option<u64>, track: Playable) -> Option<usize> {
-        // Acquire queue.write() to resolve the id->index atomically; ids are
-        // only mutated while queue is write-locked, so the position is stable
-        // for this critical section. insert_at re-acquires the lock; the
-        // residual gap is benign because insert_at clamps the index.
-        let index = {
-            let q = self.queue.write();
+        let id = self.next_id();
+        let (index, prev_id) = self.with_state(|st| {
             let index = match after_id {
                 None => 0,
-                Some(aid) => {
-                    let pos = self.ids.read().iter().position(|&i| i == aid)?;
-                    pos + 1
-                }
+                Some(aid) => st.ids.iter().position(|&i| i == aid)? + 1,
             };
-            drop(q);
-            index
-        };
-        self.insert_at(index, track);
+            let prev_id = st.insert(index, vec![track], vec![id], usize::MAX);
+            Some((index, prev_id))
+        })?;
+        self.emit_track_added(id, prev_id);
         Some(index)
     }
 
     /// Play the entry with stable id `id`. No-op if the id is no longer present.
     pub fn play_by_id(&self, id: u64) {
-        if let Some(index) = self.index_for_id(id) {
-            self.play(index, false, false);
-        }
+        let playback = self.with_state(|st| match st.ids.iter().position(|&i| i == id) {
+            Some(index) => st.play(index),
+            None => Playback::Keep,
+        });
+        self.apply(playback);
     }
 
     /// Clear all the items from the queue and stop playback.
     pub fn clear(&self) {
-        self.stop();
-
-        {
-            let mut q = self.queue.write();
-            q.clear();
-            self.ids.write().clear();
-
-            let mut random_order = self.random_order.write();
-            if let Some(o) = random_order.as_mut() {
-                o.clear()
+        self.with_state(|st| {
+            *st.current = None;
+            st.queue.clear();
+            st.ids.clear();
+            if let Some(order) = st.random_order.as_mut() {
+                order.clear();
             }
-        }
+        });
+        self.apply(Playback::Stop);
         // Any non-ActivatePlaylist queue replacement clears the active playlist.
         self.set_active_playlist(None);
         #[cfg(feature = "mpris")]
@@ -584,48 +679,46 @@ impl Queue {
 
     /// Shift the item at `from` in `self.queue` to `to`.
     pub fn shift(&self, from: usize, to: usize) {
-        {
-            let mut queue = self.queue.write();
-            if from == to || from >= queue.len() || to >= queue.len() {
-                return;
+        let moved = self.with_state(|st| {
+            let len = st.queue.len();
+            if from == to || from >= len || to >= len {
+                return false;
             }
-            let item = queue.remove(from);
-            queue.insert(to, item);
-            let mut ids = self.ids.write();
-            let id = ids.remove(from);
-            ids.insert(to, id);
+            let item = st.queue.remove(from);
+            st.queue.insert(to, item);
+            let id = st.ids.remove(from);
+            st.ids.insert(to, id);
 
-            // Keep the shuffle order pointing at the same logical tracks after the move.
-            let mut random_order = self.random_order.write();
-            if let Some(order) = random_order.as_mut() {
+            // Where an index ends up after the move.
+            let remap = |v: usize| {
+                if v == from {
+                    to
+                } else if from < to && v > from && v <= to {
+                    v - 1
+                } else if from > to && v >= to && v < from {
+                    v + 1
+                } else {
+                    v
+                }
+            };
+            // Keep the shuffle order pointing at the same logical tracks.
+            if let Some(order) = st.random_order.as_mut() {
                 for v in order.iter_mut() {
-                    if *v == from {
-                        *v = to;
-                    } else if from < to && *v > from && *v <= to {
-                        *v -= 1;
-                    } else if from > to && *v >= to && *v < from {
-                        *v += 1;
-                    }
+                    *v = remap(*v);
                 }
             }
-            drop(random_order);
-
-            // if the currently playing track is affected by the shift, update its
-            // index
-            let mut current = self.current_track.write();
-            if let Some(index) = *current {
-                if index == from {
-                    current.replace(to);
-                } else if from < to && index > from && index <= to {
-                    current.replace(index - 1);
-                } else if from > to && index >= to && index < from {
-                    current.replace(index + 1);
-                }
+            if let Some(c) = *st.current {
+                *st.current = Some(remap(c));
             }
-        }
+            true
+        });
         #[cfg(feature = "mpris")]
-        self.spotify
-            .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
+        if moved {
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
+        }
+        #[cfg(not(feature = "mpris"))]
+        let _ = moved;
     }
 
     /// Play the item at `index` in `self.queue`.
@@ -633,52 +726,21 @@ impl Queue {
     /// `reshuffle`: Reshuffle the current order of the queue.
     /// `shuffle_index`: If this is true, `index` isn't actually used, but is
     /// chosen at random as a valid index in the queue.
-    pub fn play(&self, mut index: usize, reshuffle: bool, shuffle_index: bool) {
-        let queue_length = self.queue.read().len();
-        // The length of the queue must be bigger than 0 or gen_range panics!
-        if queue_length > 0 && shuffle_index && self.get_shuffle() {
-            let mut rng = rand::rng();
-            index = rng.random_range(0..queue_length);
-        }
-
-        let track = self.queue.read().get(index).cloned();
-        if let Some(track) = &track {
-            self.spotify.load(track, true, 0);
-            let mut current = self.current_track.write();
-            current.replace(index);
-            self.spotify.update_track();
-
-            #[cfg(feature = "notify")]
-            if self.cfg.values().notify.unwrap_or(false) {
-                std::thread::spawn({
-                    // use same parser as track_format, Playable::format
-                    let format = self
-                        .cfg
-                        .values()
-                        .notification_format
-                        .clone()
-                        .unwrap_or_default();
-                    let default_title = crate::config::NotificationFormat::default().title.unwrap();
-                    let title = format.title.unwrap_or_else(|| default_title.clone());
-
-                    let default_body = crate::config::NotificationFormat::default().body.unwrap();
-                    let body = format.body.unwrap_or_else(|| default_body.clone());
-
-                    let summary_txt = Playable::format(track, &title, &self.library);
-                    let body_txt = Playable::format(track, &body, &self.library);
-                    let cover_url = track.cover_url();
-                    move || send_notification(&summary_txt, &body_txt, cover_url)
-                });
+    pub fn play(&self, index: usize, reshuffle: bool, shuffle_index: bool) {
+        let playback = self.with_state(|st| {
+            let len = st.queue.len();
+            let mut index = index;
+            // The length must be bigger than 0 or random_range panics.
+            if shuffle_index && st.shuffled() && len > 0 {
+                index = rand::rng().random_range(0..len);
             }
-
-            // Send a Seeked signal at start of new track
-            #[cfg(feature = "mpris")]
-            self.spotify.notify_seeked(0);
-        }
-
-        if reshuffle && self.get_shuffle() {
-            self.generate_random_order()
-        }
+            let playback = st.play(index);
+            if reshuffle && st.shuffled() {
+                st.reshuffle();
+            }
+            playback
+        });
+        self.apply(playback);
     }
 
     /// Toggle the playback. If playback is currently stopped, this will either
@@ -688,19 +750,28 @@ impl Queue {
             PlayerEvent::Playing(_) | PlayerEvent::Paused(_) => {
                 self.spotify.toggleplayback();
             }
-            PlayerEvent::Stopped => match self.next_index() {
-                Some(_) => self.next(false),
-                None => self.play(0, false, false),
-            },
+            PlayerEvent::Stopped => {
+                let repeat = self.get_repeat();
+                let (playback, flip) = self.with_state(|st| {
+                    if st.fields().next_index().is_some() {
+                        st.advance(false, repeat)
+                    } else {
+                        (st.play(0), false)
+                    }
+                });
+                self.apply(playback);
+                if flip {
+                    self.set_repeat(RepeatSetting::RepeatPlaylist);
+                }
+            }
             _ => (),
         }
     }
 
     /// Stop playback.
     pub fn stop(&self) {
-        let mut current = self.current_track.write();
-        *current = None;
-        self.spotify.stop();
+        self.with_state(|st| *st.current = None);
+        self.apply(Playback::Stop);
     }
 
     /// Play the next song in the queue. Stops playback if there are no playable tracks
@@ -710,62 +781,31 @@ impl Queue {
     /// used, and the next track will actually be played. This should be used
     /// when going to the next entry in the queue is the wanted behavior.
     pub fn next(&self, manual: bool) {
-        // Taken before the guards below: the getter locks queue itself.
-        let next_index = self.next_index();
-        let q = self.queue.read();
-        let current = *self.current_track.read();
-        let repeat = self.cfg.state().repeat;
-
-        if repeat == RepeatSetting::RepeatTrack && !manual {
-            if let Some(index) = current
-                && q[index].is_playable()
-            {
-                self.play(index, false, false);
-            }
-        } else if let Some(index) = next_index {
-            self.play(index, false, false);
-            if repeat == RepeatSetting::RepeatTrack && manual {
-                self.set_repeat(RepeatSetting::RepeatPlaylist);
-            }
-        } else if repeat == RepeatSetting::RepeatPlaylist
-            && !q.is_empty()
-            && q.iter().any(|track| track.is_playable())
-        {
-            let random_order = self.random_order.read();
-            self.play(
-                random_order.as_ref().map(|o| o[0]).unwrap_or(0),
-                false,
-                false,
-            );
-        } else {
-            self.spotify.stop();
+        let repeat = self.get_repeat();
+        let (playback, flip) = self.with_state(|st| st.advance(manual, repeat));
+        self.apply(playback);
+        if flip {
+            self.set_repeat(RepeatSetting::RepeatPlaylist);
         }
     }
 
     /// Play the previous item in the queue.
     pub fn previous(&self) {
-        // Taken before the guards below: the getter locks queue itself.
-        let previous_index = self.previous_index();
-        let q = self.queue.read();
-        let current = *self.current_track.read();
-        let repeat = self.cfg.state().repeat;
-
-        if let Some(index) = previous_index {
-            self.play(index, false, false);
-        } else if repeat == RepeatSetting::RepeatPlaylist && !q.is_empty() {
-            if self.get_shuffle() {
-                let random_order = self.random_order.read();
-                self.play(
-                    random_order.as_ref().map(|o| o[q.len() - 1]).unwrap_or(0),
-                    false,
-                    false,
-                );
+        let repeat = self.get_repeat();
+        let playback = self.with_state(|st| {
+            let f = st.fields();
+            let len = f.queue.len();
+            let target = if let Some(index) = f.previous_index() {
+                Some(index)
+            } else if repeat == RepeatSetting::RepeatPlaylist && len > 0 {
+                // The last song in play order.
+                Some(f.index_at(len - 1).unwrap_or(0))
             } else {
-                self.play(q.len() - 1, false, false);
-            }
-        } else if let Some(index) = current {
-            self.play(index, false, false);
-        }
+                f.current
+            };
+            target.map_or(Playback::Keep, |index| st.play(index))
+        });
+        self.apply(playback);
     }
 
     /// Get the current repeat behavior.
@@ -791,34 +831,16 @@ impl Queue {
         self.random_order.read().clone()
     }
 
-    /// (Re)generate the random shuffle order.
-    fn generate_random_order(&self) {
-        let q = self.queue.read();
-        let mut order: Vec<usize> = Vec::with_capacity(q.len());
-        let mut random: Vec<usize> = (0..q.len()).collect();
-
-        if let Some(current) = *self.current_track.read() {
-            order.push(current);
-            random.remove(current);
-        }
-
-        let mut rng = rand::rng();
-        random.shuffle(&mut rng);
-        order.extend(random);
-
-        let mut random_order = self.random_order.write();
-        *random_order = Some(order);
-    }
-
     /// Set the current shuffle behavior.
     pub fn set_shuffle(&self, new: bool) {
+        self.with_state(|st| {
+            if new {
+                st.reshuffle();
+            } else {
+                *st.random_order = None;
+            }
+        });
         self.cfg.with_state_mut(|s| s.shuffle = new);
-        if new {
-            self.generate_random_order();
-        } else {
-            let mut random_order = self.random_order.write();
-            *random_order = None;
-        }
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitShuffleStatus);
@@ -1599,5 +1621,114 @@ mod tests {
     fn get_current_returns_none_past_the_end() {
         let q = make_queue((0..2).map(make_track).collect(), Some(5));
         assert!(q.get_current().is_none());
+    }
+
+    // --- Task 6: atomic mutators ---
+
+    type Step = Box<dyn Fn(&Queue)>;
+
+    /// Runs every mutator, shuffled and not, and checks the invariant after each.
+    #[test]
+    fn every_mutator_keeps_the_invariant() {
+        for shuffle in [false, true] {
+            let q = make_queue((0..6).map(make_track).collect(), Some(2));
+            q.set_shuffle(shuffle);
+            let steps: Vec<Step> = vec![
+                Box::new(|q| q.append(make_track(20))),
+                Box::new(|q| {
+                    q.append_next(&[make_track(21), make_track(22)]);
+                }),
+                Box::new(|q| q.insert_after_current(make_track(23))),
+                Box::new(|q| {
+                    q.insert_at(0, make_track(24));
+                }),
+                Box::new(|q| {
+                    q.insert_after_id(q.id_for_index(1), make_track(25));
+                }),
+                Box::new(|q| q.shift(0, 3)),
+                Box::new(|q| q.play(4, true, false)),
+                Box::new(|q| q.next(true)),
+                Box::new(|q| q.previous()),
+                Box::new(|q| q.skip(2)),
+                Box::new(|q| q.remove(q.get_current_index().unwrap())),
+                Box::new(|q| q.remove_by_id(q.id_for_index(0).unwrap())),
+                Box::new(move |q| q.set_shuffle(!shuffle)),
+                Box::new(|q| q.stop()),
+                Box::new(|q| q.toggleplayback()),
+                Box::new(|q| q.clear()),
+            ];
+            for step in &steps {
+                step(&q);
+                assert_invariant(&q);
+            }
+        }
+    }
+
+    #[test]
+    fn operations_on_an_empty_queue_do_nothing() {
+        let q = make_queue(vec![], None);
+        q.remove(0);
+        q.shift(0, 1);
+        q.play(0, true, true);
+        q.next(false);
+        q.previous();
+        q.skip(3);
+        q.toggleplayback();
+        q.clear();
+        assert_eq!(q.len(), 0);
+        assert_eq!(q.get_current_index(), None);
+        assert_invariant(&q);
+    }
+
+    #[test]
+    fn shuffle_state_comes_from_the_order_not_the_config() {
+        let q = make_queue((0..4).map(make_track).collect(), Some(0));
+        // config says shuffle off, the queue is shuffled
+        *q.random_order.write() = Some(vec![0, 3, 1, 2]);
+        q.remove(3);
+        assert_invariant(&q); // the order was rebuilt for 3 songs
+        assert!(q.get_random_order().is_some());
+    }
+
+    /// Another thread edits the queue while this one reads it.
+    #[test]
+    fn concurrent_edits_and_reads_keep_the_invariant() {
+        let q = Arc::new(make_queue((0..20).map(make_track).collect(), Some(0)));
+        q.set_shuffle(true);
+        let (done, finished) = crossbeam_channel::bounded(2);
+        for worker in 0..2u32 {
+            let (q, done) = (q.clone(), done.clone());
+            std::thread::spawn(move || {
+                for n in 0..500u32 {
+                    match (n + worker) % 5 {
+                        0 => q.append(make_track(100 + n)),
+                        1 => q.remove(0),
+                        2 => q.next(true),
+                        3 => q.shift(0, 1),
+                        _ => {
+                            q.append_next(&[make_track(200 + n)]);
+                        }
+                    }
+                    let _ = (q.get_current(), q.next_index(), q.previous_index());
+                }
+                let _ = done.send(());
+            });
+        }
+        for _ in 0..2 {
+            assert!(
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_ok()
+            );
+        }
+        assert_invariant(&q);
+    }
+
+    #[test]
+    fn insert_after_id_is_one_step() {
+        let q = make_queue((0..3).map(make_track).collect(), None);
+        let after = q.id_for_index(1);
+        assert_eq!(q.insert_after_id(after, make_track(9)), Some(2));
+        assert_eq!(track_id(&q.list().read()[2]), "id_9");
     }
 }
