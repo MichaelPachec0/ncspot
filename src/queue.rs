@@ -1,9 +1,9 @@
 use parking_lot::{RwLock, RwLockWriteGuard};
 use std::sync::Arc;
 
-use log::debug;
 #[cfg(feature = "notify")]
 use log::info;
+use log::{debug, warn};
 #[cfg(feature = "notify")]
 use notify_rust::Notification;
 
@@ -127,6 +127,56 @@ enum Playback {
     Stop,
 }
 
+/// What a repair changed.
+#[derive(Default, Clone, Copy, PartialEq, Debug)]
+struct Repaired {
+    /// Anything was changed.
+    any: bool,
+    /// The current song was dropped because it was out of range.
+    cleared_current: bool,
+}
+
+/// Whether `order` holds each index in `0..len` exactly once.
+fn is_permutation(order: &[usize], len: usize) -> bool {
+    if order.len() != len {
+        return false;
+    }
+    let mut seen = vec![false; len];
+    order
+        .iter()
+        .all(|&i| i < len && !std::mem::replace(&mut seen[i], true))
+}
+
+/// A random play order over `0..len` with `current` (if in range) first.
+fn shuffled_order(len: usize, current: Option<usize>) -> Vec<usize> {
+    let current = current.filter(|&c| c < len);
+    let mut rest: Vec<usize> = (0..len).filter(|&i| Some(i) != current).collect();
+    rest.shuffle(&mut rand::rng());
+    let mut order = Vec::with_capacity(len);
+    order.extend(current);
+    order.extend(rest);
+    order
+}
+
+/// Make a saved state consistent; `shuffle` is the resolved config value and wins.
+fn sanitize_loaded(
+    len: usize,
+    random_order: Option<Vec<usize>>,
+    current: Option<usize>,
+    shuffle: bool,
+) -> (Option<Vec<usize>>, Option<usize>) {
+    let current = current.filter(|&c| c < len);
+    let order = if shuffle {
+        match random_order {
+            Some(order) if is_permutation(&order, len) => Some(order),
+            _ => Some(shuffled_order(len, current)),
+        }
+    } else {
+        None
+    };
+    (order, current)
+}
+
 /// The four write guards, taken in lock order. A mutator reads and writes
 /// all queue state through one of these so no other thread sees a half-done
 /// edit. Never call a public [Queue] method while holding one.
@@ -153,14 +203,45 @@ impl QueueState<'_> {
 
     /// Build a new random play order, with the current song first if any.
     fn reshuffle(&mut self) {
+        *self.random_order = Some(shuffled_order(self.queue.len(), *self.current));
+    }
+
+    /// Whether the four values agree: one id per song, the play order (if
+    /// any) a permutation of the song indices, the current song in range.
+    fn invariant_holds(&self) -> bool {
         let len = self.queue.len();
-        let current = self.current.filter(|&c| c < len);
-        let mut rest: Vec<usize> = (0..len).filter(|&i| Some(i) != current).collect();
-        rest.shuffle(&mut rand::rng());
-        let mut order = Vec::with_capacity(len);
-        order.extend(current);
-        order.extend(rest);
-        *self.random_order = Some(order);
+        self.ids.len() == len
+            && self
+                .random_order
+                .as_deref()
+                .is_none_or(|order| is_permutation(order, len))
+            && self.current.is_none_or(|c| c < len)
+    }
+
+    /// Make the four values agree again, keeping the songs. Order of fixes:
+    /// current song, play order, ids.
+    fn repair(&mut self, mut next_id: impl FnMut() -> u64) -> Repaired {
+        let len = self.queue.len();
+        let mut repaired = Repaired::default();
+        if self.current.is_some_and(|c| c >= len) {
+            *self.current = None;
+            repaired.any = true;
+            repaired.cleared_current = true;
+        }
+        if self
+            .random_order
+            .as_deref()
+            .is_some_and(|order| !is_permutation(order, len))
+        {
+            self.reshuffle();
+            repaired.any = true;
+        }
+        if self.ids.len() != len {
+            // Which id belongs to which song is unknown: give every song a new one.
+            *self.ids = (0..len).map(|_| next_id()).collect();
+            repaired.any = true;
+        }
+        repaired
     }
 
     /// Make `index` the current song. `Keep` (and no change) if it is out of
@@ -322,7 +403,16 @@ pub struct Queue {
 
 impl Queue {
     pub fn new(spotify: Spotify, cfg: Arc<Config>, library: Arc<Library>) -> Self {
-        let queue_state = cfg.state().queuestate.clone();
+        let (queue_state, shuffle) = {
+            let state = cfg.state();
+            (state.queuestate.clone(), state.shuffle)
+        };
+        let (random_order, current_track) = sanitize_loaded(
+            queue_state.queue.len(),
+            queue_state.random_order,
+            queue_state.current_track,
+            shuffle,
+        );
         let id_counter = std::sync::atomic::AtomicU64::new(0);
         let ids = (0..queue_state.queue.len())
             .map(|_| id_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
@@ -331,8 +421,8 @@ impl Queue {
         Self {
             queue: Arc::new(RwLock::new(queue_state.queue)),
             spotify: spotify.clone(),
-            current_track: RwLock::new(queue_state.current_track),
-            random_order: RwLock::new(queue_state.random_order),
+            current_track: RwLock::new(current_track),
+            random_order: RwLock::new(random_order),
             ids: RwLock::new(ids),
             id_counter,
             active_playlist: RwLock::new(None),
@@ -372,8 +462,27 @@ impl Queue {
     /// a public Queue method or run side effects; it returns what the caller
     /// needs to carry them out after the locks are released.
     fn with_state<R>(&self, f: impl FnOnce(&mut QueueState<'_>) -> R) -> R {
-        let mut st = self.lock_all();
-        f(&mut st)
+        let (result, repaired, current_is_none) = {
+            let mut st = self.lock_all();
+            let repaired = if st.invariant_holds() {
+                Repaired::default()
+            } else {
+                st.repair(|| self.next_id())
+            };
+            let result = f(&mut st);
+            (result, repaired, st.current.is_none())
+        };
+        if repaired.any {
+            warn!("queue state was inconsistent and has been repaired");
+            #[cfg(feature = "mpris")]
+            self.spotify
+                .send_mpris(crate::mpris::MprisCommand::EmitTrackListReplaced);
+            self.library.trigger_redraw();
+            if repaired.cleared_current && current_is_none {
+                self.spotify.stop();
+            }
+        }
+        result
     }
 
     /// Carry out a section's playback decision. Call with no queue guard held.
@@ -1714,14 +1823,187 @@ mod tests {
                 let _ = done.send(());
             });
         }
-        for _ in 0..2 {
-            assert!(
-                finished
-                    .recv_timeout(std::time::Duration::from_secs(30))
-                    .is_ok()
-            );
-        }
+        // Checker: sees all four values under read guards in lock order, so a
+        // mutator that is not atomic shows up as a broken invariant here.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let checker = {
+            let (q, stop) = (q.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let queue = q.queue.read();
+                    let order = q.random_order.read();
+                    let ids = q.ids.read();
+                    let current = q.current_track.read();
+                    let len = queue.len();
+                    assert_eq!(ids.len(), len, "ids out of step with the list");
+                    if let Some(order) = order.as_ref() {
+                        let mut sorted = order.clone();
+                        sorted.sort_unstable();
+                        assert_eq!(
+                            sorted,
+                            (0..len).collect::<Vec<_>>(),
+                            "order not a permutation"
+                        );
+                    }
+                    if let Some(c) = *current {
+                        assert!(c < len, "current past the end");
+                    }
+                }
+            })
+        };
+        let all_done = (0..2).all(|_| {
+            finished
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_ok()
+        });
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        checker.join().expect("invariant broke while workers ran");
+        assert!(all_done, "workers did not finish");
         assert_invariant(&q);
+    }
+
+    type Breakage = Box<dyn Fn(&mut QueueState<'_>)>;
+
+    fn broken(q: &Queue, f: impl FnOnce(&mut QueueState<'_>)) {
+        f(&mut q.lock_all());
+    }
+
+    #[test]
+    fn repair_restores_each_broken_shape() {
+        let cases: Vec<(&str, Breakage)> = vec![
+            (
+                "ids short",
+                Box::new(|st| {
+                    st.ids.pop();
+                }),
+            ),
+            ("ids long", Box::new(|st| st.ids.push(999))),
+            (
+                "order duplicate",
+                Box::new(|st| *st.random_order = Some(vec![0, 0, 1, 2])),
+            ),
+            (
+                "order missing",
+                Box::new(|st| *st.random_order = Some(vec![0, 1, 2])),
+            ),
+            (
+                "order out of range",
+                Box::new(|st| *st.random_order = Some(vec![0, 1, 2, 9])),
+            ),
+            ("current past end", Box::new(|st| *st.current = Some(4))),
+            (
+                "current and order",
+                Box::new(|st| {
+                    *st.current = Some(4);
+                    *st.random_order = Some(vec![4, 0, 1]);
+                }),
+            ),
+        ];
+        for (name, breakage) in cases {
+            let q = make_queue((0..4).map(make_track).collect(), Some(1));
+            let songs: Vec<String> = q
+                .list()
+                .read()
+                .iter()
+                .map(|p| track_id(p).to_string())
+                .collect();
+            broken(&q, breakage);
+            q.append(make_track(50)); // any mutator runs the check first
+            assert_invariant(&q);
+            let after: Vec<String> = q
+                .list()
+                .read()
+                .iter()
+                .map(|p| track_id(p).to_string())
+                .collect();
+            assert_eq!(&after[..4], &songs[..], "{name}: songs kept");
+        }
+    }
+
+    #[test]
+    fn repair_gives_every_song_a_fresh_id_when_ids_were_wrong() {
+        let shapes: Vec<(&str, Breakage)> = vec![
+            (
+                "ids short",
+                Box::new(|st| {
+                    st.ids.pop();
+                }),
+            ),
+            ("ids long", Box::new(|st| st.ids.push(999))),
+        ];
+        for (name, breakage) in shapes {
+            let q = make_queue((0..4).map(make_track).collect(), Some(1));
+            let mut before = q.track_ids();
+            broken(&q, breakage);
+            before.push(999);
+            q.append(make_track(50));
+            let after = q.track_ids();
+            assert_eq!(after.len(), 5, "{name}");
+            for id in &after[..4] {
+                assert!(!before.contains(id), "{name}: id {id} was kept");
+            }
+        }
+    }
+
+    #[test]
+    fn a_consistent_queue_is_not_repaired() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(1));
+        let ids = q.track_ids();
+        assert_eq!(
+            q.with_state(|st| st.repair(|| unreachable!())),
+            Repaired::default()
+        );
+        assert_eq!(q.track_ids(), ids);
+    }
+
+    #[test]
+    fn a_repair_that_clears_the_current_song_does_not_stop_a_new_one() {
+        let q = make_queue((0..3).map(make_track).collect(), Some(1));
+        broken(&q, |st| *st.current = Some(9));
+        q.play(0, false, false);
+        assert_eq!(q.get_current_index(), Some(0));
+    }
+
+    #[test]
+    fn sanitize_loaded_lets_the_config_decide_shuffle() {
+        // shuffle off drops a saved order
+        assert_eq!(
+            sanitize_loaded(3, Some(vec![2, 0, 1]), Some(1), false),
+            (None, Some(1))
+        );
+        // shuffle on keeps a valid order
+        assert_eq!(
+            sanitize_loaded(3, Some(vec![2, 0, 1]), Some(1), true),
+            (Some(vec![2, 0, 1]), Some(1))
+        );
+        // shuffle on with a broken order builds one that starts at the current song
+        let (order, current) = sanitize_loaded(3, Some(vec![0, 0]), Some(1), true);
+        let mut order = order.unwrap();
+        assert_eq!(order[0], 1);
+        order.sort_unstable();
+        assert_eq!((order, current), (vec![0, 1, 2], Some(1)));
+        // shuffle on with no order builds one
+        assert!(sanitize_loaded(3, None, None, true).0.is_some());
+        // current past the end is dropped
+        assert_eq!(sanitize_loaded(2, None, Some(5), false), (None, None));
+    }
+
+    #[test]
+    fn a_broken_saved_state_loads_consistent() {
+        let cfg = Config::new_for_test();
+        cfg.with_state_mut(|s| {
+            s.queuestate.queue = (0..3).map(make_track).collect();
+            s.queuestate.random_order = Some(vec![7, 7]);
+            s.queuestate.current_track = Some(9);
+            s.shuffle = true;
+        });
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify.clone(), cfg.clone());
+        let q = Queue::new(spotify, cfg, library);
+        assert_invariant(&q);
+        assert_eq!(q.get_current_index(), None);
+        assert!(q.get_random_order().is_some());
     }
 
     #[test]
