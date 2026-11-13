@@ -596,6 +596,16 @@ impl Queue {
         self.ids.read().iter().position(|&i| i == id)
     }
 
+    /// The entry with stable id `id`, if still present, read under one pair
+    /// of guards so the id cannot move to another song in between.
+    #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
+    pub fn playable_for_id(&self, id: u64) -> Option<Playable> {
+        let queue = self.queue.read();
+        let ids = self.ids.read();
+        let index = ids.iter().position(|&i| i == id)?;
+        queue.get(index).cloned()
+    }
+
     /// All entry ids in queue order (aligned with `self.queue`).
     #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
     pub fn track_ids(&self) -> Vec<u64> {
@@ -948,8 +958,11 @@ impl Queue {
             } else {
                 *st.random_order = None;
             }
+            // Inside the section (queue locks before config), so the play
+            // order and the saved setting cannot be left disagreeing by two
+            // calls that overlap.
+            self.cfg.with_state_mut(|s| s.shuffle = new);
         });
-        self.cfg.with_state_mut(|s| s.shuffle = new);
         #[cfg(feature = "mpris")]
         self.spotify
             .send_mpris(crate::mpris::MprisCommand::EmitShuffleStatus);
@@ -1730,6 +1743,41 @@ mod tests {
     fn get_current_returns_none_past_the_end() {
         let q = make_queue((0..2).map(make_track).collect(), Some(5));
         assert!(q.get_current().is_none());
+    }
+
+    #[test]
+    fn playable_for_id_follows_the_entry_when_it_moves() {
+        let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(0));
+        let id = q.id_for_index(2).unwrap();
+        let uri = q.list().read()[2].uri();
+        q.remove(0);
+        assert_eq!(q.playable_for_id(id).map(|p| p.uri()), Some(uri));
+        q.remove_by_id(id);
+        assert!(q.playable_for_id(id).is_none());
+    }
+
+    /// Two callers toggle shuffle at once; the play order and the saved
+    /// setting must agree whenever no call is in flight.
+    #[test]
+    fn overlapping_shuffle_toggles_leave_order_and_setting_agreeing() {
+        let q = Arc::new(make_queue((0..8).map(make_track).collect(), Some(0)));
+        for _ in 0..50 {
+            let threads: Vec<_> = [true, false]
+                .into_iter()
+                .map(|on| {
+                    let q = q.clone();
+                    std::thread::spawn(move || {
+                        for _ in 0..20 {
+                            q.set_shuffle(on);
+                        }
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().unwrap();
+            }
+            assert_eq!(q.get_shuffle(), q.get_random_order().is_some());
+        }
     }
 
     // --- atomic mutators ---
