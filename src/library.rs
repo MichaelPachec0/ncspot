@@ -912,13 +912,20 @@ impl Library {
                 thread::spawn(move || library.sync_episodes(force_full))
             };
 
-            let collection_complete = t_collection.join().unwrap();
-            let artists = t_artists.join().unwrap();
-            let artists_complete = library.finish_artists(artists);
+            // Wait for every set before looking at any result: a panic in one of them is
+            // passed on, and the guard marks the library done, only once the others have
+            // stopped writing.
+            let collection = t_collection.join();
+            let artists = t_artists.join();
+            let playlists = t_playlists.join();
+            let shows = t_shows.join();
+            let episodes = t_episodes.join();
 
-            let playlists_complete = t_playlists.join().unwrap();
-            let shows_complete = t_shows.join().unwrap();
-            let episodes_complete = t_episodes.join().unwrap();
+            let collection_complete = joined(collection);
+            let artists_complete = library.finish_artists(joined(artists));
+            let playlists_complete = joined(playlists);
+            let shows_complete = joined(shows);
+            let episodes_complete = joined(episodes);
 
             let ms = started.elapsed().as_millis() as u64;
             info!("library sync took {ms} ms");
@@ -3273,6 +3280,11 @@ fn tab_set(tab: &LibraryTab, episodes_enabled: bool) -> Option<SyncSet> {
         LibraryTab::Episodes => episodes_enabled.then_some(SyncSet::Episodes),
         LibraryTab::Browse => None,
     }
+}
+
+/// The value a joined thread returned; if it panicked, the panic continues on this thread.
+fn joined<T>(result: thread::Result<T>) -> T {
+    result.unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 /// When dropped, also from a panicking sync thread: marks the library done and redraws, then
