@@ -1,7 +1,8 @@
+use parking_lot::RwLock;
 use rand::{rng, seq::IteratorRandom};
 use rspotify::model::Id;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use log::debug;
@@ -181,13 +182,7 @@ impl fmt::Debug for Album {
 impl ListItem for Album {
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = self.tracks.as_ref() {
-            let playing: Vec<String> = queue
-                .queue
-                .read()
-                .unwrap()
-                .iter()
-                .filter_map(|t| t.id())
-                .collect();
+            let playing: Vec<String> = queue.queue.read().iter().filter_map(|t| t.id()).collect();
 
             let ids: Vec<String> = tracks.iter().filter_map(|t| t.id.clone()).collect();
             !ids.is_empty() && playing == ids

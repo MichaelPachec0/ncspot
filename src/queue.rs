@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::cmp::Ordering;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use log::debug;
 #[cfg(feature = "notify")]
@@ -86,8 +87,8 @@ impl Queue {
     /// Position of the current track within the play order (shuffle-aware).
     /// None if nothing is playing.
     fn current_order_pos(&self) -> Option<usize> {
-        let current = (*self.current_track.read().unwrap())?;
-        Some(match self.random_order.read().unwrap().as_ref() {
+        let current = (*self.current_track.read())?;
+        Some(match self.random_order.read().as_ref() {
             Some(order) => order.iter().position(|&i| i == current).unwrap(),
             None => current,
         })
@@ -95,7 +96,7 @@ impl Queue {
 
     /// The `self.queue` index at play-order position `pos` (shuffle-aware).
     fn queue_index_at(&self, pos: usize) -> usize {
-        match self.random_order.read().unwrap().as_ref() {
+        match self.random_order.read().as_ref() {
             Some(order) => order[pos],
             None => pos,
         }
@@ -105,7 +106,7 @@ impl Queue {
     /// if at the end of the queue.
     pub fn next_index(&self) -> Option<usize> {
         let next = self.current_order_pos()? + 1;
-        (next < self.queue.read().unwrap().len()).then(|| self.queue_index_at(next))
+        (next < self.queue.read().len()).then(|| self.queue_index_at(next))
     }
 
     /// The index of the previous item in `self.queue` that should be played.
@@ -120,7 +121,7 @@ impl Queue {
     /// nothing is playing or the queue is empty.
     fn skip_index(&self, offset: isize) -> Option<usize> {
         let pos = self.current_order_pos()?;
-        let len = self.queue.read().unwrap().len();
+        let len = self.queue.read().len();
         (len > 0).then(|| {
             let target = (pos as isize + offset).clamp(0, len as isize - 1) as usize;
             self.queue_index_at(target)
@@ -146,12 +147,12 @@ impl Queue {
     /// The currently playing item from `self.queue`.
     pub fn get_current(&self) -> Option<Playable> {
         self.get_current_index()
-            .map(|index| self.queue.read().unwrap()[index].clone())
+            .map(|index| self.queue.read()[index].clone())
     }
 
     /// The index of the currently playing item from `self.queue`.
     pub fn get_current_index(&self) -> Option<usize> {
-        *self.current_track.read().unwrap()
+        *self.current_track.read()
     }
 
     fn next_id(&self) -> u64 {
@@ -162,19 +163,19 @@ impl Queue {
     /// The stable id of the queue entry at `index`, if any.
     #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
     pub fn id_for_index(&self, index: usize) -> Option<u64> {
-        self.ids.read().unwrap().get(index).copied()
+        self.ids.read().get(index).copied()
     }
 
     /// The current index of the entry with stable id `id`, if still present.
     #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
     pub fn index_for_id(&self, id: u64) -> Option<usize> {
-        self.ids.read().unwrap().iter().position(|&i| i == id)
+        self.ids.read().iter().position(|&i| i == id)
     }
 
     /// All entry ids in queue order (aligned with `self.queue`).
     #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
     pub fn track_ids(&self) -> Vec<u64> {
-        self.ids.read().unwrap().clone()
+        self.ids.read().clone()
     }
 
     /// Resolve a batch of `/org/ncspot/queue/<id>` paths to (id, Playable) pairs
@@ -185,8 +186,8 @@ impl Queue {
         paths: &[zbus::zvariant::ObjectPath<'_>],
     ) -> Vec<(u64, crate::model::playable::Playable)> {
         use std::collections::HashMap;
-        let q = self.queue.read().unwrap();
-        let ids = self.ids.read().unwrap();
+        let q = self.queue.read();
+        let ids = self.ids.read();
         let pos: HashMap<u64, usize> = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
         paths
             .iter()
@@ -212,8 +213,8 @@ impl Queue {
         };
         let id = self.next_id();
         let after_id = {
-            let mut q = self.queue.write().unwrap();
-            let mut random_order = self.random_order.write().unwrap();
+            let mut q = self.queue.write();
+            let mut random_order = self.random_order.write();
             if let Some(order) = random_order.as_mut() {
                 let next_i = order.iter().position(|&i| i == index).unwrap();
                 for item in order.iter_mut() {
@@ -224,8 +225,8 @@ impl Queue {
                 order.insert(next_i + 1, index + 1);
             }
             q.insert(index + 1, track);
-            self.ids.write().unwrap().insert(index + 1, id);
-            self.ids.read().unwrap().get(index).copied()
+            self.ids.write().insert(index + 1, id);
+            self.ids.read().get(index).copied()
         };
         #[cfg(not(feature = "mpris"))]
         let _ = after_id;
@@ -238,18 +239,18 @@ impl Queue {
     pub fn append(&self, track: Playable) {
         let id = self.next_id();
         {
-            let mut q = self.queue.write().unwrap();
-            let mut random_order = self.random_order.write().unwrap();
+            let mut q = self.queue.write();
+            let mut random_order = self.random_order.write();
             if let Some(order) = random_order.as_mut() {
                 order.push(order.len());
             }
             q.push(track);
-            self.ids.write().unwrap().push(id);
+            self.ids.write().push(id);
         }
         #[cfg(feature = "mpris")]
         {
             let after_id = {
-                let ids = self.ids.read().unwrap();
+                let ids = self.ids.read();
                 (ids.len() >= 2).then(|| ids[ids.len() - 2])
             };
             self.spotify
@@ -261,16 +262,16 @@ impl Queue {
     /// shuffle status. Returns the first index(in `self.queue`) of added items.
     pub fn append_next(&self, tracks: &[Playable]) -> usize {
         let first = {
-            let mut q = self.queue.write().unwrap();
+            let mut q = self.queue.write();
 
             {
-                let mut random_order = self.random_order.write().unwrap();
+                let mut random_order = self.random_order.write();
                 if let Some(order) = random_order.as_mut() {
                     order.extend((q.len().saturating_sub(1))..(q.len() + tracks.len()));
                 }
             }
 
-            let first = match *self.current_track.read().unwrap() {
+            let first = match *self.current_track.read() {
                 Some(index) => index + 1,
                 None => q.len(),
             };
@@ -280,7 +281,7 @@ impl Queue {
             }
 
             let new_ids: Vec<u64> = (0..tracks.len()).map(|_| self.next_id()).collect();
-            self.ids.write().unwrap().splice(first..first, new_ids);
+            self.ids.write().splice(first..first, new_ids);
 
             first
         };
@@ -293,16 +294,16 @@ impl Queue {
     /// Remove the item at `index` in `self.queue`. No-op if out of bounds.
     pub fn remove(&self, index: usize) {
         let removed_id = {
-            let mut q = self.queue.write().unwrap();
+            let mut q = self.queue.write();
             if index >= q.len() {
                 return;
             }
             #[cfg(feature = "mpris")]
-            let rid = self.ids.read().unwrap().get(index).copied();
+            let rid = self.ids.read().get(index).copied();
             #[cfg(not(feature = "mpris"))]
             let rid: Option<u64> = None;
             q.remove(index);
-            self.ids.write().unwrap().remove(index);
+            self.ids.write().remove(index);
             rid
         };
         self.after_remove(index, removed_id);
@@ -312,13 +313,13 @@ impl Queue {
     /// No-op if the id is no longer present.
     pub fn remove_by_id(&self, id: u64) {
         let (index, removed_id) = {
-            let mut q = self.queue.write().unwrap();
-            let index = match self.ids.read().unwrap().iter().position(|&i| i == id) {
+            let mut q = self.queue.write();
+            let index = match self.ids.read().iter().position(|&i| i == id) {
                 Some(i) => i,
                 None => return,
             };
             q.remove(index);
-            self.ids.write().unwrap().remove(index);
+            self.ids.write().remove(index);
             (index, Some(id))
         };
         self.after_remove(index, removed_id);
@@ -328,7 +329,7 @@ impl Queue {
     /// current index, regenerate shuffle order, and emit TrackRemoved.
     fn after_remove(&self, index: usize, removed_id: Option<u64>) {
         let _ = removed_id;
-        let len = self.queue.read().unwrap().len();
+        let len = self.queue.read().len();
         if len == 0 {
             self.stop();
             #[cfg(feature = "mpris")]
@@ -339,7 +340,7 @@ impl Queue {
             return;
         }
 
-        let current = *self.current_track.read().unwrap();
+        let current = *self.current_track.read();
         if let Some(current_track) = current {
             match current_track.cmp(&index) {
                 Ordering::Equal => {
@@ -354,7 +355,7 @@ impl Queue {
                     }
                 }
                 Ordering::Greater => {
-                    let mut current = self.current_track.write().unwrap();
+                    let mut current = self.current_track.write();
                     current.replace(current_track - 1);
                 }
                 _ => (),
@@ -378,10 +379,10 @@ impl Queue {
     pub fn insert_at(&self, index: usize, track: Playable) -> u64 {
         let id = self.next_id();
         let after_id = {
-            let mut q = self.queue.write().unwrap();
+            let mut q = self.queue.write();
             let index = index.min(q.len());
 
-            let mut random_order = self.random_order.write().unwrap();
+            let mut random_order = self.random_order.write();
             if let Some(order) = random_order.as_mut() {
                 for item in order.iter_mut() {
                     if *item >= index {
@@ -394,12 +395,12 @@ impl Queue {
 
             q.insert(index, track);
 
-            let mut ids = self.ids.write().unwrap();
+            let mut ids = self.ids.write();
             let after_id = (index > 0).then(|| ids[index - 1]);
             ids.insert(index, id);
             drop(ids);
 
-            let mut current = self.current_track.write().unwrap();
+            let mut current = self.current_track.write();
             if let Some(ci) = *current
                 && ci >= index
             {
@@ -429,11 +430,11 @@ impl Queue {
         // for this critical section. insert_at re-acquires the lock; the
         // residual gap is benign because insert_at clamps the index.
         let index = {
-            let q = self.queue.write().unwrap();
+            let q = self.queue.write();
             let index = match after_id {
                 None => 0,
                 Some(aid) => {
-                    let pos = self.ids.read().unwrap().iter().position(|&i| i == aid)?;
+                    let pos = self.ids.read().iter().position(|&i| i == aid)?;
                     pos + 1
                 }
             };
@@ -456,11 +457,11 @@ impl Queue {
         self.stop();
 
         {
-            let mut q = self.queue.write().unwrap();
+            let mut q = self.queue.write();
             q.clear();
-            self.ids.write().unwrap().clear();
+            self.ids.write().clear();
 
-            let mut random_order = self.random_order.write().unwrap();
+            let mut random_order = self.random_order.write();
             if let Some(o) = random_order.as_mut() {
                 o.clear()
             }
@@ -474,21 +475,21 @@ impl Queue {
 
     /// The amount of items in `self.queue`.
     pub fn len(&self) -> usize {
-        self.queue.read().unwrap().len()
+        self.queue.read().len()
     }
 
     /// Shift the item at `from` in `self.queue` to `to`.
     pub fn shift(&self, from: usize, to: usize) {
         {
-            let mut queue = self.queue.write().unwrap();
+            let mut queue = self.queue.write();
             let item = queue.remove(from);
             queue.insert(to, item);
-            let mut ids = self.ids.write().unwrap();
+            let mut ids = self.ids.write();
             let id = ids.remove(from);
             ids.insert(to, id);
 
             // Keep the shuffle order pointing at the same logical tracks after the move.
-            let mut random_order = self.random_order.write().unwrap();
+            let mut random_order = self.random_order.write();
             if let Some(order) = random_order.as_mut() {
                 for v in order.iter_mut() {
                     if *v == from {
@@ -504,7 +505,7 @@ impl Queue {
 
             // if the currently playing track is affected by the shift, update its
             // index
-            let mut current = self.current_track.write().unwrap();
+            let mut current = self.current_track.write();
             if let Some(index) = *current {
                 if index == from {
                     current.replace(to);
@@ -526,16 +527,16 @@ impl Queue {
     /// `shuffle_index`: If this is true, `index` isn't actually used, but is
     /// chosen at random as a valid index in the queue.
     pub fn play(&self, mut index: usize, reshuffle: bool, shuffle_index: bool) {
-        let queue_length = self.queue.read().unwrap().len();
+        let queue_length = self.queue.read().len();
         // The length of the queue must be bigger than 0 or gen_range panics!
         if queue_length > 0 && shuffle_index && self.get_shuffle() {
             let mut rng = rand::rng();
             index = rng.random_range(0..queue_length);
         }
 
-        if let Some(track) = &self.queue.read().unwrap().get(index) {
+        if let Some(track) = &self.queue.read().get(index) {
             self.spotify.load(track, true, 0);
-            let mut current = self.current_track.write().unwrap();
+            let mut current = self.current_track.write();
             current.replace(index);
             self.spotify.update_track();
 
@@ -589,7 +590,7 @@ impl Queue {
 
     /// Stop playback.
     pub fn stop(&self) {
-        let mut current = self.current_track.write().unwrap();
+        let mut current = self.current_track.write();
         *current = None;
         self.spotify.stop();
     }
@@ -601,8 +602,8 @@ impl Queue {
     /// used, and the next track will actually be played. This should be used
     /// when going to the next entry in the queue is the wanted behavior.
     pub fn next(&self, manual: bool) {
-        let q = self.queue.read().unwrap();
-        let current = *self.current_track.read().unwrap();
+        let q = self.queue.read();
+        let current = *self.current_track.read();
         let repeat = self.cfg.state().repeat;
 
         if repeat == RepeatSetting::RepeatTrack && !manual {
@@ -620,7 +621,7 @@ impl Queue {
             && !q.is_empty()
             && q.iter().any(|track| track.is_playable())
         {
-            let random_order = self.random_order.read().unwrap();
+            let random_order = self.random_order.read();
             self.play(
                 random_order.as_ref().map(|o| o[0]).unwrap_or(0),
                 false,
@@ -633,15 +634,15 @@ impl Queue {
 
     /// Play the previous item in the queue.
     pub fn previous(&self) {
-        let q = self.queue.read().unwrap();
-        let current = *self.current_track.read().unwrap();
+        let q = self.queue.read();
+        let current = *self.current_track.read();
         let repeat = self.cfg.state().repeat;
 
         if let Some(index) = self.previous_index() {
             self.play(index, false, false);
         } else if repeat == RepeatSetting::RepeatPlaylist && !q.is_empty() {
             if self.get_shuffle() {
-                let random_order = self.random_order.read().unwrap();
+                let random_order = self.random_order.read();
                 self.play(
                     random_order.as_ref().map(|o| o[q.len() - 1]).unwrap_or(0),
                     false,
@@ -675,16 +676,16 @@ impl Queue {
 
     /// Get the current order that is used to shuffle.
     pub fn get_random_order(&self) -> Option<Vec<usize>> {
-        self.random_order.read().unwrap().clone()
+        self.random_order.read().clone()
     }
 
     /// (Re)generate the random shuffle order.
     fn generate_random_order(&self) {
-        let q = self.queue.read().unwrap();
+        let q = self.queue.read();
         let mut order: Vec<usize> = Vec::with_capacity(q.len());
         let mut random: Vec<usize> = (0..q.len()).collect();
 
-        if let Some(current) = *self.current_track.read().unwrap() {
+        if let Some(current) = *self.current_track.read() {
             order.push(current);
             random.remove(current);
         }
@@ -693,7 +694,7 @@ impl Queue {
         random.shuffle(&mut rng);
         order.extend(random);
 
-        let mut random_order = self.random_order.write().unwrap();
+        let mut random_order = self.random_order.write();
         *random_order = Some(order);
     }
 
@@ -703,7 +704,7 @@ impl Queue {
         if new {
             self.generate_random_order();
         } else {
-            let mut random_order = self.random_order.write().unwrap();
+            let mut random_order = self.random_order.write();
             *random_order = None;
         }
         #[cfg(feature = "mpris")]
@@ -716,7 +717,7 @@ impl Queue {
         match event {
             QueueEvent::PreloadTrackRequest => {
                 if let Some(next_index) = self.next_index() {
-                    let track = self.queue.read().unwrap()[next_index].clone();
+                    let track = self.queue.read()[next_index].clone();
                     debug!("Preloading track {track} as requested by librespot");
                     self.spotify.preload(&track);
                 }
@@ -727,14 +728,14 @@ impl Queue {
     /// The playlist id the queue was last loaded from via ActivatePlaylist, if any.
     #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
     pub fn active_playlist(&self) -> Option<String> {
-        self.active_playlist.read().unwrap().clone()
+        self.active_playlist.read().clone()
     }
 
     /// Record (or clear) the active source playlist and notify MPRIS.
     #[cfg_attr(not(feature = "mpris"), allow(dead_code))]
     pub fn set_active_playlist(&self, id: Option<String>) {
         {
-            let mut g = self.active_playlist.write().unwrap();
+            let mut g = self.active_playlist.write();
             if *g == id {
                 return;
             }
@@ -753,7 +754,7 @@ impl Queue {
 
 /// Id of the last notification shown by ncspot
 #[cfg(all(unix, not(target_os = "macos")))]
-static LAST_NOTIFICATION_ID: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+static LAST_NOTIFICATION_ID: parking_lot::Mutex<Option<u32>> = parking_lot::Mutex::new(None);
 
 /// Send a notification using the desktops default notification method.
 ///
@@ -787,7 +788,7 @@ pub fn send_notification(summary_txt: &str, body_txt: &str, cover_url: Option<St
     // reuse the id of the previous notification
     // so we replace it and not create a new one
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Some(notification_id) = *LAST_NOTIFICATION_ID.lock().unwrap() {
+    if let Some(notification_id) = *LAST_NOTIFICATION_ID.lock() {
         n.id(notification_id);
     }
 
@@ -797,7 +798,7 @@ pub fn send_notification(summary_txt: &str, body_txt: &str, cover_url: Option<St
             #[cfg(all(unix, not(target_os = "macos")))]
             {
                 info!("Created notification: {}", handle.id());
-                *LAST_NOTIFICATION_ID.lock().unwrap() = Some(handle.id());
+                *LAST_NOTIFICATION_ID.lock() = Some(handle.id());
             }
             #[cfg(not(all(unix, not(target_os = "macos"))))]
             drop(handle);
@@ -808,7 +809,8 @@ pub fn send_notification(summary_txt: &str, body_txt: &str, cover_url: Option<St
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, RwLock};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     use super::*;
     use crate::config::Config;
@@ -917,7 +919,7 @@ mod tests {
             vec![make_track(0), make_track(1), make_track(2), make_track(3)],
             Some(2),
         );
-        *q.random_order.write().unwrap() = Some(vec![2, 0, 3, 1]);
+        *q.random_order.write() = Some(vec![2, 0, 3, 1]);
         assert_eq!(q.next_index(), Some(0));
     }
 
@@ -929,7 +931,7 @@ mod tests {
             vec![make_track(0), make_track(1), make_track(2), make_track(3)],
             Some(0),
         );
-        *q.random_order.write().unwrap() = Some(vec![2, 0, 3, 1]);
+        *q.random_order.write() = Some(vec![2, 0, 3, 1]);
         assert_eq!(q.previous_index(), Some(2));
     }
 
@@ -941,7 +943,7 @@ mod tests {
             vec![make_track(0), make_track(1), make_track(2), make_track(3)],
             Some(1),
         );
-        *q.random_order.write().unwrap() = Some(vec![2, 0, 3, 1]);
+        *q.random_order.write() = Some(vec![2, 0, 3, 1]);
         assert_eq!(q.next_index(), None);
     }
 
@@ -978,7 +980,7 @@ mod tests {
             vec![make_track(0), make_track(1), make_track(2), make_track(3)],
             Some(2),
         );
-        *q.random_order.write().unwrap() = Some(vec![2, 0, 3, 1]);
+        *q.random_order.write() = Some(vec![2, 0, 3, 1]);
         assert_eq!(q.skip_index(2), Some(3));
     }
 
@@ -1016,7 +1018,7 @@ mod tests {
     fn test_append_adds_to_end() {
         let q = make_queue(vec![make_track(0), make_track(1)], None);
         q.append(make_track(2));
-        let queue = q.queue.read().unwrap();
+        let queue = q.queue.read();
         assert_eq!(track_id(&queue[2]), "id_2");
     }
 
@@ -1026,7 +1028,7 @@ mod tests {
         let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], Some(1));
         let first = q.append_next(&[make_track(3), make_track(4)]);
         assert_eq!(first, 2);
-        let queue = q.queue.read().unwrap();
+        let queue = q.queue.read();
         let ids: Vec<&str> = queue.iter().map(track_id).collect();
         assert_eq!(ids, ["id_0", "id_1", "id_3", "id_4", "id_2"]);
     }
@@ -1046,7 +1048,7 @@ mod tests {
         q.insert_after_current(make_track(99));
         assert_eq!(q.len(), 3);
         assert_eq!(q.get_current_index(), Some(0));
-        let queue = q.queue.read().unwrap();
+        let queue = q.queue.read();
         assert_eq!(track_id(&queue[1]), "id_99");
         assert_eq!(track_id(&queue[2]), "id_1");
     }
@@ -1085,7 +1087,7 @@ mod tests {
         // [0, 1, 2], shift(2, 0) → [2, 0, 1]
         let q = make_queue(vec![make_track(0), make_track(1), make_track(2)], None);
         q.shift(2, 0);
-        let queue = q.queue.read().unwrap();
+        let queue = q.queue.read();
         let ids: Vec<&str> = queue.iter().map(track_id).collect();
         assert_eq!(ids, ["id_2", "id_0", "id_1"]);
     }
@@ -1105,13 +1107,13 @@ mod tests {
             vec![make_track(0), make_track(1), make_track(2), make_track(3)],
             Some(0),
         );
-        *q.random_order.write().unwrap() = Some(vec![2, 0, 3, 1]);
+        *q.random_order.write() = Some(vec![2, 0, 3, 1]);
         // capture the playable each order-slot points at, by track id
         let before: Vec<String> = q
             .get_random_order()
             .unwrap()
             .iter()
-            .map(|&i| track_id(&q.queue.read().unwrap()[i]).to_string())
+            .map(|&i| track_id(&q.queue.read()[i]).to_string())
             .collect();
         // move queue[0] to position 2
         q.shift(0, 2);
@@ -1119,7 +1121,7 @@ mod tests {
             .get_random_order()
             .unwrap()
             .iter()
-            .map(|&i| track_id(&q.queue.read().unwrap()[i]).to_string())
+            .map(|&i| track_id(&q.queue.read()[i]).to_string())
             .collect();
         // the shuffle SEQUENCE (which tracks play in which order) must be unchanged
         assert_eq!(before, after);
@@ -1197,7 +1199,7 @@ mod tests {
         let id0 = q.id_for_index(0).unwrap();
         let idx = q.insert_after_id(Some(id0), make_track(9));
         assert_eq!(idx, Some(1));
-        assert_eq!(track_id(&q.queue.read().unwrap()[1]), "id_9");
+        assert_eq!(track_id(&q.queue.read()[1]), "id_9");
     }
 
     #[test]
@@ -1214,7 +1216,7 @@ mod tests {
         q.remove_by_id(id1);
         assert_eq!(q.len(), 2);
         assert_eq!(q.index_for_id(id1), None);
-        assert_eq!(track_id(&q.queue.read().unwrap()[1]), "id_2");
+        assert_eq!(track_id(&q.queue.read()[1]), "id_2");
     }
 
     #[test]

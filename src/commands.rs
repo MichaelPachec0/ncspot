@@ -180,7 +180,7 @@ impl CommandManager {
                 }
                 self.library.reset_pending_writes();
                 self.library.finish_playlist_save();
-                let queue = self.queue.queue.read().unwrap();
+                let queue = self.queue.queue.read();
                 self.config.with_state_mut(move |s| {
                     debug!(
                         "saving state, {} items, current track: {:?}",
@@ -414,8 +414,6 @@ impl CommandManager {
             )),
             #[cfg(feature = "harness")]
             Command::Harness(crate::command::HarnessCommand::Dump(path)) => {
-                use crate::ext_traits::RwLockExt;
-
                 // Read before this command's own result replaces the last error.
                 let (title, state, error) = s
                     .call_on_name("main", |v: &mut Layout| v.harness_view())
@@ -425,13 +423,13 @@ impl CommandManager {
                     state,
                     error,
                     &self.spotify,
-                    *self.library.is_done.read_unpoisoned(),
+                    *self.library.is_done.read(),
                     crate::harness::PlaylistCounts {
-                        stored: self.library.playlists.read_unpoisoned().len(),
+                        stored: self.library.playlists.read().len(),
                         layout: self
                             .library
                             .playlist_layout
-                            .read_unpoisoned()
+                            .read()
                             .iter()
                             .filter(|e| {
                                 matches!(e, crate::playlist_layout::LayoutEntry::Playlist(_))

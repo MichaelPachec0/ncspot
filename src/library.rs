@@ -1,5 +1,6 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+use parking_lot::RwLock;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -7,8 +8,8 @@ use std::io::BufWriter;
 use std::iter::Iterator;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,7 +24,6 @@ use crate::config::Config;
 use crate::config::{self, CACHE_VERSION, LibraryTab};
 use crate::cover_prefetch;
 use crate::events::{Event, EventManager};
-use crate::ext_traits::RwLockExt;
 use crate::internal_api::Area;
 use crate::internal_api::collection::{SET_ARTIST, SET_COLLECTION, SET_LISTEN_LATER, SET_SHOW};
 use crate::internal_api::error::InternalError;
@@ -297,7 +297,7 @@ impl Library {
     /// of. Under the store lock: an op is in the log here or applies after this, so a sync can
     /// never erase it.
     fn with_store<T: SavedStore>(&self, lock: &RwLock<Vec<T>>, change: impl FnOnce(&mut Vec<T>)) {
-        let mut store = lock.write_unpoisoned();
+        let mut store = lock.write();
         change(&mut store);
         self.saves.lock().replay(&mut store);
     }
@@ -306,7 +306,7 @@ impl Library {
     /// Syncs must not build from the store itself: a save that fails after the copy would come
     /// back with the swap, with no entry left to remove it.
     fn confirmed<T: SavedStore>(&self, lock: &RwLock<Vec<T>>) -> Vec<T> {
-        let store = lock.read_unpoisoned();
+        let store = lock.read();
         let mut copy = store.clone();
         self.saves.lock().confirmed(&mut copy);
         copy
@@ -474,13 +474,13 @@ impl Library {
     /// the Web API per the fallback classes. The store, the layout and their caches update in
     /// place.
     pub fn delete_playlist(&self, id: &str) {
-        if !*self.is_done.read_unpoisoned() {
+        if !*self.is_done.read() {
             // Nothing sent: the note fails the queued unfollow.
             self.post_note(LOADING_NOTE);
             return;
         }
 
-        let stored = self.playlists.read_unpoisoned().iter().any(|i| i.id == id);
+        let stored = self.playlists.read().iter().any(|i| i.id == id);
         if !stored {
             return;
         }
@@ -511,11 +511,11 @@ impl Library {
 
     /// Forget a deleted playlist locally: the store (and its cache), the fresh set, the layout.
     fn drop_deleted(&self, id: &str) {
-        self.playlists.write_unpoisoned().retain(|p| p.id != id);
+        self.playlists.write().retain(|p| p.id != id);
         self.bump_playlists_rev();
         self.save_playlists();
-        self.fresh_playlists.write_unpoisoned().remove(id);
-        let changed = remove_from_layout(&mut self.playlist_layout.write_unpoisoned(), id);
+        self.fresh_playlists.write().remove(id);
+        let changed = remove_from_layout(&mut self.playlist_layout.write(), id);
         if changed {
             self.save_layout();
         }
@@ -526,7 +526,7 @@ impl Library {
     pub fn is_pinned(&self, id: &str) -> bool {
         let api = &self.spotify.api;
         pinned_in_layout_or_set(
-            &self.playlist_layout.read_unpoisoned(),
+            &self.playlist_layout.read(),
             id,
             api.internal_usable(Area::Playlists),
             || api.collection_page_all(Area::Playlists, SET_PIN),
@@ -584,7 +584,7 @@ impl Library {
     /// Whether the stored playlist `id` is the user's own (an unknown user owns nothing).
     pub fn owns_playlist(&self, id: &str) -> bool {
         self.playlists
-            .read_unpoisoned()
+            .read()
             .iter()
             .any(|p| p.id == id && is_owned(&p.owner_id, self.user_id.as_deref()))
     }
@@ -625,11 +625,7 @@ impl Library {
 
     /// A copy of the stored playlist `id`.
     fn stored_playlist(&self, id: &str) -> Option<Playlist> {
-        self.playlists
-            .read_unpoisoned()
-            .iter()
-            .find(|p| p.id == id)
-            .cloned()
+        self.playlists.read().iter().find(|p| p.id == id).cloned()
     }
 
     fn change_pin(&self, id: &str, pin: bool) -> PinOutcome {
@@ -648,7 +644,7 @@ impl Library {
             },
         );
         if let Some(pinned) = pinned {
-            let changed = set_pins(&mut self.playlist_layout.write_unpoisoned(), &pinned);
+            let changed = set_pins(&mut self.playlist_layout.write(), &pinned);
             if changed {
                 self.save_layout();
             }
@@ -661,7 +657,7 @@ impl Library {
     fn save_layout(&self) {
         self.save_cache(
             &config::cache_path(CACHE_PLAYLIST_LAYOUT),
-            &self.playlist_layout.read_unpoisoned(),
+            &self.playlist_layout.read(),
         );
     }
 
@@ -670,7 +666,7 @@ impl Library {
     fn insert_new_playlist(&self, playlist: Playlist) {
         let id = playlist.id.clone();
         {
-            let mut store = self.playlists.write_unpoisoned();
+            let mut store = self.playlists.write();
             if store.iter().any(|p| p.id == id) {
                 return;
             }
@@ -680,7 +676,7 @@ impl Library {
         self.save_playlists();
         // An empty layout is the flat store list (the Web path ran): it stays empty.
         let layout_changed = {
-            let mut layout = self.playlist_layout.write_unpoisoned();
+            let mut layout = self.playlist_layout.write();
             let listed = layout
                 .iter()
                 .any(|e| matches!(e, LayoutEntry::Playlist(p) if *p == id));
@@ -756,7 +752,7 @@ impl Library {
         let mut playlist = created.into_inner().filter(|_| written)?;
         playlist.owner_name.clone_from(&self.display_name);
         let id = playlist.id.clone();
-        self.fresh_playlists.write_unpoisoned().insert(id.clone());
+        self.fresh_playlists.write().insert(id.clone());
         self.insert_new_playlist(playlist);
         Some((id, web_created.get()))
     }
@@ -932,7 +928,7 @@ impl Library {
             info!("library sync took {ms} ms");
             library.library_sync_ms.store(ms.max(1), Ordering::Relaxed);
             library.filled.mark_all();
-            *library.is_done.write_unpoisoned() = true;
+            *library.is_done.write() = true;
             library.ev.trigger();
 
             let complete = collection_complete
@@ -983,7 +979,7 @@ impl Library {
                 }
             }
             library.filled.mark_all();
-            *library.is_done.write_unpoisoned() = true;
+            *library.is_done.write() = true;
             library.ev.trigger();
         });
         TabUpdate::Started
@@ -1000,7 +996,7 @@ impl Library {
             info!("library sync already running, skipped");
             return false;
         }
-        *self.is_done.write_unpoisoned() = false;
+        *self.is_done.write() = false;
         true
     }
 
@@ -1058,7 +1054,7 @@ impl Library {
         if internal {
             // No saves act on the layout: a plain swap, not [Library::load_store].
             if let Some(layout) = self.read_cache(&config::cache_path(CACHE_PLAYLIST_LAYOUT)) {
-                *self.playlist_layout.write_unpoisoned() = layout;
+                *self.playlist_layout.write() = layout;
                 self.trigger_redraw();
             }
         }
@@ -1076,7 +1072,7 @@ impl Library {
         if !cfg!(test) {
             let urls: Vec<String> = self
                 .playlists
-                .read_unpoisoned()
+                .read()
                 .iter()
                 .filter_map(|p| p.cover_url.clone())
                 .collect();
@@ -1275,17 +1271,13 @@ impl Library {
     /// playlist is downloaded again, unchanged ones too.
     fn fetch_playlists(&self, force_full: bool) -> PlaylistSync {
         debug!("loading playlists");
-        let known_at_start: Vec<String> = self
-            .playlists
-            .read_unpoisoned()
-            .iter()
-            .map(|p| p.id.clone())
-            .collect();
+        let known_at_start: Vec<String> =
+            self.playlists.read().iter().map(|p| p.id.clone()).collect();
         // Read every listing page first, so a rate limit during the track
         // downloads below can never leave the listing incomplete.
         let mut listed: Vec<Playlist> = Vec::new();
         let lists_page = self.spotify.api.current_user_playlist();
-        let mut lists_batch = Some(lists_page.items.read_unpoisoned().clone());
+        let mut lists_batch = Some(lists_page.items.read().clone());
         while let Some(lists) = lists_batch {
             listed.extend(lists);
             lists_batch = lists_page.next();
@@ -1300,7 +1292,7 @@ impl Library {
                 continue;
             }
             // Download without holding the store lock; only the merge locks.
-            let current = !needs_download(&self.playlists.read_unpoisoned(), remote, force_full);
+            let current = !needs_download(&self.playlists.read(), remote, force_full);
             let downloaded = if current {
                 None
             } else {
@@ -1318,7 +1310,7 @@ impl Library {
                 tracks
             };
             {
-                let mut store = self.playlists.write_unpoisoned();
+                let mut store = self.playlists.write();
                 // Again under the lock: a write queued during the download keeps its copy.
                 items_complete &=
                     merge_unless_pending(&mut store, remote, force_full, downloaded, |id| {
@@ -1333,9 +1325,9 @@ impl Library {
         let listing_complete = !lists_page.failed();
         if listing_complete {
             reconcile_playlists(
-                &mut self.playlists.write_unpoisoned(),
+                &mut self.playlists.write(),
                 &known_at_start,
-                &mut self.fresh_playlists.write_unpoisoned(),
+                &mut self.fresh_playlists.write(),
                 &list_order,
                 true,
             );
@@ -1373,7 +1365,7 @@ impl Library {
                 if action != Action::Fail {
                     // The Web path runs this sync: the tab is flat for this session. The
                     // layout file is kept for the next complete internal sync.
-                    self.playlist_layout.write_unpoisoned().clear();
+                    self.playlist_layout.write().clear();
                 }
                 return match action {
                     Action::LatchThenWeb => {
@@ -1408,12 +1400,8 @@ impl Library {
                 _ => None,
             })
             .collect();
-        let known_at_start: Vec<String> = self
-            .playlists
-            .read_unpoisoned()
-            .iter()
-            .map(|p| p.id.clone())
-            .collect();
+        let known_at_start: Vec<String> =
+            self.playlists.read().iter().map(|p| p.id.clone()).collect();
         let mut known = self.known_playables();
         let mut spacer = Spacer::new(PLAYLIST_FETCH_SPACING);
         let mut stopped = false;
@@ -1427,7 +1415,7 @@ impl Library {
             }
             let remote = &self.with_head_snapshot(listed_remote, *status, &mut stopped);
             // Download without holding the store lock; only the merge locks.
-            let current = !needs_download(&self.playlists.read_unpoisoned(), remote, force_full);
+            let current = !needs_download(&self.playlists.read(), remote, force_full);
             let downloaded = if current {
                 None
             } else {
@@ -1441,7 +1429,7 @@ impl Library {
             }
             let downloaded_any = downloaded.is_some();
             let changed = {
-                let mut store = self.playlists.write_unpoisoned();
+                let mut store = self.playlists.write();
                 let before = store
                     .iter()
                     .find(|p| p.id == remote.id)
@@ -1477,7 +1465,7 @@ impl Library {
                         err.class()
                     );
                     self.playlist_layout
-                        .read_unpoisoned()
+                        .read()
                         .iter()
                         .filter_map(|entry| match entry {
                             LayoutEntry::Pinned(id) => Some(id.clone()),
@@ -1488,9 +1476,9 @@ impl Library {
             };
             let order: Vec<String> = listed.iter().map(|(p, _)| p.id.clone()).collect();
             reconcile_playlists(
-                &mut self.playlists.write_unpoisoned(),
+                &mut self.playlists.write(),
                 &known_at_start,
-                &mut self.fresh_playlists.write_unpoisoned(),
+                &mut self.fresh_playlists.write(),
                 &order,
                 true,
             );
@@ -1498,7 +1486,7 @@ impl Library {
             let layout = layout_from(&rootlist, &pinned);
             self.save_playlists();
             self.save_cache(&config::cache_path(CACHE_PLAYLIST_LAYOUT), &layout);
-            *self.playlist_layout.write_unpoisoned() = layout;
+            *self.playlist_layout.write() = layout;
         } else {
             warn!("playlist rootlist incomplete, keeping cached playlists");
         }
@@ -1550,7 +1538,7 @@ impl Library {
         };
         let cached = self
             .playlists
-            .read_unpoisoned()
+            .read()
             .iter()
             .find(|p| p.id == listed.id)
             .map(|p| p.snapshot_id.clone());
@@ -1624,13 +1612,13 @@ impl Library {
     /// episodes and the tracks of every cached playlist, placeholders left out.
     pub(crate) fn known_playables(&self) -> HashMap<String, Playable> {
         let mut known = HashMap::new();
-        for track in self.tracks.read_unpoisoned().iter() {
+        for track in self.tracks.read().iter() {
             remember(&mut known, &Playable::Track(track.clone()));
         }
-        for episode in self.episodes.read_unpoisoned().iter() {
+        for episode in self.episodes.read().iter() {
             remember(&mut known, &Playable::Episode(episode.clone()));
         }
-        for playlist in self.playlists.read_unpoisoned().iter() {
+        for playlist in self.playlists.read().iter() {
             for playable in playlist.tracks.iter().flatten() {
                 remember(&mut known, playable);
             }
@@ -2055,7 +2043,7 @@ impl Library {
     /// on the optimistic store copy: its queued writes would show twice.
     pub fn playlist_update(&self, updated: &Playlist) {
         {
-            let mut playlists = self.playlists.write_unpoisoned();
+            let mut playlists = self.playlists.write();
             // Under the store lock, so a write queued meanwhile is in the overlay or applies
             // after this store write.
             let shown = self.writer.overlay(updated);
@@ -2074,7 +2062,7 @@ impl Library {
     /// rewrite the cache and redraw. Returns whether it was stored.
     pub fn playlist_update_if_unchanged(&self, updated: &Playlist, base_snapshot: &str) -> bool {
         let replaced = {
-            let mut store = self.playlists.write_unpoisoned();
+            let mut store = self.playlists.write();
             !self.writer.is_pending(&updated.id)
                 && replace_if_unchanged(&mut store, updated, base_snapshot)
         };
@@ -2093,7 +2081,7 @@ impl Library {
             return;
         };
         {
-            let mut store = self.playlists.write_unpoisoned();
+            let mut store = self.playlists.write();
             let kept: Vec<Playlist> = store
                 .iter()
                 .filter(|p| self.writer.is_pending(&p.id))
@@ -2116,7 +2104,7 @@ impl Library {
     /// cached as that copy, never as one showing writes Spotify has not confirmed yet.
     fn cached_playlists(&self) -> Vec<Playlist> {
         self.playlists
-            .read_unpoisoned()
+            .read()
             .iter()
             .map(|p| self.writer.confirmed(&p.id).unwrap_or_else(|| p.clone()))
             .collect()
@@ -2182,7 +2170,7 @@ impl Library {
         }
         {
             // Store lock first, then the writer's (the lock order).
-            let mut store = self.playlists.write_unpoisoned();
+            let mut store = self.playlists.write();
             for id in &ids {
                 // No entry: the job in flight landed and stored its confirmed copy already.
                 if let (Some(confirmed), Some(stored)) = (
@@ -2384,7 +2372,7 @@ impl Library {
     fn restore_confirmed(&self, id: &str) {
         {
             // Store lock first, then the writer's (the lock order).
-            let mut store = self.playlists.write_unpoisoned();
+            let mut store = self.playlists.write();
             self.writer.drop_jobs(id);
             if let (Some(confirmed), Some(stored)) = (
                 self.writer.confirmed(id),
@@ -2480,7 +2468,7 @@ impl Library {
     ) -> Queued<R> {
         let at = {
             // Held across the queue: the worker's store write and overlay never interleave.
-            let mut store = self.playlists.write_unpoisoned();
+            let mut store = self.playlists.write();
             let Some(stored) = store.iter_mut().find(|p| p.id == id) else {
                 return Queued::NotStored;
             };
@@ -2511,7 +2499,7 @@ impl Library {
     fn queue_as_is(&self, id: Option<&str>, kind: JobKind) {
         // The store lock is held across the queue, so the copy cannot be one the worker is
         // about to replace with its confirmed copy.
-        let store = self.playlists.read_unpoisoned();
+        let store = self.playlists.read();
         let stored = id.and_then(|id| store.iter().find(|p| p.id == id).cloned());
         if self.writer.queue(id, kind, || stored).is_none() {
             self.post_note(WRITES_REFUSED_NOTE);
@@ -2672,7 +2660,7 @@ impl Library {
             return;
         }
         let op = {
-            let mut store = lock.write_unpoisoned();
+            let mut store = lock.write();
             let prior = T::prior(&store, &item);
             if (prior != Prior::Absent) != remove {
                 return;
@@ -2689,7 +2677,7 @@ impl Library {
             op
         };
         if matches!(op.item, SaveItem::Track(_)) {
-            Artist::apply(&mut self.artists.write_unpoisoned(), &op);
+            Artist::apply(&mut self.artists.write(), &op);
         }
         // Last: the worker must not undo an artist step that has not happened yet.
         let job = JobKind::LibrarySave(op.clone());
@@ -2801,7 +2789,7 @@ impl Library {
 
     /// Undo the failed `entry` in `lock`'s store; returns what was undone, if anything.
     fn undo_in<T: SavedStore>(&self, lock: &RwLock<Vec<T>>, entry: u64) -> Option<(SaveOp, Prior)> {
-        let mut store = lock.write_unpoisoned();
+        let mut store = lock.write();
         let undone = self.saves.lock().fail(entry);
         if let Some((op, prior)) = &undone {
             T::undo(&mut store, op, *prior);
@@ -2845,7 +2833,7 @@ impl Library {
         match &op.item {
             SaveItem::Track(_) => {
                 if let Some((op, prior)) = self.undo_in(&self.tracks, op.entry) {
-                    Artist::undo(&mut self.artists.write_unpoisoned(), &op, prior);
+                    Artist::undo(&mut self.artists.write(), &op, prior);
                 }
             }
             SaveItem::Album(_) => {
@@ -2878,7 +2866,7 @@ impl Library {
 
     /// Check whether `track` is saved in the user's library.
     pub fn is_saved_track(&self, track: &Playable) -> bool {
-        let tracks = self.tracks.read_unpoisoned();
+        let tracks = self.tracks.read();
         tracks.iter().any(|t| t.id == track.id())
     }
 
@@ -2909,7 +2897,7 @@ impl Library {
 
     /// Check whether `album` is saved to the user's library.
     pub fn is_saved_album(&self, album: &Album) -> bool {
-        let albums = self.albums.read_unpoisoned();
+        let albums = self.albums.read();
         albums.iter().any(|a| a.id == album.id)
     }
 
@@ -2935,7 +2923,7 @@ impl Library {
 
     /// Check whether the user follows `artist`.
     pub fn is_followed_artist(&self, artist: &Artist) -> bool {
-        let artists = self.artists.read_unpoisoned();
+        let artists = self.artists.read();
         artists.iter().any(|a| a.id == artist.id && a.is_followed)
     }
 
@@ -2961,11 +2949,11 @@ impl Library {
 
     /// Check whether `playlist` is saved in the user's library.
     pub fn is_saved_playlist(&self, playlist: &Playlist) -> bool {
-        if !*self.is_done.read_unpoisoned() {
+        if !*self.is_done.read() {
             return false;
         }
 
-        let playlists = self.playlists.read_unpoisoned();
+        let playlists = self.playlists.read();
         playlists.iter().any(|p| p.id == playlist.id)
     }
 
@@ -2980,7 +2968,7 @@ impl Library {
     /// Add `playlist` to the user's library by following it as the logged in user: the
     /// internal API first, the Web API per the fallback classes.
     pub fn follow_playlist(&self, mut playlist: Playlist) {
-        if !*self.is_done.read_unpoisoned() {
+        if !*self.is_done.read() {
             // Nothing sent: the note fails the queued follow.
             self.post_note(LOADING_NOTE);
             return;
@@ -3002,26 +2990,20 @@ impl Library {
         }
 
         playlist.load_tracks(&self.spotify);
-        self.fresh_playlists
-            .write_unpoisoned()
-            .insert(playlist.id.clone());
+        self.fresh_playlists.write().insert(playlist.id.clone());
         self.insert_new_playlist(playlist);
     }
 
     /// Check whether `show` is already in the user's library.
     pub fn is_saved_show(&self, show: &Show) -> bool {
-        let shows = self.shows.read_unpoisoned();
+        let shows = self.shows.read();
         shows.iter().any(|s| s.id == show.id)
     }
 
     /// Whether `episode` is in Your Episodes; None while Your Episodes is off.
     pub fn is_saved_episode(&self, episode: &Episode) -> Option<bool> {
-        self.episodes_enabled.then(|| {
-            self.episodes
-                .read_unpoisoned()
-                .iter()
-                .any(|e| e.id == episode.id)
-        })
+        self.episodes_enabled
+            .then(|| self.episodes.read().iter().any(|e| e.id == episode.id))
     }
 
     /// Add `episode` to Your Episodes.
@@ -4272,11 +4254,11 @@ mod test {
         };
         library.save_episode(&episode("new"));
         assert!(library.run_next_write());
-        assert!(library.episodes.read_unpoisoned().is_empty());
-        library.episodes.write_unpoisoned().push(episode("kept"));
+        assert!(library.episodes.read().is_empty());
+        library.episodes.write().push(episode("kept"));
         library.unsave_episode(&episode("kept"));
         assert!(library.run_next_write());
-        let store = library.episodes.read_unpoisoned();
+        let store = library.episodes.read();
         assert_eq!(store.len(), 1);
         assert_eq!(store[0].id, "kept");
     }
@@ -4318,7 +4300,7 @@ mod test {
         assert!(library.read_cache::<u32>(&path).is_none());
         let store = RwLock::new(vec![track("7", &[])]);
         assert!(!library.load_store(&path, &store));
-        let kept = store.read_unpoisoned()[0].id.clone();
+        let kept = store.read()[0].id.clone();
         assert_eq!(kept.as_deref(), Some("7"), "the store stays as it is");
         std::fs::remove_file(path).unwrap();
     }
@@ -4342,7 +4324,7 @@ mod test {
         assert!(library.save_store(&path, &saved, &gate));
         let store = RwLock::new(vec![track("9", &[])]);
         assert!(library.load_store(&path, &store));
-        let store = store.read_unpoisoned();
+        let store = store.read();
         let ids: Vec<_> = store.iter().filter_map(|t| t.id.as_deref()).collect();
         assert_eq!(ids, ["1", "2"]);
         std::fs::remove_file(path).unwrap();
@@ -4358,7 +4340,7 @@ mod test {
             for n in 0..16 {
                 let (library, path, gate, store) = (&library, &path, &gate, &store);
                 s.spawn(move || {
-                    store.write_unpoisoned().push(track(&n.to_string(), &[]));
+                    store.write().push(track(&n.to_string(), &[]));
                     library.save_store(path, store, gate);
                 });
             }
@@ -4521,7 +4503,7 @@ mod test {
     #[test]
     fn is_pinned_reads_the_layout() {
         let library = test_library();
-        *library.playlist_layout.write_unpoisoned() = vec![
+        *library.playlist_layout.write() = vec![
             LayoutEntry::Pinned("p".into()),
             LayoutEntry::Playlist("q".into()),
         ];
@@ -4572,29 +4554,23 @@ mod test {
             snapshot_id: "reload".into(),
             ..cleared.clone()
         };
-        *library.playlists.write_unpoisoned() = vec![cleared];
+        *library.playlists.write() = vec![cleared];
         assert!(library.playlist_update_if_unchanged(&reloaded, ""));
-        assert_eq!(library.playlists.read_unpoisoned()[0].snapshot_id, "reload");
+        assert_eq!(library.playlists.read()[0].snapshot_id, "reload");
 
         // A sync stored a newer copy after the view read the cleared one.
-        library.playlists.write_unpoisoned()[0].snapshot_id = "sync".into();
+        library.playlists.write()[0].snapshot_id = "sync".into();
         assert!(!library.playlist_update_if_unchanged(&reloaded, ""));
-        assert_eq!(library.playlists.read_unpoisoned()[0].snapshot_id, "sync");
+        assert_eq!(library.playlists.read()[0].snapshot_id, "sync");
     }
 
     #[test]
     fn a_deleted_playlist_leaves_the_fresh_set() {
         let library = test_library();
-        library
-            .fresh_playlists
-            .write_unpoisoned()
-            .insert("p".into());
-        library
-            .fresh_playlists
-            .write_unpoisoned()
-            .insert("q".into());
+        library.fresh_playlists.write().insert("p".into());
+        library.fresh_playlists.write().insert("q".into());
         library.drop_deleted("p");
-        let fresh = library.fresh_playlists.read_unpoisoned();
+        let fresh = library.fresh_playlists.read();
         assert!(!fresh.contains("p"));
         assert!(fresh.contains("q"));
     }
@@ -5013,11 +4989,11 @@ mod test {
     fn a_second_sync_is_skipped_while_one_runs() {
         let library = test_library();
         library.syncing.store(true, Ordering::SeqCst);
-        *library.is_done.write_unpoisoned() = true;
+        *library.is_done.write() = true;
 
         library.update_library(true);
 
-        assert!(*library.is_done.read_unpoisoned());
+        assert!(*library.is_done.read());
         assert!(library.syncing.load(Ordering::SeqCst));
     }
 
@@ -5046,23 +5022,23 @@ mod test {
     fn a_tab_update_is_skipped_while_a_sync_runs() {
         let library = test_library();
         library.syncing.store(true, Ordering::SeqCst);
-        *library.is_done.write_unpoisoned() = true;
+        *library.is_done.write() = true;
 
         assert_eq!(library.update_tab(&LibraryTab::Tracks), TabUpdate::Busy);
 
-        assert!(*library.is_done.read_unpoisoned());
+        assert!(*library.is_done.read());
         assert!(library.syncing.load(Ordering::SeqCst));
     }
 
     #[test]
     fn a_tab_without_a_set_starts_nothing() {
         let library = test_library();
-        *library.is_done.write_unpoisoned() = true;
+        *library.is_done.write() = true;
 
         assert_eq!(library.update_tab(&LibraryTab::Browse), TabUpdate::NoSet);
         assert_eq!(library.update_tab(&LibraryTab::Episodes), TabUpdate::NoSet);
 
-        assert!(*library.is_done.read_unpoisoned());
+        assert!(*library.is_done.read());
         assert!(!library.syncing.load(Ordering::SeqCst));
     }
 
@@ -5209,10 +5185,10 @@ mod test {
     #[test]
     fn internal_playlist_sync_without_a_session_uses_the_web_path() {
         let library = test_library();
-        *library.playlist_layout.write_unpoisoned() = vec![LayoutEntry::Playlist("p".into())];
+        *library.playlist_layout.write() = vec![LayoutEntry::Playlist("p".into())];
         assert!(library.spotify.api.internal_usable(Area::Playlists));
         assert!(library.fetch_playlists_internal(false).is_none());
-        assert!(library.playlist_layout.read_unpoisoned().is_empty());
+        assert!(library.playlist_layout.read().is_empty());
         assert_eq!(library.spotify.api.area_counts(Area::Playlists).fallback, 1);
         assert!(library.spotify.api.internal_usable(Area::Playlists));
     }
@@ -5337,7 +5313,7 @@ mod test {
                 playable
             })
             .collect();
-        *library.playlists.write_unpoisoned() = vec![Playlist {
+        *library.playlists.write() = vec![Playlist {
             owner_id: "me".into(),
             snapshot_id: "s0".into(),
             num_tracks: tracks.len(),
@@ -5350,7 +5326,7 @@ mod test {
     fn stored_opt(library: &Library, id: &str) -> Option<Playlist> {
         library
             .playlists
-            .read_unpoisoned()
+            .read()
             .iter()
             .find(|p| p.id == id)
             .cloned()
@@ -5583,7 +5559,7 @@ mod test {
         let row = stored_row(&library, "p", 0);
         library.queue_move("p", &row, 1, false);
         let pending = |id: &str| library.writer.is_pending(id);
-        let mut store = library.playlists.read_unpoisoned().clone();
+        let mut store = library.playlists.read().clone();
         store.push(playlist("q"));
         // A changed listing of both, with downloaded tracks.
         let listed = |id: &str| Playlist {
@@ -5612,7 +5588,7 @@ mod test {
     #[test]
     fn a_cache_load_keeps_the_copies_of_pending_playlists() {
         let library = library_with_playlist("p", &["a", "b", "c"]);
-        let disk = library.playlists.read_unpoisoned().clone();
+        let disk = library.playlists.read().clone();
         let row = stored_row(&library, "p", 0);
         library.queue_move("p", &row, 1, false);
         let rev = library.playlists_rev.load(Ordering::Relaxed);
@@ -5645,7 +5621,7 @@ mod test {
     fn a_rootlist_job_that_posted_a_note_settles_as_failed() {
         // No session and no Web token: the unfollow fails and posts its note.
         let library = library_with_playlist("p", &["a"]);
-        *library.is_done.write_unpoisoned() = true;
+        *library.is_done.write() = true;
         library.queue_unfollow("p");
         assert!(library.run_next_write());
         let settled = settled_events(&library);
@@ -5679,12 +5655,11 @@ mod test {
         library.queue_move("p", &row, 1, false);
         assert_eq!(stored_uris(&library, "p"), ["b", "a", "c"], "optimistic");
         assert!(library.run_next_write_with(|_, _| {
-            let _store = library.playlists.write_unpoisoned();
+            let _store = library.playlists.write();
             let _note = library.last_note.lock();
             panic!("write job failed with the store locked");
         }));
-        // The settle reverted the store through the poisoned lock and cleared the mark.
-        assert!(!library.playlists.is_poisoned());
+        // The settle reverted the store after the job panicked with the lock held.
         assert_eq!(stored_uris(&library, "p"), ["a", "b", "c"]);
         let settled = settled_events(&library);
         assert_eq!(settled.len(), 1);
@@ -5768,7 +5743,7 @@ mod test {
     fn giving_up_restores_removed_rows_in_order() {
         let library = loaded_library();
         let tracks: Vec<Track> = ["a", "b", "c", "d"].map(|id| track(id, &[])).into();
-        *library.tracks.write_unpoisoned() = tracks.clone();
+        *library.tracks.write() = tracks.clone();
         library.unsave_tracks(&[&tracks[1]]);
         library.unsave_tracks(&[&tracks[2]]);
         library.give_up_writes();
@@ -5811,7 +5786,7 @@ mod test {
     fn giving_up_undoes_pending_saves() {
         let library = loaded_library();
         let (kept, saved) = (track("kept", &[("a", "A")]), track("t", &[("b", "B")]));
-        library.tracks.write_unpoisoned().push(kept.clone());
+        library.tracks.write().push(kept.clone());
         library.save_tracks(&[&saved]);
         library.unsave_tracks(&[&kept]);
         library.give_up_writes();
@@ -6043,18 +6018,14 @@ mod test {
         let library = test_library();
         let t = track("t", &[]);
         {
-            let mut store = library.tracks.write_unpoisoned();
+            let mut store = library.tracks.write();
             let item = SaveItem::Track(Box::new(t.clone()));
             let prior = Track::prior(&store, &item);
             let op = library.saves.lock().add(item, false, prior);
             Track::apply(&mut store, &op);
         }
         library.with_store(&library.tracks, |store| store.clear());
-        assert_eq!(
-            library.tracks.read_unpoisoned().len(),
-            1,
-            "the swap kept it"
-        );
+        assert_eq!(library.tracks.read().len(), 1, "the swap kept it");
         assert!(library.confirmed(&library.tracks).is_empty());
     }
 
@@ -6113,7 +6084,7 @@ mod test {
 
     /// Apply a save of `t` to the tracks store and log it, as the UI thread does.
     fn pending_save(library: &Library, t: &Track) -> SaveOp {
-        let mut store = library.tracks.write_unpoisoned();
+        let mut store = library.tracks.write();
         let item = SaveItem::Track(Box::new(t.clone()));
         let prior = Track::prior(&store, &item);
         let op = library.saves.lock().add(item, false, prior);
@@ -6128,7 +6099,7 @@ mod test {
         library.save_cache(&path, &[track("old", &[])]);
         let op = pending_save(&library, &track("t", &[]));
         assert!(library.load_store(&path, &library.tracks));
-        let store = library.tracks.read_unpoisoned();
+        let store = library.tracks.read();
         let ids: Vec<_> = store.iter().filter_map(|t| t.id.as_deref()).collect();
         assert_eq!(ids, ["t", "old"]);
         drop(store);
@@ -6156,7 +6127,7 @@ mod test {
         let library = test_library();
         pending_save(&library, &track("t", &[("a", "A")]));
         library.populate_artists();
-        assert_eq!(library.artists.read_unpoisoned().len(), 1, "replayed");
+        assert_eq!(library.artists.read().len(), 1, "replayed");
         assert!(library.confirmed(&library.artists).is_empty());
     }
 
@@ -6164,9 +6135,9 @@ mod test {
     fn a_pending_follow_stays_out_of_what_a_followed_sync_builds_from() {
         let library = test_library();
         let followed = artist("a", "A", true);
-        library.artists.write_unpoisoned().push(followed);
+        library.artists.write().push(followed);
         {
-            let mut store = library.artists.write_unpoisoned();
+            let mut store = library.artists.write();
             let item = SaveItem::Artist(Box::new(artist("b", "B", false)));
             let prior = Artist::prior(&store, &item);
             let op = library.saves.lock().add(item, false, prior);
@@ -6183,7 +6154,7 @@ mod test {
     fn saved_ids(library: &Library) -> Vec<String> {
         library
             .tracks
-            .read_unpoisoned()
+            .read()
             .iter()
             .filter_map(|t| t.id.clone())
             .collect()
@@ -6199,8 +6170,8 @@ mod test {
     fn saves_work_and_marks_stay_during_a_sync() {
         let library = loaded_library();
         let t = track("t", &[]);
-        library.tracks.write_unpoisoned().push(t.clone());
-        *library.is_done.write_unpoisoned() = false;
+        library.tracks.write().push(t.clone());
+        *library.is_done.write() = false;
         assert!(
             library.is_saved_track(&Playable::Track(t.clone())),
             "the mark stays"
@@ -6256,11 +6227,7 @@ mod test {
         let t = track("t", &[("a", "A")]);
         library.save_tracks(&[&t]);
         assert_eq!(saved_ids(&library), ["t"]);
-        assert_eq!(
-            library.artists.read_unpoisoned().len(),
-            1,
-            "the artist side too"
-        );
+        assert_eq!(library.artists.read().len(), 1, "the artist side too");
         assert_eq!(library.writer.pending(), 1);
     }
 
@@ -6318,7 +6285,7 @@ mod test {
         library.save_tracks(&[&t]);
         assert!(library.run_next_write());
         assert!(saved_ids(&library).is_empty());
-        assert!(library.artists.read_unpoisoned().is_empty());
+        assert!(library.artists.read().is_empty());
         assert_eq!(library.writer.pending(), 0);
         let events: Vec<Event> = library.ev.msg_iter().collect();
         let notes = events
@@ -6377,7 +6344,7 @@ mod test {
     fn an_unsave_failing_after_a_sync_copy_does_not_vanish() {
         let library = loaded_library();
         let t = track("t", &[]);
-        library.tracks.write_unpoisoned().push(t.clone());
+        library.tracks.write().push(t.clone());
         library.unsave_tracks(&[&t]);
         let copy = library.confirmed(&library.tracks);
         assert!(library.run_next_write_with(|_, _| false));
@@ -6390,13 +6357,13 @@ mod test {
         let library = loaded_library();
         let mut stored = track("t", &[]);
         stored.added_at = Some(chrono::Utc::now());
-        library.tracks.write_unpoisoned().push(stored.clone());
+        library.tracks.write().push(stored.clone());
         let mut stripped = track("t", &[]);
         stripped.list_index = 7;
         library.unsave_tracks(&[&stripped]);
         assert!(saved_ids(&library).is_empty());
         assert!(library.run_next_write_with(|_, _| false));
-        let tracks = library.tracks.read_unpoisoned();
+        let tracks = library.tracks.read();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].added_at, stored.added_at);
         assert_eq!(tracks[0].list_index, stored.list_index);
@@ -6408,14 +6375,14 @@ mod test {
         let mut stored = Album::default_for_test("a");
         stored.id = Some("a".into());
         stored.tracks = Some(vec![track("t", &[])]);
-        library.albums.write_unpoisoned().push(stored);
+        library.albums.write().push(stored);
         let mut stripped = Album::default_for_test("a");
         stripped.id = Some("a".into());
         stripped.tracks = None;
         library.unsave_album(&stripped);
-        assert!(library.albums.read_unpoisoned().is_empty());
+        assert!(library.albums.read().is_empty());
         assert!(library.run_next_write_with(|_, _| false));
-        let albums = library.albums.read_unpoisoned();
+        let albums = library.albums.read();
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].tracks.as_ref().map(Vec::len), Some(1));
     }
@@ -6425,7 +6392,7 @@ mod test {
         let library = loaded_library();
         let mut stored = track("t", &[]);
         stored.added_at = Some(chrono::Utc::now());
-        library.tracks.write_unpoisoned().push(stored.clone());
+        library.tracks.write().push(stored.clone());
         library.unsave_tracks(&[&track("t", &[])]);
         let confirmed = library.confirmed(&library.tracks);
         assert_eq!(confirmed.len(), 1);
@@ -6460,7 +6427,7 @@ mod test {
         library.save_tracks(&[&t]);
         assert!(library.confirmed(&library.tracks).is_empty());
         assert!(library.run_next_write_with(|_, _| true));
-        assert_eq!(library.tracks.read_unpoisoned().len(), 1);
+        assert_eq!(library.tracks.read().len(), 1);
     }
 
     #[test]
@@ -6470,9 +6437,9 @@ mod test {
         let mut t = track("t", &[]);
         t.id = None;
         library.save_tracks(&[&t]);
-        assert_eq!(library.tracks.read_unpoisoned().len(), 1, "shows at once");
+        assert_eq!(library.tracks.read().len(), 1, "shows at once");
         assert!(library.run_next_write());
-        assert_eq!(library.tracks.read_unpoisoned().len(), 1, "stays");
+        assert_eq!(library.tracks.read().len(), 1, "stays");
         let events: Vec<Event> = library.ev.msg_iter().collect();
         assert!(
             events

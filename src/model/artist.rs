@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rspotify::model::Id;
 use rspotify::model::artist::{FullArtist, SimplifiedArtist};
@@ -80,13 +81,7 @@ impl fmt::Debug for Artist {
 impl ListItem for Artist {
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = &self.tracks {
-            let playing: Vec<String> = queue
-                .queue
-                .read()
-                .unwrap()
-                .iter()
-                .filter_map(|t| t.id())
-                .collect();
+            let playing: Vec<String> = queue.queue.read().iter().filter_map(|t| t.id()).collect();
             let ids: Vec<String> = tracks.iter().filter_map(|t| t.id.clone()).collect();
             !ids.is_empty() && playing == ids
         } else {

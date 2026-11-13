@@ -1,9 +1,9 @@
-use crate::ext_traits::RwLockExt;
 use crate::library::Library;
 use crate::traits::ListItem;
 use log::debug;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 pub struct ApiPage<I> {
     pub offset: u32,
@@ -30,7 +30,7 @@ impl<I: ListItem + Clone> ApiResult<I> {
                 first_page.items.len(),
                 first_page.total
             );
-            items.write().unwrap().extend(first_page.items);
+            items.write().extend(first_page.items);
             Self {
                 offset: Arc::new(RwLock::new(first_page.offset)),
                 limit,
@@ -57,7 +57,7 @@ impl<I: ListItem + Clone> ApiResult<I> {
     }
 
     fn offset(&self) -> u32 {
-        *self.offset.read().unwrap()
+        *self.offset.read()
     }
 
     pub fn at_end(&self) -> bool {
@@ -66,7 +66,7 @@ impl<I: ListItem + Clone> ApiResult<I> {
 
     pub fn apply_pagination(self, pagination: &Pagination<I>) {
         let total = self.total as usize;
-        let fetched_items = self.items.read().unwrap().len();
+        let fetched_items = self.items.read().len();
         pagination.set(
             fetched_items,
             total,
@@ -90,8 +90,8 @@ impl<I: ListItem + Clone> ApiResult<I> {
         debug!("fetching next page at offset {offset}");
         if !self.at_end() {
             if let Some(next_page) = (self.fetch_page)(offset) {
-                *self.offset.write().unwrap() = next_page.offset;
-                self.items.write().unwrap().extend(next_page.items.clone());
+                *self.offset.write() = next_page.offset;
+                self.items.write().extend(next_page.items.clone());
                 Some(next_page.items)
             } else {
                 self.failed.store(true, Ordering::SeqCst);
@@ -119,9 +119,9 @@ pub fn fill_in_background<I, F, R>(
 {
     std::thread::spawn(move || {
         let result = fetch();
-        let first_page = result.items.read_unpoisoned().clone();
+        let first_page = result.items.read().clone();
         let loaded = {
-            let mut content = content.write_unpoisoned();
+            let mut content = content.write();
             content.extend(first_page);
             content.len()
         };
@@ -130,7 +130,7 @@ pub fn fill_in_background<I, F, R>(
             result.total as usize,
             Box::new(move |content| {
                 if let Some(items) = result.next() {
-                    content.write_unpoisoned().extend(items);
+                    content.write().extend(items);
                 }
             }),
         );
@@ -168,39 +168,39 @@ impl<I: ListItem> Default for Pagination<I> {
 
 impl<I: ListItem + Clone> Pagination<I> {
     pub fn clear(&mut self) {
-        *self.max_content.write().unwrap() = None;
-        *self.callback.write().unwrap() = None;
+        *self.max_content.write() = None;
+        *self.callback.write() = None;
     }
     pub fn set(&self, loaded_content: usize, max_content: usize, callback: Paginator<I>) {
-        *self.loaded_content.write().unwrap() = loaded_content;
-        *self.max_content.write().unwrap() = Some(max_content);
-        *self.callback.write().unwrap() = Some(callback);
+        *self.loaded_content.write() = loaded_content;
+        *self.max_content.write() = Some(max_content);
+        *self.callback.write() = Some(callback);
     }
 
     pub fn loaded_content(&self) -> usize {
-        *self.loaded_content.read().unwrap()
+        *self.loaded_content.read()
     }
 
     pub fn max_content(&self) -> Option<usize> {
-        *self.max_content.read().unwrap()
+        *self.max_content.read()
     }
 
     pub(crate) fn is_busy(&self) -> bool {
-        *self.busy.read().unwrap()
+        *self.busy.read()
     }
 
     pub fn call(&self, content: &Arc<RwLock<Vec<I>>>, library: Arc<Library>) {
         let pagination = self.clone();
         let content = content.clone();
         if !self.is_busy() {
-            *self.busy.write().unwrap() = true;
+            *self.busy.write() = true;
             std::thread::spawn(move || {
-                let cb = pagination.callback.read().unwrap();
+                let cb = pagination.callback.read();
                 if let Some(ref cb) = *cb {
                     debug!("calling paginator!");
                     cb(content.clone());
-                    *pagination.loaded_content.write().unwrap() = content.read().unwrap().len();
-                    *pagination.busy.write().unwrap() = false;
+                    *pagination.loaded_content.write() = content.read().len();
+                    *pagination.busy.write() = false;
                     library.trigger_redraw();
                 }
             });
@@ -253,7 +253,7 @@ mod test {
     fn failed_first_page_marks_the_result_failed() {
         let result = ApiResult::new(1, always_failing(Arc::new(AtomicUsize::new(0))));
         assert!(result.failed());
-        assert!(result.items.read().unwrap().is_empty());
+        assert!(result.items.read().is_empty());
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod test {
             assert!(result.next().is_some());
         }
         assert!(!result.failed());
-        assert_eq!(result.items.read().unwrap().len(), 3);
+        assert_eq!(result.items.read().len(), 3);
     }
 
     #[test]
@@ -318,18 +318,18 @@ mod test {
         );
 
         // The first page is still held back, so nothing is loaded yet.
-        assert!(content.read().unwrap().is_empty());
+        assert!(content.read().is_empty());
         assert_eq!(pagination.max_content(), None);
 
         release.send(()).unwrap();
         redraw_seen.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(content.read().unwrap().len(), 1);
+        assert_eq!(content.read().len(), 1);
         assert_eq!(pagination.loaded_content(), 1);
         assert_eq!(pagination.max_content(), Some(3));
 
         // The paginator appends later pages to the view's own list.
-        let callback = pagination.callback.read().unwrap();
+        let callback = pagination.callback.read();
         callback.as_ref().unwrap()(content.clone());
-        assert_eq!(content.read().unwrap().len(), 2);
+        assert_eq!(content.read().len(), 2);
     }
 }

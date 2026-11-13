@@ -15,7 +15,6 @@ use serde::Serialize;
 
 use crate::activity::ACTIVITY;
 use crate::command::ShiftMode;
-use crate::ext_traits::RwLockExt;
 use crate::internal_api::{Area, AreaCounts};
 use crate::library::Library;
 use crate::model::album::Album;
@@ -255,7 +254,7 @@ fn last_test_playlist(library: &Library, verb: &str) -> Result<Playlist, String>
         .ok_or_else(|| format!("harness {verb}: no recorded test playlist"))?;
     library
         .playlists
-        .read_unpoisoned()
+        .read()
         .iter()
         .find(|p| p.id == id)
         .cloned()
@@ -390,7 +389,7 @@ pub fn test_playlist_names(library: &Library, spotify: &Spotify) -> Result<Vec<S
             };
             let stored = library
                 .playlists
-                .read_unpoisoned()
+                .read()
                 .iter()
                 .find(|p| p.id == id)
                 .map(|p| p.name.clone());
@@ -459,16 +458,10 @@ pub fn unfollow_recorded(library: &Library, spotify: &Spotify, n: usize) -> Resu
         })?;
     let id =
         recorded_id(uri).ok_or("harness unfollow-recorded: the recorded line is not a playlist")?;
-    if !*library.is_done.read_unpoisoned() {
+    if !*library.is_done.read() {
         return Err("harness unfollow-recorded: the library is still syncing".into());
     }
-    let stored = |library: &Library| {
-        library
-            .playlists
-            .read_unpoisoned()
-            .iter()
-            .any(|p| p.id == id)
-    };
+    let stored = |library: &Library| library.playlists.read().iter().any(|p| p.id == id);
     let was_stored = stored(library);
     let mut still_stored = false;
     let mut listing = RootlistState::Unknown;

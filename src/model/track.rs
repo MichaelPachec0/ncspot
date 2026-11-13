@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::config;
 use crate::utils::ms_to_hms;

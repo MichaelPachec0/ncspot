@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use crate::command::{Command, MoveMode, ShiftMode};
 use crate::commands::CommandResult;
-use crate::ext_traits::RwLockExt;
 use crate::library::Library;
 use crate::model::playable::Playable;
 use crate::queue::Queue;
@@ -41,7 +40,7 @@ impl QueueView {
         library: Arc<Library>,
         id: Option<String>,
     ) {
-        let tracks = queue.queue.read().unwrap().clone();
+        let tracks = queue.queue.read().clone();
         match id {
             Some(id) => {
                 library.queue_overwrite(&id, &tracks);
@@ -70,7 +69,7 @@ impl QueueView {
         let mut list_select: SelectView<Option<String>> = SelectView::new().autojump();
         list_select.add_item("[Create new]", None);
 
-        for list in library.playlists.read_unpoisoned().iter() {
+        for list in library.playlists.read().iter() {
             list_select.add_item(list.name.clone(), Some(list.id.clone()));
         }
 
@@ -118,7 +117,6 @@ impl ViewExt for QueueView {
             .queue
             .queue
             .read()
-            .unwrap()
             .iter()
             .map(|p| p.duration() as u64 / 1000)
             .sum();

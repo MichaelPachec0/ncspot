@@ -2,8 +2,9 @@
 
 use cursive::view::scroll::Scroller;
 use log::info;
+use parking_lot::RwLock;
 use std::cmp::{Ordering, max, min};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use cursive::align::HAlign;
 use cursive::event::{Callback, Event, EventResult, MouseButton, MouseEvent};
@@ -15,7 +16,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::command::{Command, GotoMode, InsertSource, JumpMode, MoveAmount, MoveMode, TargetMode};
 use crate::commands::CommandResult;
-use crate::ext_traits::{CursiveExt, RwLockExt};
+use crate::ext_traits::CursiveExt;
 use crate::library::Library;
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -98,7 +99,7 @@ impl<I: ListItem + Clone> ListView<I> {
     /// If `include_paginator` is `true`, the pagination entry will be included
     /// in the count.
     pub fn content_len(&self, include_paginator: bool) -> usize {
-        let content_len = self.content.read_unpoisoned().len();
+        let content_len = self.content.read().len();
 
         // add 1 more row for paginator if we can paginate
         if self.can_paginate() && include_paginator {
@@ -125,7 +126,7 @@ impl<I: ListItem + Clone> ListView<I> {
         //    OR
         //   The scroller can't scroll further down (mouse scrolling)
         if self.can_paginate()
-            && (self.selected == self.content.read_unpoisoned().len().saturating_sub(1)
+            && (self.selected == self.content.read().len().saturating_sub(1)
                 || !self.scroller.can_scroll_down())
         {
             self.pagination.call(&self.content, self.library.clone());
@@ -143,7 +144,7 @@ impl<I: ListItem + Clone> ListView<I> {
 
     pub fn get_indexes_of(&self, query: &str) -> Vec<usize> {
         // A copy, as in [ListView::draw]: a custom track format asks the library too.
-        let content = self.content.read_unpoisoned().clone();
+        let content = self.content.read().clone();
         content
             .iter()
             .enumerate()
@@ -196,7 +197,7 @@ impl<I: ListItem + Clone> ListView<I> {
     /// currently playing track and start playing them. Returns true if adding and playing the
     /// tracks succeeded, false otherwhise.
     fn attempt_play_all_tracks(&self) -> bool {
-        let content = self.content.read_unpoisoned();
+        let content = self.content.read();
         let any = &(*content) as &dyn std::any::Any;
         let playables = any.downcast_ref::<Vec<Playable>>();
         let tracks = any.downcast_ref::<Vec<Track>>().map(|t| {
@@ -215,7 +216,7 @@ impl<I: ListItem + Clone> ListView<I> {
 
     /// Appends the currently focused item after the currently playing item and starts playing it.
     fn play_current_item(&mut self) {
-        let mut content = self.content.write_unpoisoned();
+        let mut content = self.content.write();
         if let Some(listitem) = content.get_mut(self.selected) {
             listitem.play(&self.queue);
         }
@@ -273,7 +274,7 @@ impl<I: ListItem + Clone> ListView<I> {
                 } else if let Some(clicked_row_index) = self.get_selected_row(position, offset) {
                     let currently_selected_listitem = self
                         .content
-                        .read_unpoisoned()
+                        .read()
                         .get(clicked_row_index)
                         .map(ListItem::as_listitem);
                     let currently_selected_is_individual = currently_selected_listitem
@@ -285,7 +286,7 @@ impl<I: ListItem + Clone> ListView<I> {
                         // The clicked position wasn't focused yet or the item is a collection
                         // that can be opened.
                         self.move_focus_to(clicked_row_index);
-                        let content = self.content.read_unpoisoned();
+                        let content = self.content.read();
                         let clicked_list_item =
                             content.get(self.selected).map(ListItem::as_listitem);
 
@@ -313,7 +314,7 @@ impl<I: ListItem + Clone> ListView<I> {
                     let queue = self.queue.clone();
                     let library = self.library.clone();
                     if let Some(target) = {
-                        let content = self.content.read_unpoisoned();
+                        let content = self.content.read();
                         content.get(self.selected).map(|t| t.as_listitem())
                     } {
                         let contextmenu = ContextMenu::new(&*target, queue, library);
@@ -355,7 +356,7 @@ impl<I: ListItem + Clone> View for ListView<I> {
             // when the content is a library store that is a second read of this lock. A second
             // read waits for any waiting writer, who waits for the first: a deadlock.
             let (len, item) = {
-                let content = self.content.read_unpoisoned();
+                let content = self.content.read();
                 (content.len(), content.get(i).cloned())
             };
 
@@ -539,7 +540,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
 
     #[cfg(feature = "harness")]
     fn harness_state(&self) -> Option<crate::harness::HarnessState> {
-        let content = self.content.read_unpoisoned();
+        let content = self.content.read();
         Some(crate::harness::HarnessState {
             view: "list".into(),
             tab: None,
@@ -560,7 +561,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
             }
             Command::PlayNext => {
                 info!("played next");
-                let mut content = self.content.write_unpoisoned();
+                let mut content = self.content.write();
                 if let Some(item) = content.get_mut(self.selected) {
                     item.play_next(&self.queue);
                 }
@@ -568,7 +569,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 return Ok(CommandResult::Consumed(None));
             }
             Command::Queue => {
-                let mut content = self.content.write_unpoisoned();
+                let mut content = self.content.write();
                 if let Some(item) = content.get_mut(self.selected) {
                     item.queue(&self.queue);
                 }
@@ -577,7 +578,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
             }
             Command::Save => {
                 let mut item = {
-                    let content = self.content.read_unpoisoned();
+                    let content = self.content.read();
                     content.get(self.selected).cloned()
                 };
 
@@ -589,7 +590,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
             }
             Command::Add => {
                 let item = {
-                    let content = self.content.read_unpoisoned();
+                    let content = self.content.read();
                     content.get(self.selected).cloned()
                 };
 
@@ -604,7 +605,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
             }
             Command::Delete => {
                 let mut item = {
-                    let content = self.content.read_unpoisoned();
+                    let content = self.content.read();
                     content.get(self.selected).cloned()
                 };
 
@@ -619,7 +620,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 let url = match mode {
                     TargetMode::Selected => self
                         .content
-                        .read_unpoisoned()
+                        .read()
                         .get(self.selected)
                         .and_then(ListItem::share_url),
                     TargetMode::Current => self
@@ -677,7 +678,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 }
             },
             Command::Move(mode, amount) => {
-                let last_idx = self.content.read_unpoisoned().len().saturating_sub(1);
+                let last_idx = self.content.read().len().saturating_sub(1);
 
                 match mode {
                     MoveMode::Up => {
@@ -716,7 +717,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 let target: Option<Box<dyn ListItem>> = match mode {
                     TargetMode::Current => self.queue.get_current().map(|t| t.as_listitem()),
                     TargetMode::Selected => {
-                        let content = self.content.read_unpoisoned();
+                        let content = self.content.read();
                         content.get(self.selected).map(|t| t.as_listitem())
                     }
                 };
@@ -734,7 +735,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 }
             }
             Command::Goto(mode) => {
-                let mut content = self.content.write_unpoisoned();
+                let mut content = self.content.write();
                 if let Some(item) = content.get_mut(self.selected) {
                     let queue = self.queue.clone();
                     let library = self.library.clone();
@@ -836,7 +837,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 let target: Option<Box<dyn ListItem>> = match mode {
                     TargetMode::Current => self.queue.get_current().map(|t| t.as_listitem()),
                     TargetMode::Selected => {
-                        let content = self.content.read_unpoisoned();
+                        let content = self.content.read();
                         content.get(self.selected).map(|t| t.as_listitem())
                     }
                 };
@@ -898,7 +899,7 @@ mod draw_test {
         let ev = EventManager::new_for_test();
         let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
         let library = Library::new_for_test(ev, spotify.clone(), cfg.clone());
-        *library.tracks.write_unpoisoned() = (0..30).map(|n| track(&n.to_string(), &[])).collect();
+        *library.tracks.write() = (0..30).map(|n| track(&n.to_string(), &[])).collect();
         let queue = Arc::new(Queue::new(spotify, cfg, library.clone()));
         let list = ListView::new(library.tracks.clone(), queue, library.clone());
         (list, library)
@@ -915,7 +916,7 @@ mod draw_test {
             let (library, stop) = (library.clone(), stop.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    drop(library.tracks.write_unpoisoned());
+                    drop(library.tracks.write());
                 }
             })
         };
@@ -945,7 +946,7 @@ mod draw_test {
             let (library, stop) = (library.clone(), stop.clone());
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
-                    drop(library.tracks.write_unpoisoned());
+                    drop(library.tracks.write());
                 }
             })
         };

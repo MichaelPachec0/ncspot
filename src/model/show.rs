@@ -36,7 +36,7 @@ impl Show {
         if episodes_result.failed() {
             return;
         }
-        let episodes = episodes_result.items.read().unwrap().clone();
+        let episodes = episodes_result.items.read().clone();
         self.episodes = Some(episodes);
     }
 }

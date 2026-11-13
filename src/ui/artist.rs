@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::thread;
 
 use cursive::Cursive;
@@ -40,7 +41,7 @@ impl ArtistView {
                 if let Some(id) = id
                     && let Ok(tracks) = spotify.api.artist_top_tracks(&id)
                 {
-                    top_tracks.write().unwrap().extend(tracks);
+                    top_tracks.write().extend(tracks);
                     library.trigger_redraw();
                 }
             });
@@ -55,7 +56,7 @@ impl ArtistView {
                 if let Some(id) = id
                     && let Ok(artists) = spotify.api.artist_related_artists(&id)
                 {
-                    related.write().unwrap().extend(artists);
+                    related.write().extend(artists);
                     library.trigger_redraw();
                 }
             });
