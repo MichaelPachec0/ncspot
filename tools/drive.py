@@ -205,6 +205,19 @@ def render_config(values):
     return "".join(top) + "".join(tables)
 
 
+def order_problem(q):
+    """Why the queue section of a dump is not a valid shuffled state, or None when it is: the
+    order holds every queue index once and starts at the current song."""
+    order = q.get("order")
+    if not q.get("shuffle") or order is None:
+        return "shuffle is off or there is no play order"
+    if sorted(order) != list(range(q["len"])):
+        return "the play order is not every queue index once"
+    if q["current"] is not None and order[0] != q["current"]:
+        return "the play order does not start at the current song"
+    return None
+
+
 def exit_code(results):
     if "FAIL" in results:
         return 1
@@ -872,6 +885,115 @@ def sc_reconnect(inst, args):
     inst.send("stop")
 
 
+SHUFFLE_SONGS = 30
+SHUFFLE_START = 4
+SHUFFLE_STEPS = 5
+
+
+def wait_queue(inst, timeout, what, cond):
+    """Poll dumps until the queue section passes `cond`. The section holds counts and indices
+    only, so it is safe to print."""
+    deadline = time.monotonic() + timeout
+    while True:
+        d = inst.dump()
+        if d.get("error") and d["error"].startswith("harness queue"):
+            raise Fail(d["error"])
+        q = d["queue"]
+        if cond(q):
+            return q
+        if time.monotonic() > deadline:
+            raise Fail(f"expected {what}, got {q}")
+        time.sleep(0.25)
+
+
+def shuffled(inst, timeout, what):
+    """Wait for a valid shuffled state and return its queue section."""
+    return wait_queue(inst, timeout, what, lambda q: order_problem(q) is None)
+
+
+def sc_shuffle(inst, args):
+    """Shuffle over random liked songs: the order, next and previous, edits, and off again."""
+    n, t = SHUFFLE_SONGS, args.settle_timeout
+    inst.wait_library(t)
+    inst.send("shuffle off")
+    inst.send("repeat off")
+    inst.send(f"harness queue-liked {n}")
+    wait_queue(
+        inst, t, f"{n} different liked songs, not shuffled, nothing current",
+        lambda q: q["len"] == n and q["distinct"] == n and q["order"] is None
+        and not q["shuffle"] and q["current"] is None,
+    )
+
+    inst.send(f"harness queue-play {SHUFFLE_START}")
+    wait_queue(inst, t, f"song {SHUFFLE_START} current", lambda q: q["current"] == SHUFFLE_START)
+    deadline = time.monotonic() + t
+    while inst.dump()["player"]["status"] != "playing":
+        if time.monotonic() > deadline:
+            raise Fail("playback never started")
+        time.sleep(0.5)
+
+    # On: a full order that starts at the playing song and is not the list order.
+    inst.send("shuffle on")
+    q = shuffled(inst, t, "a play order starting at the current song")
+    order = q["order"]
+    expect(order[1:] != sorted(order[1:]), "a mixed play order", order)
+
+    # Next walks the order without changing it; previous walks it back.
+    for step in range(1, SHUFFLE_STEPS + 1):
+        inst.send("next")
+        q = wait_queue(
+            inst, t, f"song {order[step]} current after {step} next",
+            lambda q, want=order[step]: q["current"] == want,
+        )
+        expect(q["order"] == order, "the same play order while stepping", q["order"])
+    inst.send("previous")
+    back = order[SHUFFLE_STEPS - 1]
+    wait_queue(inst, t, f"song {back} current after previous", lambda q: q["current"] == back)
+
+    # Remove the playing song: the song that moved into its place plays, with a new valid order.
+    # The last row has no successor, so there playback stops.
+    after = back if back < n - 1 else None
+    inst.send(f"harness queue-remove {back}")
+    q = wait_queue(
+        inst, t, f"{n - 1} songs with {after} current and a valid order",
+        lambda q: q["len"] == n - 1 and q["current"] == after and order_problem(q) is None,
+    )
+    if q["current"] is None:
+        inst.send("harness queue-play 0")
+        q = shuffled(inst, t, "a play order after playing the first song")
+        q = wait_queue(inst, t, "song 0 current", lambda q: q["current"] == 0)
+
+    # Move the playing row: it stays current at its new index and keeps its place in the order.
+    src = q["current"]
+    dst = 0 if src != 0 else 1
+    place = q["order"].index(src)
+    inst.send(f"harness queue-move {src} {dst}")
+    q = wait_queue(
+        inst, t, f"song {dst} current at order place {place} after the move",
+        lambda q: q["current"] == dst and sorted(q["order"] or []) == list(range(n - 1))
+        and q["order"].index(dst) == place,
+    )
+
+    # Off: no order, the same song, and next goes down the list.
+    inst.send("shuffle off")
+    wait_queue(
+        inst, t, f"no play order and song {dst} current",
+        lambda q: q["order"] is None and not q["shuffle"] and q["current"] == dst,
+    )
+    inst.send("next")
+    wait_queue(inst, t, f"song {dst + 1} current", lambda q: q["current"] == dst + 1)
+
+    # Two shuffles of the same queue differ.
+    inst.send("shuffle on")
+    first = shuffled(inst, t, "a play order after shuffle on")["order"]
+    inst.send("shuffle off")
+    wait_queue(inst, t, "no play order", lambda q: q["order"] is None)
+    inst.send("shuffle on")
+    second = shuffled(inst, t, "a play order after the second shuffle on")["order"]
+    expect(first != second, "a different order from a second shuffle", "the same order")
+    inst.send("stop")
+
+
 # Scenarios that start with no playlist cache, so the sync downloads every playlist.
 COLD_PLAYLISTS = {"sync_time_cold"}
 
@@ -894,6 +1016,7 @@ SCENARIOS = {
     "sync_time": ({}, sc_sync_time, False),
     "sync_time_cold": ({}, sc_sync_time, False),
     "reconnect": ({}, sc_reconnect, True),
+    "shuffle": ({}, sc_shuffle, True),
 }
 
 

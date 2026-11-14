@@ -445,6 +445,7 @@ impl CommandManager {
                     self.library.writer.pending(),
                 );
                 let mut dump = dump;
+                dump.queue = crate::harness::queue_dump(&self.queue);
                 if crate::harness::take_test_playlists_request() {
                     dump.test_playlists =
                         crate::harness::test_playlist_names(&self.library, &self.spotify)?;
@@ -517,6 +518,26 @@ impl CommandManager {
             #[cfg(feature = "harness")]
             Command::Harness(crate::command::HarnessCommand::DropSession) => {
                 self.spotify.drop_session();
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::QueueLiked(n)) => {
+                crate::harness::queue_liked(&self.queue, &self.library, *n)?;
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::QueuePlay(index)) => {
+                self.queue.play(*index, true, false);
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::QueueRemove(index)) => {
+                self.queue.remove(*index);
+                Ok(None)
+            }
+            #[cfg(feature = "harness")]
+            Command::Harness(crate::command::HarnessCommand::QueueMove(from, to)) => {
+                self.queue.shift(*from, *to);
                 Ok(None)
             }
             #[cfg(feature = "harness")]
