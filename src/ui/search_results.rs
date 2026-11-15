@@ -1,7 +1,7 @@
 use crate::application::ASYNC_RUNTIME;
 use crate::command::Command;
 use crate::commands::CommandResult;
-use crate::events::EventManager;
+use crate::events::{Event, EventManager};
 use crate::internal_api::search::Kind;
 use crate::library::Library;
 use crate::model::album::Album;
@@ -43,6 +43,14 @@ pub struct SearchResultsView {
     tabs: TabbedView,
     spotify: Spotify,
     events: EventManager,
+}
+
+/// The status bar text for a search whose first page failed. Never carries the term.
+const SEARCH_FAILED_NOTE: &str = "Search failed, try again";
+
+/// Tell the user that the first page failed, so empty tabs do not read as "no results".
+fn report_failed_search(events: &EventManager) {
+    events.send(Event::StatusNote(SEARCH_FAILED_NOTE.into()));
 }
 
 type SearchHandler<I> =
@@ -630,8 +638,11 @@ impl SearchResultsView {
                     );
                     events.trigger();
                 }
-                FirstPage::NotInUse => Self::search_web_api(&spotify, &events, tabs, &term),
-                FirstPage::Failed => events.trigger(),
+                FirstPage::NotInUse => {
+                    Self::refresh_web_token(&spotify);
+                    Self::search_web_api(&spotify, &events, tabs, &term);
+                }
+                FirstPage::Failed => report_failed_search(&events),
             }
         });
     }
@@ -688,19 +699,22 @@ impl SearchResultsView {
         );
     }
 
-    pub fn run_search(&mut self) {
-        let query = self.search_term.clone();
-
-        // check if API token refresh is necessary before commencing multiple
-        // requests to avoid deadlock, as the parallel requests might
-        // simultaneously try to refresh the token
-        self.spotify
+    /// Check if a Web API token refresh is necessary before commencing multiple requests to
+    /// avoid deadlock, as the parallel requests might simultaneously try to refresh the token.
+    /// Blocks on the refresh.
+    fn refresh_web_token(spotify: &Spotify) {
+        spotify
             .api
             .update_token()
             .map(move |h| ASYNC_RUNTIME.get().unwrap().block_on(h).ok());
+    }
+
+    pub fn run_search(&mut self) {
+        let query = self.search_term.clone();
 
         // is the query a Spotify URI?
         if let Ok(uritype) = query.parse() {
+            Self::refresh_web_token(&self.spotify);
             match uritype {
                 UriType::Track => {
                     self.lookup(Box::new(Self::get_track), &self.results_tracks, &query);
@@ -734,6 +748,7 @@ impl SearchResultsView {
         // Is the query a spotify URL?
         // https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC
         } else if let Some(url) = SpotifyUrl::from_url(&query) {
+            Self::refresh_web_token(&self.spotify);
             match url.uri_type {
                 UriType::Track => {
                     self.lookup(Box::new(Self::get_track), &self.results_tracks, &url.id);
@@ -817,6 +832,20 @@ mod tests {
         let mut rows = Vec::new();
         assert_eq!(append_new(&mut rows, vec![track("x"), track("y")]), 2);
         assert_eq!(ids(&rows), ["x", "y"]);
+    }
+
+    #[test]
+    fn a_failed_first_page_posts_a_note_without_the_term() {
+        let events = EventManager::new_for_test();
+        report_failed_search(&events);
+        let notes: Vec<String> = events
+            .msg_iter()
+            .filter_map(|event| match event {
+                Event::StatusNote(note) => Some(note),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, [SEARCH_FAILED_NOTE]);
     }
 
     #[test]
