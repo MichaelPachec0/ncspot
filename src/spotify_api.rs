@@ -268,16 +268,12 @@ impl WebApi {
 
     /// The first page of all six search tabs from the internal API (see
     /// [search_api::first_page_with]). Blocks on the network: never call it on the UI thread.
-    // Used from the search view, in a later task of the search work.
-    #[allow(dead_code)]
     pub fn search_first_page(&self, term: &str) -> FirstPage {
         search_api::first_page_with(self, self.search_hashes(), term)
     }
 
     /// The search page of `kind` at `offset` from the internal API (see
     /// [search_api::next_page_with]). Blocks on the network: never call it on the UI thread.
-    // Used from the search view, in a later task of the search work.
-    #[allow(dead_code)]
     pub fn search_next_page(&self, kind: Kind, term: &str, offset: usize) -> NextPage {
         search_api::next_page_with(self, self.search_hashes(), kind, term, offset)
     }

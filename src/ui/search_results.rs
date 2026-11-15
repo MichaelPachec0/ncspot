@@ -2,6 +2,7 @@ use crate::application::ASYNC_RUNTIME;
 use crate::command::Command;
 use crate::commands::CommandResult;
 use crate::events::EventManager;
+use crate::internal_api::search::Kind;
 use crate::library::Library;
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -10,17 +11,19 @@ use crate::model::playlist::Playlist;
 use crate::model::show::Show;
 use crate::model::track::Track;
 use crate::queue::Queue;
+use crate::search_api::{FirstPage, NextPage, Rows, TabPage};
 use crate::spotify::{Spotify, UriType};
 use crate::spotify_url::SpotifyUrl;
 use crate::traits::{ListItem, ViewExt};
 use crate::ui::listview::ListView;
-use crate::ui::pagination::Pagination;
+use crate::ui::pagination::{Pagination, Position};
 use crate::ui::tabbedview::TabbedView;
 use cursive::Cursive;
 use cursive::view::ViewWrapper;
 use parking_lot::RwLock;
 use rspotify::model::SearchType;
 use rspotify::model::search::SearchResult;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct SearchResultsView {
@@ -44,6 +47,148 @@ pub struct SearchResultsView {
 
 type SearchHandler<I> =
     Box<dyn Fn(&Spotify, &Arc<RwLock<Vec<I>>>, &str, usize, bool) -> u32 + Send + Sync>;
+
+/// A tab's model rows from the rows of an internal search page.
+trait FromRows: Sized {
+    /// `None` when `rows` hold another kind than this tab shows.
+    fn from_rows(rows: Rows) -> Option<Vec<Self>>;
+}
+
+macro_rules! from_rows {
+    ($model:ty, $variant:ident, |$row:ident| $convert:expr) => {
+        impl FromRows for $model {
+            fn from_rows(rows: Rows) -> Option<Vec<Self>> {
+                match rows {
+                    Rows::$variant(rows) => Some(rows.into_iter().map(|$row| $convert).collect()),
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+from_rows!(Track, Tracks, |row| Track::from(&row));
+from_rows!(Album, Albums, |row| Album::from(&row));
+from_rows!(Artist, Artists, |row| Artist::from(&row));
+from_rows!(Playlist, Playlists, |row| row);
+from_rows!(Show, Shows, |row| Show::from(&row));
+from_rows!(Episode, Episodes, |row| Episode::from(&row));
+
+/// What a request for the next page of a tab gave, with the rows already converted.
+pub(crate) enum NextOutcome<I> {
+    Page {
+        rows: Vec<I>,
+        next_offset: Option<usize>,
+        total: usize,
+    },
+    Failed,
+    Ended,
+}
+
+/// Append `new` to `rows`, skipping items whose `id()` is already there.
+/// Returns how many were added.
+pub(crate) fn append_new<I: ListItem + Clone>(rows: &mut Vec<I>, new: Vec<I>) -> usize {
+    let mut seen: HashSet<String> = rows.iter().filter_map(|row| row.id()).collect();
+    let before = rows.len();
+    for item in new {
+        // An item without an id cannot be matched, so it is always kept.
+        if item.id().is_none_or(|id| seen.insert(id)) {
+            rows.push(item);
+        }
+    }
+    rows.len() - before
+}
+
+/// Write the outcome of a next-page request into a tab: a page is appended and moves the
+/// position, a failure keeps the offset so the same page can be asked again, and an end stops
+/// paging at the rows shown.
+pub(crate) fn apply_next_page<I: ListItem + Clone>(
+    rows: &RwLock<Vec<I>>,
+    position: &Position,
+    page: NextOutcome<I>,
+) {
+    match page {
+        NextOutcome::Page {
+            rows: new,
+            next_offset,
+            total,
+        } => {
+            append_new(&mut rows.write(), new);
+            position.set(next_offset, total);
+        }
+        NextOutcome::Failed => {}
+        NextOutcome::Ended => {
+            let shown = rows.read().len();
+            position.set(None, shown);
+        }
+    }
+}
+
+/// The rows and paginator of one tab, cloned so a background thread can fill them.
+#[derive(Clone)]
+struct TabHandle<I: ListItem + Clone> {
+    rows: Arc<RwLock<Vec<I>>>,
+    pagination: Pagination<I>,
+}
+
+impl<I> TabHandle<I>
+where
+    I: FromRows + ListItem + Clone + Send + Sync + 'static,
+{
+    /// Show the first page of an internal search and page the rest by position. The paging
+    /// callback asks for the next page with no lock held and writes it afterwards.
+    /// A tab the answer has no page for stays empty.
+    fn fill(
+        &self,
+        page: Option<TabPage>,
+        kind: Kind,
+        term: &str,
+        spotify: &Spotify,
+        events: &EventManager,
+    ) {
+        let Some(page) = page else {
+            return;
+        };
+        *self.rows.write() = I::from_rows(page.rows).unwrap_or_default();
+
+        let rows = self.rows.clone();
+        let position = self.pagination.position();
+        let term = term.to_owned();
+        let spotify = spotify.clone();
+        let events = events.clone();
+        let callback = move |_: Arc<RwLock<Vec<I>>>| {
+            let Some(offset) = position.next_offset() else {
+                return;
+            };
+            let outcome = match spotify.api.search_next_page(kind, &term, offset) {
+                NextPage::Page(page) => match I::from_rows(page.rows) {
+                    Some(new) => NextOutcome::Page {
+                        rows: new,
+                        next_offset: page.next_offset,
+                        total: page.total,
+                    },
+                    None => NextOutcome::Failed,
+                },
+                NextPage::Failed => NextOutcome::Failed,
+                NextPage::Ended => NextOutcome::Ended,
+            };
+            apply_next_page(&rows, &position, outcome);
+            events.trigger();
+        };
+        self.pagination
+            .set_positioned(page.next_offset, page.total, Box::new(callback));
+    }
+}
+
+/// Every tab's handles, moved into the thread that runs a text search.
+struct SearchTabs {
+    tracks: TabHandle<Track>,
+    albums: TabHandle<Album>,
+    artists: TabHandle<Artist>,
+    playlists: TabHandle<Playlist>,
+    shows: TabHandle<Show>,
+    episodes: TabHandle<Episode>,
+}
 
 impl SearchResultsView {
     pub fn new(
@@ -350,19 +495,16 @@ impl SearchResultsView {
         0
     }
 
+    /// Run one search on its own thread, fill `results` and, for a search that pages, register
+    /// a paginator that asks for more rows by row count.
     fn perform_search<I: ListItem + Clone>(
-        &self,
+        spotify: Spotify,
+        events: EventManager,
         handler: SearchHandler<I>,
-        results: &Arc<RwLock<Vec<I>>>,
-        query: &str,
-        paginator: Option<&Pagination<I>>,
+        results: Arc<RwLock<Vec<I>>>,
+        query: String,
+        paginator: Option<Pagination<I>>,
     ) {
-        let spotify = self.spotify.clone();
-        let query = query.to_owned();
-        let results = results.clone();
-        let ev = self.events.clone();
-        let paginator = paginator.cloned();
-
         std::thread::spawn(move || {
             let total_items = handler(&spotify, &results, &query, 0, false) as usize;
 
@@ -370,21 +512,180 @@ impl SearchResultsView {
             if let Some(mut paginator) = paginator {
                 let loaded_items = results.read().len();
                 if total_items > loaded_items {
-                    let ev = ev.clone();
+                    let events = events.clone();
 
                     // paginator callback
                     let cb = move |items: Arc<RwLock<Vec<I>>>| {
                         let offset = items.read().len();
                         handler(&spotify, &results, &query, offset, true);
-                        ev.trigger();
+                        events.trigger();
                     };
                     paginator.set(loaded_items, total_items, Box::new(cb));
                 } else {
                     paginator.clear()
                 }
             }
-            ev.trigger();
+            events.trigger();
         });
+    }
+
+    /// `perform_search` for a single item looked up by id, which does not page.
+    fn lookup<I: ListItem + Clone>(
+        &self,
+        handler: SearchHandler<I>,
+        results: &Arc<RwLock<Vec<I>>>,
+        query: &str,
+    ) {
+        Self::perform_search(
+            self.spotify.clone(),
+            self.events.clone(),
+            handler,
+            results.clone(),
+            query.to_owned(),
+            None,
+        );
+    }
+
+    fn search_tabs(&self) -> SearchTabs {
+        SearchTabs {
+            tracks: TabHandle {
+                rows: self.results_tracks.clone(),
+                pagination: self.pagination_tracks.clone(),
+            },
+            albums: TabHandle {
+                rows: self.results_albums.clone(),
+                pagination: self.pagination_albums.clone(),
+            },
+            artists: TabHandle {
+                rows: self.results_artists.clone(),
+                pagination: self.pagination_artists.clone(),
+            },
+            playlists: TabHandle {
+                rows: self.results_playlists.clone(),
+                pagination: self.pagination_playlists.clone(),
+            },
+            shows: TabHandle {
+                rows: self.results_shows.clone(),
+                pagination: self.pagination_shows.clone(),
+            },
+            episodes: TabHandle {
+                rows: self.results_episodes.clone(),
+                pagination: self.pagination_episodes.clone(),
+            },
+        }
+    }
+
+    /// Search for `term` on a background thread: the internal API serves the first page of
+    /// every tab when it is in use, today's six Web API searches run when it is not, and the
+    /// tabs stay empty when it failed.
+    fn search_text(&self, term: String) {
+        // Taken here so the app does not look idle between the search command and the first
+        // request; dropped once the tabs are written.
+        let activity = crate::activity::ACTIVITY.begin();
+        let tabs = self.search_tabs();
+        let spotify = self.spotify.clone();
+        let events = self.events.clone();
+
+        std::thread::spawn(move || {
+            let _activity = activity;
+            match spotify.api.search_first_page(&term) {
+                FirstPage::Internal(mut pages) => {
+                    let (term, spotify, events) = (&term, &spotify, &events);
+                    tabs.tracks.fill(
+                        pages.remove(&Kind::Track),
+                        Kind::Track,
+                        term,
+                        spotify,
+                        events,
+                    );
+                    tabs.albums.fill(
+                        pages.remove(&Kind::Album),
+                        Kind::Album,
+                        term,
+                        spotify,
+                        events,
+                    );
+                    tabs.artists.fill(
+                        pages.remove(&Kind::Artist),
+                        Kind::Artist,
+                        term,
+                        spotify,
+                        events,
+                    );
+                    tabs.playlists.fill(
+                        pages.remove(&Kind::Playlist),
+                        Kind::Playlist,
+                        term,
+                        spotify,
+                        events,
+                    );
+                    tabs.shows
+                        .fill(pages.remove(&Kind::Show), Kind::Show, term, spotify, events);
+                    tabs.episodes.fill(
+                        pages.remove(&Kind::Episode),
+                        Kind::Episode,
+                        term,
+                        spotify,
+                        events,
+                    );
+                    events.trigger();
+                }
+                FirstPage::NotInUse => Self::search_web_api(&spotify, &events, tabs, &term),
+                FirstPage::Failed => events.trigger(),
+            }
+        });
+    }
+
+    /// Today's six Web API searches, one thread per tab.
+    fn search_web_api(spotify: &Spotify, events: &EventManager, tabs: SearchTabs, term: &str) {
+        Self::perform_search(
+            spotify.clone(),
+            events.clone(),
+            Box::new(Self::search_track),
+            tabs.tracks.rows,
+            term.to_owned(),
+            Some(tabs.tracks.pagination),
+        );
+        Self::perform_search(
+            spotify.clone(),
+            events.clone(),
+            Box::new(Self::search_album),
+            tabs.albums.rows,
+            term.to_owned(),
+            Some(tabs.albums.pagination),
+        );
+        Self::perform_search(
+            spotify.clone(),
+            events.clone(),
+            Box::new(Self::search_artist),
+            tabs.artists.rows,
+            term.to_owned(),
+            Some(tabs.artists.pagination),
+        );
+        Self::perform_search(
+            spotify.clone(),
+            events.clone(),
+            Box::new(Self::search_playlist),
+            tabs.playlists.rows,
+            term.to_owned(),
+            Some(tabs.playlists.pagination),
+        );
+        Self::perform_search(
+            spotify.clone(),
+            events.clone(),
+            Box::new(Self::search_show),
+            tabs.shows.rows,
+            term.to_owned(),
+            Some(tabs.shows.pagination),
+        );
+        Self::perform_search(
+            spotify.clone(),
+            events.clone(),
+            Box::new(Self::search_episode),
+            tabs.episodes.rows,
+            term.to_owned(),
+            Some(tabs.episodes.pagination),
+        );
     }
 
     pub fn run_search(&mut self) {
@@ -402,57 +703,31 @@ impl SearchResultsView {
         if let Ok(uritype) = query.parse() {
             match uritype {
                 UriType::Track => {
-                    self.perform_search(
-                        Box::new(Self::get_track),
-                        &self.results_tracks,
-                        &query,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_track), &self.results_tracks, &query);
                     self.tabs.set_selected(0);
                 }
                 UriType::Album => {
-                    self.perform_search(
-                        Box::new(Self::get_album),
-                        &self.results_albums,
-                        &query,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_album), &self.results_albums, &query);
                     self.tabs.set_selected(1);
                 }
                 UriType::Artist => {
-                    self.perform_search(
-                        Box::new(Self::get_artist),
-                        &self.results_artists,
-                        &query,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_artist), &self.results_artists, &query);
                     self.tabs.set_selected(2);
                 }
                 UriType::Playlist => {
-                    self.perform_search(
+                    self.lookup(
                         Box::new(Self::get_playlist),
                         &self.results_playlists,
                         &query,
-                        None,
                     );
                     self.tabs.set_selected(3);
                 }
                 UriType::Show => {
-                    self.perform_search(
-                        Box::new(Self::get_show),
-                        &self.results_shows,
-                        &query,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_show), &self.results_shows, &query);
                     self.tabs.set_selected(4);
                 }
                 UriType::Episode => {
-                    self.perform_search(
-                        Box::new(Self::get_episode),
-                        &self.results_episodes,
-                        &query,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_episode), &self.results_episodes, &query);
                     self.tabs.set_selected(5);
                 }
             }
@@ -461,97 +736,36 @@ impl SearchResultsView {
         } else if let Some(url) = SpotifyUrl::from_url(&query) {
             match url.uri_type {
                 UriType::Track => {
-                    self.perform_search(
-                        Box::new(Self::get_track),
-                        &self.results_tracks,
-                        &url.id,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_track), &self.results_tracks, &url.id);
                     self.tabs.set_selected(0);
                 }
                 UriType::Album => {
-                    self.perform_search(
-                        Box::new(Self::get_album),
-                        &self.results_albums,
-                        &url.id,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_album), &self.results_albums, &url.id);
                     self.tabs.set_selected(1);
                 }
                 UriType::Artist => {
-                    self.perform_search(
-                        Box::new(Self::get_artist),
-                        &self.results_artists,
-                        &url.id,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_artist), &self.results_artists, &url.id);
                     self.tabs.set_selected(2);
                 }
                 UriType::Playlist => {
-                    self.perform_search(
+                    self.lookup(
                         Box::new(Self::get_playlist),
                         &self.results_playlists,
                         &url.id,
-                        None,
                     );
                     self.tabs.set_selected(3);
                 }
                 UriType::Show => {
-                    self.perform_search(
-                        Box::new(Self::get_show),
-                        &self.results_shows,
-                        &url.id,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_show), &self.results_shows, &url.id);
                     self.tabs.set_selected(4);
                 }
                 UriType::Episode => {
-                    self.perform_search(
-                        Box::new(Self::get_episode),
-                        &self.results_episodes,
-                        &url.id,
-                        None,
-                    );
+                    self.lookup(Box::new(Self::get_episode), &self.results_episodes, &url.id);
                     self.tabs.set_selected(5);
                 }
             }
         } else {
-            self.perform_search(
-                Box::new(Self::search_track),
-                &self.results_tracks,
-                &query,
-                Some(&self.pagination_tracks),
-            );
-            self.perform_search(
-                Box::new(Self::search_album),
-                &self.results_albums,
-                &query,
-                Some(&self.pagination_albums),
-            );
-            self.perform_search(
-                Box::new(Self::search_artist),
-                &self.results_artists,
-                &query,
-                Some(&self.pagination_artists),
-            );
-            self.perform_search(
-                Box::new(Self::search_playlist),
-                &self.results_playlists,
-                &query,
-                Some(&self.pagination_playlists),
-            );
-            self.perform_search(
-                Box::new(Self::search_show),
-                &self.results_shows,
-                &query,
-                Some(&self.pagination_shows),
-            );
-            self.perform_search(
-                Box::new(Self::search_episode),
-                &self.results_episodes,
-                &query,
-                Some(&self.pagination_episodes),
-            );
+            self.search_text(query);
         }
     }
 }
@@ -561,10 +775,68 @@ impl ViewWrapper for SearchResultsView {
 }
 
 impl ViewExt for SearchResultsView {
+    #[cfg(feature = "harness")]
+    fn harness_state(&self) -> Option<crate::harness::HarnessState> {
+        let mut state = self.tabs.harness_state()?;
+        state.view = "search".into();
+        Some(state)
+    }
+
     fn title(&self) -> String {
         format!("Search: {}", self.search_term)
     }
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         self.tabs.on_command(s, cmd)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::save_log::test_items;
+    use crate::ui::pagination::Position;
+
+    fn track(id: &str) -> Track {
+        test_items::track(id, &[])
+    }
+
+    fn ids<I: ListItem>(rows: &[I]) -> Vec<String> {
+        rows.iter().filter_map(|row| row.id()).collect()
+    }
+
+    #[test]
+    fn append_skips_rows_already_shown() {
+        let mut rows = vec![track("a"), track("b")];
+        let added = append_new(&mut rows, vec![track("b"), track("c"), track("c")]);
+        assert_eq!(added, 1);
+        assert_eq!(ids(&rows), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn append_to_an_empty_list_keeps_order() {
+        let mut rows = Vec::new();
+        assert_eq!(append_new(&mut rows, vec![track("x"), track("y")]), 2);
+        assert_eq!(ids(&rows), ["x", "y"]);
+    }
+
+    #[test]
+    fn a_failed_page_keeps_the_offset_and_an_ended_one_stops() {
+        let rows = RwLock::new(vec![track("a")]);
+        let pos = Position::default();
+        pos.set(Some(50), 180);
+        apply_next_page(&rows, &pos, NextOutcome::<Track>::Failed);
+        assert_eq!(pos.next_offset(), Some(50));
+        apply_next_page(
+            &rows,
+            &pos,
+            NextOutcome::Page {
+                rows: vec![track("a"), track("b")],
+                next_offset: Some(100),
+                total: 171,
+            },
+        );
+        assert_eq!((rows.read().len(), pos.next_offset()), (2, Some(100)));
+        apply_next_page(&rows, &pos, NextOutcome::<Track>::Ended);
+        assert_eq!(pos.next_offset(), None);
     }
 }
