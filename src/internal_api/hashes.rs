@@ -499,7 +499,7 @@ mod tests {
 
     #[test]
     fn a_refused_request_marks_nothing() {
-        let (s, saved) = store(None, None);
+        let (s, saved) = store([], []);
         let mut calls = 0;
         let got: Result<u8, _> = rotate(
             &s,
