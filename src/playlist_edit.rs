@@ -690,7 +690,9 @@ pub fn remove_after_web(playlist: &mut Playlist, index: usize, uri: &str) {
         .as_mut()
         .is_some_and(|tracks| remove_server_item(tracks, index, uri));
     playlist.num_tracks = playlist.tracks.as_ref().map_or(0, Vec::len);
-    playlist.tracks_unknown = false;
+    if playlist.tracks.is_some() {
+        playlist.tracks_unknown = false;
+    }
     let ordered = playlist.tracks.as_deref().is_some_and(in_server_order);
     if !removed || !ordered {
         playlist.snapshot_id.clear();
@@ -2336,6 +2338,17 @@ mod tests {
         remove_after_web(&mut reloaded, 1, "spotify:track:gone");
         assert_eq!(reloaded.num_tracks, 3);
         assert_eq!(reloaded.snapshot_id, "");
+    }
+
+    #[test]
+    fn a_web_remove_on_an_unloaded_copy_keeps_its_count_unknown() {
+        let mut found = Playlist {
+            tracks: None,
+            tracks_unknown: true,
+            ..local("", 0)
+        };
+        remove_after_web(&mut found, 0, "spotify:track:0");
+        assert!(found.tracks_unknown);
     }
 
     #[test]

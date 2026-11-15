@@ -52,22 +52,38 @@ impl Playlist {
             return true;
         }
 
-        self.tracks = self.load_all_tracks(spotify);
-        if self.tracks.is_some() {
-            self.tracks_unknown = false;
+        let loaded = self.load_all_tracks(spotify);
+        self.store_loaded(loaded)
+    }
+
+    /// Keep the tracks of a load (`None` = it failed, nothing changes) and the snapshot they
+    /// were read at. A copy without a snapshot (a search row, a cleared copy) takes the load's,
+    /// so it is not reloaded on every later use; a copy with one keeps it. Returns true if the
+    /// tracks are loaded.
+    fn store_loaded(&mut self, loaded: Option<(Vec<Playable>, String)>) -> bool {
+        let Some((tracks, snapshot_id)) = loaded else {
+            return false;
+        };
+        if self.snapshot_id.is_empty() {
+            self.snapshot_id = snapshot_id;
         }
-        self.tracks.is_some()
+        self.tracks = Some(tracks);
+        self.tracks_unknown = false;
+        true
     }
 
     /// The internal API first when the playlists area is usable, then the Web API per the
-    /// fallback classes (rate limits and transient errors fail without a Web call).
-    fn load_all_tracks(&self, spotify: &Spotify) -> Option<Vec<Playable>> {
+    /// fallback classes (rate limits and transient errors fail without a Web call). With the
+    /// tracks comes the snapshot they were read at: the internal read gives the revision of its
+    /// head (empty when the head carried none), the Web read gives none (empty).
+    fn load_all_tracks(&self, spotify: &Spotify) -> Option<(Vec<Playable>, String)> {
         let api = &spotify.api;
         let skip = !api.internal_usable(Area::Playlists);
         run_with_fallback(
             skip,
             || {
-                api.playlist_playables(&self.id, &HashMap::new())
+                api.playlist_playables_at(&self.id, &HashMap::new())
+                    .map(|(head, tracks)| (tracks, head.snapshot_id))
                     .inspect_err(|err| {
                         if decide_after(err) == Action::Fail {
                             warn!("Could not load a playlist ({})", err.class());
@@ -79,6 +95,7 @@ impl Playlist {
                     api.count_fallback(Area::Playlists);
                 }
                 self.get_all_tracks(spotify)
+                    .map(|tracks| (tracks, String::new()))
             },
             |err| api.latch_area(Area::Playlists, err),
         )
@@ -391,8 +408,11 @@ impl From<&FullPlaylist> for Playlist {
 
 impl ListItem for Playlist {
     fn merge_loaded(&mut self, loaded: Self) {
-        if self.tracks.is_none() && self.snapshot_id == loaded.snapshot_id {
+        // A row without a snapshot (a search row) takes the one its tracks were read at.
+        let same_version = self.snapshot_id.is_empty() || self.snapshot_id == loaded.snapshot_id;
+        if self.tracks.is_none() && same_version && loaded.tracks.is_some() {
             self.tracks = loaded.tracks;
+            self.snapshot_id = loaded.snapshot_id;
             self.tracks_unknown = false;
         }
     }
@@ -595,5 +615,69 @@ mod tests {
         p.merge_loaded(loaded);
         assert!(!p.tracks_unknown);
         assert_eq!(p.count_text(), "   0 tracks");
+    }
+
+    #[test]
+    fn a_failed_load_written_back_keeps_the_count_unknown() {
+        let mut p = unknown();
+        p.merge_loaded(unknown());
+        assert!(p.tracks_unknown && p.tracks.is_none());
+        assert_eq!(p.count_text().trim(), "");
+    }
+
+    #[test]
+    fn a_search_row_takes_the_snapshot_of_its_loaded_tracks() {
+        let mut p = unknown();
+        let loaded = Playlist {
+            snapshot_id: "s1".into(),
+            tracks: Some(Vec::new()),
+            tracks_unknown: false,
+            ..unknown()
+        };
+        p.merge_loaded(loaded);
+        assert_eq!(p.snapshot_id, "s1");
+        assert!(p.tracks.is_some() && !p.tracks_unknown);
+    }
+
+    #[test]
+    fn a_row_refreshed_to_another_snapshot_drops_the_load() {
+        let mut p = Playlist {
+            snapshot_id: "s2".into(),
+            ..unknown()
+        };
+        let loaded = Playlist {
+            snapshot_id: "s1".into(),
+            tracks: Some(Vec::new()),
+            ..unknown()
+        };
+        p.merge_loaded(loaded);
+        assert_eq!(p.snapshot_id, "s2");
+        assert!(p.tracks.is_none());
+    }
+
+    #[test]
+    fn a_load_clears_the_unknown_count_and_sets_a_missing_snapshot() {
+        let mut p = unknown();
+        assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
+        assert!(!p.tracks_unknown && p.tracks.is_some());
+        assert_eq!(p.snapshot_id, "s1");
+        assert_eq!(p.count_text(), "   0 tracks");
+    }
+
+    #[test]
+    fn a_load_keeps_a_known_snapshot() {
+        let mut p = Playlist {
+            snapshot_id: "s0".into(),
+            ..unknown()
+        };
+        assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
+        assert_eq!(p.snapshot_id, "s0");
+    }
+
+    #[test]
+    fn a_failed_load_leaves_the_row_unknown() {
+        let mut p = unknown();
+        assert!(!p.store_loaded(None));
+        assert!(p.tracks_unknown && p.tracks.is_none() && p.snapshot_id.is_empty());
     }
 }
