@@ -294,6 +294,9 @@ pub fn rotate<T>(
     mut send: impl FnMut(&str) -> Result<Outcome, InternalError>,
     mut read: impl FnMut(&serde_json::Value) -> Option<T>,
 ) -> Result<T, RotateError> {
+    if store.is_retired(op) {
+        return Err(RotateError::Retired);
+    }
     for hash in store.candidates(op) {
         match send(&hash) {
             Ok(Outcome::Answer(answer)) => {
