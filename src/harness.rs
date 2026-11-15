@@ -1,5 +1,3 @@
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
 //! Drive harness (feature `harness`): IPC commands that open a view by URI and write a JSON
 //! snapshot of the current view, so a script can drive ncspot and check what it shows.
 
@@ -15,7 +13,6 @@ use serde::Serialize;
 
 use crate::activity::ACTIVITY;
 use crate::command::ShiftMode;
-use crate::ext_traits::RwLockExt;
 use crate::internal_api::{Area, AreaCounts};
 use crate::library::Library;
 use crate::model::album::Album;
@@ -101,6 +98,7 @@ pub struct Dump {
     pub playlists: PlaylistCounts,
     pub player: PlayerState,
     pub session: SessionState,
+    pub queue: QueueDump,
     /// Names of the recorded test playlists, in file order; filled only in the first dump after
     /// `harness test-playlists`, empty otherwise.
     pub test_playlists: Vec<String>,
@@ -125,6 +123,58 @@ pub struct PlaylistCounts {
     pub sync_ms: Option<u64>,
     /// How long the last full library sync took, all sets; `None` before one ended.
     pub library_sync_ms: Option<u64>,
+}
+
+/// The play queue as numbers only: no ids, uris or names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct QueueDump {
+    pub len: usize,
+    /// How many different songs the queue holds.
+    pub distinct: usize,
+    /// Queue index of the current song.
+    pub current: Option<usize>,
+    /// The saved shuffle setting.
+    pub shuffle: bool,
+    /// The play order as queue indices; `None` when not shuffled.
+    pub order: Option<Vec<usize>>,
+}
+
+/// Snapshot the queue for a dump.
+pub fn queue_dump(queue: &Queue) -> QueueDump {
+    let snap = queue.snapshot();
+    let distinct: std::collections::HashSet<String> =
+        snap.queue.iter().map(Playable::uri).collect();
+    QueueDump {
+        len: snap.queue.len(),
+        distinct: distinct.len(),
+        current: snap.current_track,
+        shuffle: queue.get_shuffle(),
+        order: snap.random_order,
+    }
+}
+
+/// Replace the queue with `n` playable liked songs picked at random, a new pick on every
+/// call. Nothing is played. Fails, leaving the queue alone, when there are fewer than `n`.
+pub fn queue_liked(queue: &Queue, library: &Library, n: usize) -> Result<(), String> {
+    let picked: Vec<Playable> = {
+        let tracks = library.tracks.read();
+        let playable: Vec<&Track> = tracks.iter().filter(|t| t.is_playable()).collect();
+        if playable.len() < n {
+            return Err(format!(
+                "harness queue-liked: {} playable liked songs, need {n}",
+                playable.len()
+            ));
+        }
+        rand::seq::index::sample(&mut rand::rng(), playable.len(), n)
+            .into_iter()
+            .map(|i| Playable::Track(playable[i].clone()))
+            .collect()
+    };
+    queue.clear();
+    for track in picked {
+        queue.append(track);
+    }
+    Ok(())
 }
 
 /// What the player is doing.
@@ -202,6 +252,8 @@ pub fn build_dump(
             valid: spotify.session_valid(),
             reconnects: spotify.reconnects(),
         },
+        // Filled by the caller from [queue_dump], like `test_playlists`.
+        queue: QueueDump::default(),
         test_playlists: Vec::new(),
     }
 }
@@ -255,7 +307,7 @@ fn last_test_playlist(library: &Library, verb: &str) -> Result<Playlist, String>
         .ok_or_else(|| format!("harness {verb}: no recorded test playlist"))?;
     library
         .playlists
-        .read_unpoisoned()
+        .read()
         .iter()
         .find(|p| p.id == id)
         .cloned()
@@ -390,7 +442,7 @@ pub fn test_playlist_names(library: &Library, spotify: &Spotify) -> Result<Vec<S
             };
             let stored = library
                 .playlists
-                .read_unpoisoned()
+                .read()
                 .iter()
                 .find(|p| p.id == id)
                 .map(|p| p.name.clone());
@@ -459,16 +511,10 @@ pub fn unfollow_recorded(library: &Library, spotify: &Spotify, n: usize) -> Resu
         })?;
     let id =
         recorded_id(uri).ok_or("harness unfollow-recorded: the recorded line is not a playlist")?;
-    if !*library.is_done.read_unpoisoned() {
+    if !*library.is_done.read() {
         return Err("harness unfollow-recorded: the library is still syncing".into());
     }
-    let stored = |library: &Library| {
-        library
-            .playlists
-            .read_unpoisoned()
-            .iter()
-            .any(|p| p.id == id)
-    };
+    let stored = |library: &Library| library.playlists.read().iter().any(|p| p.id == id);
     let was_stored = stored(library);
     let mut still_stored = false;
     let mut listing = RootlistState::Unknown;
@@ -848,6 +894,13 @@ mod tests {
                 valid: true,
                 reconnects: 1,
             },
+            queue: QueueDump {
+                len: 3,
+                distinct: 3,
+                current: Some(1),
+                shuffle: true,
+                order: Some(vec![1, 2, 0]),
+            },
             test_playlists: Vec::new(),
         }
     }
@@ -857,7 +910,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"pending_writes":0,"item_write":null,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8,"last_test_len":3,"last_test_order":"ABC","last_test_renamed":false,"sync_ms":60000,"library_sync_ms":61000},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"test_playlists":[]}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"pending_writes":0,"item_write":null,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8,"last_test_len":3,"last_test_order":"ABC","last_test_renamed":false,"sync_ms":60000,"library_sync_ms":61000},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"queue":{"len":3,"distinct":3,"current":1,"shuffle":true,"order":[1,2,0]},"test_playlists":[]}"#
         );
     }
 
@@ -910,6 +963,7 @@ mod tests {
             0,
         );
         let second = build_dump("x".into(), None, None, &spotify, false, counts.clone(), 0);
+        assert_eq!(first.queue, QueueDump::default());
         assert!(!first.session.valid);
         assert_eq!(first.session.reconnects, 0);
         assert_eq!(first.player.status, "stopped");
@@ -921,5 +975,92 @@ mod tests {
         assert!(first.tabs.is_empty());
         assert_eq!(first.web, WebCalls::default());
         assert!(!first.throttled.shared && !first.throttled.personal && !first.throttled.internal);
+    }
+
+    fn liked(id: u32, playable: bool) -> Track {
+        Track {
+            id: Some(format!("id_{id}")),
+            uri: format!("spotify:track:id_{id}"),
+            title: format!("Track {id}"),
+            track_number: id,
+            disc_number: 1,
+            duration: 180_000,
+            artists: vec!["Artist".to_string()],
+            artist_ids: vec![],
+            album: Some("Album".to_string()),
+            album_id: None,
+            album_artists: vec![],
+            cover_url: None,
+            url: String::new(),
+            added_at: None,
+            list_index: 0,
+            is_local: false,
+            is_playable: Some(playable),
+        }
+    }
+
+    /// A queue and a library whose liked songs are ids `0..n`, the odd ones unplayable.
+    fn queue_and_liked(n: u32) -> (Queue, Arc<Library>) {
+        let cfg = crate::config::Config::new_for_test();
+        let ev = crate::events::EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify.clone(), cfg.clone());
+        *library.tracks.write() = (0..n).map(|id| liked(id, id.is_multiple_of(2))).collect();
+        (Queue::new(spotify, cfg, library.clone()), library)
+    }
+
+    #[test]
+    fn queue_liked_fills_the_queue_with_different_playable_liked_songs() {
+        let (queue, library) = queue_and_liked(60);
+        queue.append(Playable::Track(liked(999, true)));
+        queue_liked(&queue, &library, 20).unwrap();
+        let dump = queue_dump(&queue);
+        assert_eq!((dump.len, dump.distinct), (20, 20));
+        assert_eq!((dump.current, dump.order), (None, None));
+        let uris: Vec<String> = queue.list().read().iter().map(Playable::uri).collect();
+        assert!(uris.iter().all(|uri| {
+            let id: u32 = uri.rsplit('_').next().unwrap().parse().unwrap();
+            id < 60 && id.is_multiple_of(2)
+        }));
+    }
+
+    /// 30 playable songs, 10 picked: two picks agreeing by chance is far below one in a billion.
+    #[test]
+    fn queue_liked_picks_anew_on_every_call() {
+        let (queue, library) = queue_and_liked(60);
+        let mut picks = Vec::new();
+        for _ in 0..3 {
+            queue_liked(&queue, &library, 10).unwrap();
+            picks.push(
+                queue
+                    .list()
+                    .read()
+                    .iter()
+                    .map(Playable::uri)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert!(picks[0] != picks[1] || picks[1] != picks[2]);
+    }
+
+    #[test]
+    fn queue_liked_with_too_few_songs_leaves_the_queue_alone() {
+        let (queue, library) = queue_and_liked(10);
+        queue.append(Playable::Track(liked(999, true)));
+        let err = queue_liked(&queue, &library, 6).unwrap_err();
+        assert_eq!(err, "harness queue-liked: 5 playable liked songs, need 6");
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn queue_dump_reports_the_order_as_indices() {
+        let (queue, library) = queue_and_liked(20);
+        queue_liked(&queue, &library, 5).unwrap();
+        queue.set_shuffle(true);
+        let dump = queue_dump(&queue);
+        assert!(dump.shuffle);
+        let mut order = dump.order.unwrap();
+        order.sort_unstable();
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
     }
 }

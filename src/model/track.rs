@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::config;
 use crate::utils::ms_to_hms;
@@ -337,6 +338,10 @@ impl ListItem for Track {
     #[inline]
     fn is_playable(&self) -> bool {
         self.is_playable == Some(true)
+    }
+
+    fn id(&self) -> Option<String> {
+        self.id.clone()
     }
 
     fn as_listitem(&self) -> Box<dyn ListItem> {

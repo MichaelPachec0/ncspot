@@ -1,7 +1,6 @@
 //! Playlist writes off the UI thread. The UI thread applies a job to the stored copy at once
 //! ([apply_local]) and queues it; one worker runs the queue in issue order against the copy
 //! Spotify last confirmed, so the store always shows the confirmed copy plus the queued jobs.
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::{HashMap, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};

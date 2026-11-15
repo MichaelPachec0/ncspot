@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use log::debug;
 
-use crate::utils;
+use crate::utils::{self, OnDrop};
 
 /// Minimum pause after each cover download.
 pub const COVER_PREFETCH_SPACING: Duration = Duration::from_millis(100);
@@ -31,19 +31,32 @@ pub fn missing_covers(urls: &[String], exists: impl Fn(&Path) -> bool) -> Vec<St
 /// after each. Failures are logged without the URL and skipped. Does nothing while a previous
 /// prefetch is still running.
 pub fn spawn_prefetch(urls: Vec<String>) {
-    if urls.is_empty() || RUNNING.swap(true, Ordering::AcqRel) {
-        return;
+    spawn_prefetch_on(&RUNNING, urls, |url| {
+        let path = utils::cache_path_for_url(url.clone());
+        if let Err(e) = utils::download(url, path) {
+            debug!("cover prefetch download failed: {:?}", e.kind());
+        }
+    });
+}
+
+/// [spawn_prefetch] with the running flag and the per-URL `fetch` given. The flag is cleared
+/// when the thread ends, also if `fetch` panics.
+fn spawn_prefetch_on(
+    running: &'static AtomicBool,
+    urls: Vec<String>,
+    fetch: impl Fn(String) + Send + 'static,
+) -> Option<thread::JoinHandle<()>> {
+    if urls.is_empty() || running.swap(true, Ordering::AcqRel) {
+        return None;
     }
-    thread::spawn(move || {
+    let guard = OnDrop::new(move || running.store(false, Ordering::Release));
+    Some(thread::spawn(move || {
+        let _guard = guard;
         for url in urls {
-            let path = utils::cache_path_for_url(url.clone());
-            if let Err(e) = utils::download(url, path) {
-                debug!("cover prefetch download failed: {:?}", e.kind());
-            }
+            fetch(url);
             thread::sleep(COVER_PREFETCH_SPACING);
         }
-        RUNNING.store(false, Ordering::Release);
-    });
+    }))
 }
 
 #[cfg(test)]
@@ -63,5 +76,17 @@ mod tests {
         .into();
         let missing = missing_covers(&urls, |p| have.contains(p));
         assert_eq!(missing, vec!["https://x/b", "https://x/a"]);
+    }
+
+    #[test]
+    fn a_panicking_prefetch_frees_the_slot() {
+        static TEST_RUNNING: AtomicBool = AtomicBool::new(false);
+        let handle =
+            spawn_prefetch_on(&TEST_RUNNING, vec!["u".into()], |_| panic!("boom")).unwrap();
+        assert!(handle.join().is_err());
+        assert!(!TEST_RUNNING.load(Ordering::SeqCst));
+        let again = spawn_prefetch_on(&TEST_RUNNING, vec!["u".into()], |_| ());
+        assert!(again.is_some());
+        again.unwrap().join().unwrap();
     }
 }

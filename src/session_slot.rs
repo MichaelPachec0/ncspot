@@ -1,7 +1,8 @@
 //! The session handle the internal API reads, plus whether the worker is reconnecting.
 
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct SessionSlot<T> {
@@ -21,12 +22,12 @@ impl<T> SessionSlot<T> {
 
     /// The session went invalid: callers get no session until [Self::restored].
     pub fn lost(&self) {
-        *self.slot.write().unwrap() = None;
+        *self.slot.write() = None;
         self.reconnecting.store(true, Ordering::Relaxed);
     }
 
     pub fn restored(&self, value: T) {
-        *self.slot.write().unwrap() = Some(value);
+        *self.slot.write() = Some(value);
         self.reconnecting.store(false, Ordering::Relaxed);
         self.reconnects.fetch_add(1, Ordering::Relaxed);
     }
@@ -51,16 +52,17 @@ impl<T> SessionSlot<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, RwLock};
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     #[test]
     fn lost_clears_the_slot_and_restored_fills_it() {
         let slot = SessionSlot::new(Arc::new(RwLock::new(Some(1u32))));
         slot.lost();
-        assert_eq!(*slot.slot.read().unwrap(), None);
+        assert_eq!(*slot.slot.read(), None);
         assert!(slot.is_reconnecting());
         slot.restored(2);
-        assert_eq!(*slot.slot.read().unwrap(), Some(2));
+        assert_eq!(*slot.slot.read(), Some(2));
         assert!(!slot.is_reconnecting());
         assert_eq!(slot.reconnects(), 1);
     }
@@ -70,7 +72,7 @@ mod tests {
         let slot = SessionSlot::new(Arc::new(RwLock::new(Some(1u32))));
         slot.lost();
         slot.lost();
-        assert_eq!(*slot.slot.read().unwrap(), None);
+        assert_eq!(*slot.slot.read(), None);
         assert_eq!(slot.reconnects(), 0);
     }
 
@@ -80,7 +82,7 @@ mod tests {
         slot.lost();
         slot.reset();
         assert!(!slot.is_reconnecting());
-        assert_eq!(*slot.slot.read().unwrap(), None);
+        assert_eq!(*slot.slot.read(), None);
     }
 
     #[test]

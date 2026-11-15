@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use cursive::theme::{ColorStyle, ColorType, PaletteColor};
 use cursive::{Cursive, Printer, Vec2, View};
@@ -19,6 +20,23 @@ use crate::queue::Queue;
 use crate::traits::{IntoBoxedViewExt, ListItem, ViewExt};
 use crate::ui::album::AlbumView;
 use crate::ui::artist::ArtistView;
+use crate::utils::OnDrop;
+
+/// Run `fetch` on a background thread; the caller has already put `url` in `loading`. The url
+/// is taken out again when the thread ends, also if `fetch` panics, so it can be loaded again.
+fn spawn_download(
+    loading: Arc<RwLock<HashSet<String>>>,
+    url: String,
+    fetch: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    let guard = OnDrop::new(move || {
+        loading.write().remove(&url);
+    });
+    std::thread::spawn(move || {
+        let _guard = guard;
+        fetch();
+    })
+}
 
 pub struct CoverView {
     queue: Arc<Queue>,
@@ -80,7 +98,7 @@ impl CoverView {
         draw_offset.x += (draw_size.x - size.x) / 2;
         draw_offset.y += (draw_size.y - size.y) - (draw_size.y - size.y) / 2;
 
-        let mut desired_cover = self.desired_cover.write().unwrap();
+        let mut desired_cover = self.desired_cover.write();
         *desired_cover = Some(CoverRequest {
             url,
             path,
@@ -90,7 +108,7 @@ impl CoverView {
     }
 
     fn clear_cover(&self) {
-        let mut desired_cover = self.desired_cover.write().unwrap();
+        let mut desired_cover = self.desired_cover.write();
         *desired_cover = None;
     }
 
@@ -116,32 +134,32 @@ impl CoverView {
     fn cache_path(&self, url: String) -> Option<PathBuf> {
         let path = crate::utils::cache_path_for_url(url.clone());
 
-        let mut loading = self.loading.write().unwrap();
-        if loading.contains(&url) {
-            return None;
+        {
+            let mut loading = self.loading.write();
+            if loading.contains(&url) {
+                return None;
+            }
+
+            if path.exists() {
+                return Some(path);
+            }
+
+            loading.insert(url.clone());
         }
 
-        if path.exists() {
-            return Some(path);
-        }
-
-        loading.insert(url.clone());
-
-        let loading_thread = self.loading.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = crate::utils::download(url.clone(), path.clone()) {
+        let download_url = url.clone();
+        spawn_download(self.loading.clone(), url, move || {
+            if let Err(e) = crate::utils::download(download_url, path) {
                 error!("Failed to download cover: {e}");
             }
-            let mut loading = loading_thread.write().unwrap();
-            loading.remove(&url.clone());
         });
 
         None
     }
 
     pub fn render_to_terminal(&self) {
-        let desired_cover = self.desired_cover.read().unwrap().clone();
-        let mut rendered_cover = self.rendered_cover.write().unwrap();
+        let desired_cover = self.desired_cover.read().clone();
+        let mut rendered_cover = self.rendered_cover.write();
 
         if *rendered_cover == desired_cover {
             return;
@@ -290,5 +308,21 @@ impl ViewExt for CoverView {
         };
 
         Ok(CommandResult::Ignored)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_panicking_download_leaves_the_url_loadable() {
+        let loading = Arc::new(RwLock::new(HashSet::from(["u".to_string()])));
+        assert!(
+            spawn_download(loading.clone(), "u".into(), || panic!("boom"))
+                .join()
+                .is_err()
+        );
+        assert!(loading.read().is_empty());
     }
 }

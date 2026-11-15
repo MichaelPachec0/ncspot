@@ -36,7 +36,7 @@ impl Show {
         if episodes_result.failed() {
             return;
         }
-        let episodes = episodes_result.items.read().unwrap().clone();
+        let episodes = episodes_result.items.read().clone();
         self.episodes = Some(episodes);
     }
 }
@@ -76,6 +76,12 @@ impl fmt::Display for Show {
 }
 
 impl ListItem for Show {
+    fn merge_loaded(&mut self, loaded: Self) {
+        if self.episodes.is_none() {
+            self.episodes = loaded.episodes;
+        }
+    }
+
     fn is_playing(&self, _queue: &Queue) -> bool {
         false
     }
@@ -162,6 +168,10 @@ impl ListItem for Show {
     #[inline]
     fn is_playable(&self) -> bool {
         true
+    }
+
+    fn id(&self) -> Option<String> {
+        Some(self.id.clone())
     }
 
     fn as_listitem(&self) -> Box<dyn ListItem> {

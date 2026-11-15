@@ -278,6 +278,14 @@ pub enum HarnessCommand {
     PlaylistRenameTest,
     /// Shut the playback session down so the worker has to reconnect.
     DropSession,
+    /// Replace the queue with n liked songs picked at random; nothing is played.
+    QueueLiked(usize),
+    /// Play the queue entry at an index, as Enter does in the queue view.
+    QueuePlay(usize),
+    /// Remove the queue entry at an index.
+    QueueRemove(usize),
+    /// Move the queue entry at an index to another index.
+    QueueMove(usize, usize),
     /// Write a JSON snapshot of the current view to a file.
     Dump(String),
 }
@@ -414,6 +422,22 @@ impl fmt::Display for Command {
             }
             #[cfg(feature = "harness")]
             Self::Harness(HarnessCommand::DropSession) => vec!["drop-session".into()],
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::QueueLiked(n)) => {
+                vec!["queue-liked".into(), n.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::QueuePlay(index)) => {
+                vec!["queue-play".into(), index.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::QueueRemove(index)) => {
+                vec!["queue-remove".into(), index.to_string()]
+            }
+            #[cfg(feature = "harness")]
+            Self::Harness(HarnessCommand::QueueMove(from, to)) => {
+                vec!["queue-move".into(), from.to_string(), to.to_string()]
+            }
             Self::Goto(mode) => vec![mode.to_string()],
             Self::Move(mode, amount) => match (mode, amount) {
                 (MoveMode::Playing, _) => vec!["playing".to_string()],
@@ -1192,6 +1216,28 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                     (Some("playlist-rename-test"), []) => {
                         Ok(Command::Harness(HarnessCommand::PlaylistRenameTest))
                     }
+                    (Some(sub @ ("queue-liked" | "queue-play" | "queue-remove")), [n]) => n
+                        .parse()
+                        .map(|n| {
+                            Command::Harness(match sub {
+                                "queue-liked" => HarnessCommand::QueueLiked(n),
+                                "queue-play" => HarnessCommand::QueuePlay(n),
+                                _ => HarnessCommand::QueueRemove(n),
+                            })
+                        })
+                        .map_err(|_| E::InsufficientArgs {
+                            cmd: format!("{command} {sub}"),
+                            hint: Some("a number".into()),
+                        }),
+                    (Some("queue-move"), [from, to]) => match (from.parse(), to.parse()) {
+                        (Ok(from), Ok(to)) => {
+                            Ok(Command::Harness(HarnessCommand::QueueMove(from, to)))
+                        }
+                        _ => Err(E::InsufficientArgs {
+                            cmd: format!("{command} queue-move"),
+                            hint: Some("two indices".into()),
+                        }),
+                    },
                     (Some("save"), [target]) => Ok(Command::Harness(HarnessCommand::Save(
                         (*target).to_string(),
                     ))),
@@ -1208,7 +1254,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                         Some(
                             sub @ ("open" | "dump" | "save" | "unsave" | "unfollow-recorded"
                             | "playlist-add-test" | "playlist-remove-test"
-                            | "playlist-overwrite-test" | "playlist-move-test"),
+                            | "playlist-overwrite-test" | "playlist-move-test"
+                            | "queue-liked" | "queue-play" | "queue-remove" | "queue-move"),
                         ),
                         _,
                     ) => {
@@ -1219,6 +1266,8 @@ pub fn parse(input: &str) -> Result<Vec<Command>, CommandParseError> {
                                     "dump" => "a file path",
                                     "unfollow-recorded" => "a recorded playlist number",
                                     "playlist-move-test" => "an index and a signed count",
+                                    "queue-move" => "two indices",
+                                    "queue-liked" | "queue-play" | "queue-remove" => "a number",
                                     "playlist-add-test" | "playlist-remove-test"
                                     | "playlist-overwrite-test" => "a number",
                                     _ => "a Spotify URI or URL",
@@ -1319,6 +1368,10 @@ mod tests {
                 HarnessCommand::OpenLibrary(Some("episodes".into())),
             ),
             ("harness drop-session", HarnessCommand::DropSession),
+            ("harness queue-liked 30", HarnessCommand::QueueLiked(30)),
+            ("harness queue-play 4", HarnessCommand::QueuePlay(4)),
+            ("harness queue-remove 2", HarnessCommand::QueueRemove(2)),
+            ("harness queue-move 5 0", HarnessCommand::QueueMove(5, 0)),
             ("harness newplaylist-test", HarnessCommand::NewPlaylistTest),
             ("harness test-playlists", HarnessCommand::TestPlaylists),
             (
@@ -1359,6 +1412,9 @@ mod tests {
         assert!(parse("harness playlist-add-test").is_err());
         assert!(parse("harness playlist-remove-test x").is_err());
         assert!(parse("harness playlist-overwrite-test -1").is_err());
+        assert!(parse("harness queue-liked").is_err());
+        assert!(parse("harness queue-play x").is_err());
+        assert!(parse("harness queue-move 1").is_err());
     }
 
     #[cfg(feature = "harness")]

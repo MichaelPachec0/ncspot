@@ -547,5 +547,134 @@ class WaitWhileAnsweringTest(unittest.TestCase):
             drive.Instance.wait_library(self.Fake([self.busy]), 0)
 
 
+
+
+class FakeQueue:
+    """A queue that follows ncspot's shuffle rules, driven by the scenario's commands."""
+
+    def __init__(self, follow_order=True, reshuffle=True):
+        self.len = 0
+        self.current = None
+        self.shuffle = False
+        self.order = None
+        self.error = None
+        self.follow_order = follow_order
+        self.reshuffle = reshuffle
+        self.sent = []
+        self.seed = 0
+
+    def new_order(self):
+        self.seed += 1 if self.reshuffle else 0
+        rest = [i for i in range(self.len) if i != self.current]
+        k = (self.seed * 7) % max(len(rest), 1)
+        rest = rest[k:][::-1] + rest[:k]
+        self.order = ([] if self.current is None else [self.current]) + rest
+
+    def wait_library(self, timeout):
+        return self.dump()
+
+    def send(self, line):
+        self.sent.append(line)
+        w = line.split()
+        if w[0] == "harness":
+            w = w[1:]
+        num = [int(x) for x in w[1:] if x.isdigit()]
+        if w[0] == "shuffle":
+            self.shuffle = w[1] == "on"
+            if self.shuffle:
+                self.new_order()
+            else:
+                self.order = None
+        elif w[0] == "queue-liked":
+            self.len, self.current = num[0], None
+            self.order = [] if self.shuffle else None
+        elif w[0] == "queue-play":
+            self.current = num[0]
+            if self.shuffle:
+                self.new_order()
+        elif w[0] in ("next", "previous"):
+            step = 1 if w[0] == "next" else -1
+            if self.order is not None and self.follow_order:
+                self.current = self.order[self.order.index(self.current) + step]
+            else:
+                self.current += step
+        elif w[0] == "queue-remove":
+            self.len -= 1
+            self.current = num[0] if num[0] < self.len else None
+            if self.shuffle:
+                self.new_order()
+        elif w[0] == "queue-move":
+            src, dst = num
+
+            def remap(v):
+                if v == src:
+                    return dst
+                if src < dst and src < v <= dst:
+                    return v - 1
+                if src > dst and dst <= v < src:
+                    return v + 1
+                return v
+
+            self.current = remap(self.current)
+            if self.order is not None:
+                self.order = [remap(v) for v in self.order]
+
+    def dump(self):
+        return {
+            "error": self.error,
+            "player": {"status": "playing"},
+            "queue": {
+                "len": self.len,
+                "distinct": self.len,
+                "current": self.current,
+                "shuffle": self.shuffle,
+                "order": self.order,
+            },
+        }
+
+
+class ShuffleScenarioTest(unittest.TestCase):
+    @staticmethod
+    def run_with(**kwargs):
+        inst = FakeQueue(**kwargs)
+        args = type("Args", (), {"settle_timeout": 0.0})()
+        drive.sc_shuffle(inst, args)
+        return inst.sent
+
+    def test_a_queue_that_follows_the_rules_passes(self):
+        sent = self.run_with()
+        self.assertEqual(sent[2], f"harness queue-liked {drive.SHUFFLE_SONGS}")
+        self.assertEqual(sent.count("next"), drive.SHUFFLE_STEPS + 1)
+        self.assertEqual(sent[-1], "stop")
+
+    def test_next_down_the_list_while_shuffled_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(follow_order=False)
+
+    def test_the_same_order_from_every_shuffle_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(reshuffle=False)
+
+    def test_a_harness_error_fails_with_its_text(self):
+        inst = FakeQueue()
+        inst.error = "harness queue-liked: 5 playable liked songs, need 30"
+        args = type("Args", (), {"settle_timeout": 0.0})()
+        with self.assertRaisesRegex(drive.Fail, "need 30"):
+            drive.sc_shuffle(inst, args)
+
+    def test_order_problem_names_each_broken_shape(self):
+        ok = {"len": 3, "current": 1, "shuffle": True, "order": [1, 2, 0]}
+        self.assertIsNone(drive.order_problem(ok))
+        self.assertIsNone(drive.order_problem({**ok, "current": None}))
+        for broken in (
+            {**ok, "shuffle": False},
+            {**ok, "order": None},
+            {**ok, "order": [1, 2]},
+            {**ok, "order": [1, 1, 0]},
+            {**ok, "order": [0, 1, 2]},
+        ):
+            self.assertIsNotNone(drive.order_problem(broken), broken)
+
+
 if __name__ == "__main__":
     unittest.main()

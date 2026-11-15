@@ -7,7 +7,7 @@ use cursive::view::{IntoBoxedView, Selector, ViewNotFound, ViewWrapper};
 use cursive::views::{EditView, NamedView, ViewRef};
 use cursive::{Cursive, Printer, Vec2};
 use std::cell::RefCell;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 
 use crate::command::{Command, MoveMode};
 use crate::commands::CommandResult;

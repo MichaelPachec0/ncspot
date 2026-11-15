@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use cursive::Cursive;
 use cursive::event::{Event, EventResult, Key, MouseButton, MouseEvent};
@@ -14,6 +15,7 @@ use crate::lyrics::model::{Lyrics, LyricsState, TrackMeta};
 use crate::lyrics::{FetchOutcome, LyricsManager};
 use crate::queue::Queue;
 use crate::traits::{ListItem, ViewExt};
+use crate::utils::OnDrop;
 
 /// How a single rendered line should be styled.
 enum RowStyle {
@@ -134,14 +136,14 @@ impl LyricsView {
         };
         let key = Self::track_key(&meta);
 
-        if self.fetched_for.read().unwrap().as_deref() == Some(key.as_str()) {
+        if self.fetched_for.read().as_deref() == Some(key.as_str()) {
             return;
         }
 
-        *self.fetched_for.write().unwrap() = Some(key.clone());
-        *self.cursor_line.write().unwrap() = None;
-        *self.offset_ms.write().unwrap() = 0;
-        *self.state.write().unwrap() = LyricsState::Loading {
+        *self.fetched_for.write() = Some(key.clone());
+        *self.cursor_line.write() = None;
+        *self.offset_ms.write() = 0;
+        *self.state.write() = LyricsState::Loading {
             track_id: key.clone(),
         };
 
@@ -149,8 +151,10 @@ impl LyricsView {
         let cfg = self.cfg.clone();
         let events = self.events.clone();
         let state = self.state.clone();
+        let guard = loading_guard(state.clone(), key.clone(), events.clone());
 
         std::thread::spawn(move || {
+            let _guard = guard;
             let order = cfg
                 .values()
                 .lyrics
@@ -172,7 +176,7 @@ impl LyricsView {
                 },
             };
 
-            let mut guard = state.write().unwrap();
+            let mut guard = state.write();
             // Only apply if the user hasn't moved on to a different track.
             let still_current = matches!(
                 &*guard,
@@ -193,13 +197,13 @@ impl LyricsView {
     /// Current playback position in ms with the manual sync offset applied.
     fn position_ms(&self) -> i64 {
         let progress = self.queue.get_spotify().get_current_progress().as_millis() as i64;
-        progress + *self.offset_ms.read().unwrap()
+        progress + *self.offset_ms.read()
     }
 
     /// Move the selection cursor by `delta` lines, seeding from the active line.
     fn move_cursor_by(&self, delta: i64) {
         let (len, active) = {
-            let guard = self.state.read().unwrap();
+            let guard = self.state.read();
             match &*guard {
                 LyricsState::Loaded { lyrics, .. } => {
                     let active = if lyrics.synced {
@@ -212,8 +216,8 @@ impl LyricsView {
                 _ => (0, None),
             }
         };
-        let current = *self.cursor_line.read().unwrap();
-        *self.cursor_line.write().unwrap() = move_cursor(current, active, len, delta);
+        let current = *self.cursor_line.read();
+        *self.cursor_line.write() = move_cursor(current, active, len, delta);
     }
 
     /// Seek to line `line_idx`'s timestamp (offset-adjusted), then resume
@@ -221,31 +225,30 @@ impl LyricsView {
     /// without a timestamp.
     fn seek_to_line(&self, line_idx: usize) {
         let target = {
-            let guard = self.state.read().unwrap();
+            let guard = self.state.read();
             match &*guard {
                 LyricsState::Loaded { lyrics, .. } if lyrics.synced => lyrics
                     .lines
                     .get(line_idx)
                     .and_then(|l| l.start_ms)
-                    .map(|start| seek_target_ms(start, *self.offset_ms.read().unwrap())),
+                    .map(|start| seek_target_ms(start, *self.offset_ms.read())),
                 _ => None,
             }
         };
         if let Some(ms) = target {
             self.queue.get_spotify().seek(ms);
-            *self.cursor_line.write().unwrap() = None;
+            *self.cursor_line.write() = None;
         }
     }
 
     /// Seek to the selected line, or the active playing line if no cursor is set.
     fn seek_to_selected(&self) {
         let line = {
-            let guard = self.state.read().unwrap();
+            let guard = self.state.read();
             match &*guard {
                 LyricsState::Loaded { lyrics, .. } if lyrics.synced => self
                     .cursor_line
                     .read()
-                    .unwrap()
                     .or_else(|| lyrics.active_index(self.position_ms().max(0) as u32)),
                 _ => None,
             }
@@ -258,7 +261,7 @@ impl LyricsView {
     /// Handle a left-click at view-relative row `rel_y`: seek to the clicked line.
     fn handle_click(&self, rel_y: usize) {
         let line = {
-            let layout = self.last_layout.read().unwrap();
+            let layout = self.last_layout.read();
             row_at(rel_y, layout.top, &layout.row_line)
         };
         if let Some(i) = line {
@@ -267,20 +270,20 @@ impl LyricsView {
     }
 
     fn adjust_offset(&self, delta_ms: i64) {
-        *self.offset_ms.write().unwrap() += delta_ms;
+        *self.offset_ms.write() += delta_ms;
     }
 
     /// Force a re-evaluation on the next draw (used by refetch/provider cycle).
     fn force_refetch(&self) {
-        *self.fetched_for.write().unwrap() = None;
-        *self.cursor_line.write().unwrap() = None;
-        *self.state.write().unwrap() = LyricsState::Idle;
+        *self.fetched_for.write() = None;
+        *self.cursor_line.write() = None;
+        *self.state.write() = LyricsState::Idle;
     }
 
     #[cfg(feature = "share_clipboard")]
     fn copy_line(&self) {
         let line = {
-            let guard = self.state.read().unwrap();
+            let guard = self.state.read();
             match &*guard {
                 LyricsState::Loaded { lyrics, .. } => lyrics
                     .active_index(self.position_ms().max(0) as u32)
@@ -300,7 +303,7 @@ impl LyricsView {
     #[cfg(feature = "share_clipboard")]
     fn copy_all(&self) {
         let all = {
-            let guard = self.state.read().unwrap();
+            let guard = self.state.read();
             match &*guard {
                 LyricsState::Loaded { lyrics, .. } => Some(
                     lyrics
@@ -352,7 +355,7 @@ impl LyricsView {
         // Flatten the lyrics into rendered rows so translation/romanization
         // lines participate in scrolling and centering, tracking which line
         // each row belongs to for click hit-testing.
-        let cursor = *self.cursor_line.read().unwrap();
+        let cursor = *self.cursor_line.read();
         let mut rows: Vec<(&str, RowStyle)> = Vec::new();
         let mut row_line: Vec<Option<usize>> = Vec::new();
         let mut active_row: Option<usize> = None;
@@ -393,7 +396,7 @@ impl LyricsView {
                 .unwrap_or(0),
         };
 
-        *self.last_layout.write().unwrap() = LineLayout { top, row_line };
+        *self.last_layout.write() = LineLayout { top, row_line };
 
         let highlight = ColorStyle::new(
             ColorType::Color(*printer.theme.palette.custom("lyrics_highlight").unwrap()),
@@ -436,7 +439,7 @@ impl View for LyricsView {
         self.ensure_fetch();
 
         let lyrics_cfg = self.cfg.values().lyrics.clone().unwrap_or_default();
-        let guard = self.state.read().unwrap();
+        let guard = self.state.read();
         match &*guard {
             LyricsState::Loaded { lyrics, .. } => self.draw_lyrics(printer, lyrics, &lyrics_cfg),
             LyricsState::Loading { .. } => self.draw_status(printer, "Loading…"),
@@ -491,8 +494,8 @@ impl View for LyricsView {
             }
             // Clear the selection (resume auto-follow) only when one is set, so
             // an unselected Esc still falls through to the global handler.
-            Event::Key(Key::Esc) if self.cursor_line.read().unwrap().is_some() => {
-                *self.cursor_line.write().unwrap() = None;
+            Event::Key(Key::Esc) if self.cursor_line.read().is_some() => {
+                *self.cursor_line.write() = None;
                 EventResult::Consumed(None)
             }
             Event::Char('[') if allow_offset => {
@@ -604,6 +607,32 @@ impl ViewExt for LyricsView {
     }
 }
 
+/// When dropped, also while a panicking fetch thread unwinds, turns a `Loading` state for
+/// `key` that is still current into an error, so the view does not show "Loading" forever.
+/// A finished or newer state is left alone.
+fn loading_guard(
+    state: Arc<RwLock<LyricsState>>,
+    key: String,
+    events: EventManager,
+) -> OnDrop<impl FnOnce()> {
+    OnDrop::new(move || {
+        let stuck = {
+            let mut guard = state.write();
+            let stuck = matches!(&*guard, LyricsState::Loading { track_id } if *track_id == key);
+            if stuck {
+                *guard = LyricsState::Error {
+                    track_id: key,
+                    message: "lyrics fetch failed".to_string(),
+                };
+            }
+            stuck
+        };
+        if stuck {
+            events.trigger();
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,5 +666,55 @@ mod tests {
         assert_eq!(move_cursor(Some(0), None, 10, -1), Some(0)); // clamp low
         assert_eq!(move_cursor(Some(9), None, 10, 1), Some(9)); // clamp high
         assert_eq!(move_cursor(Some(0), None, 0, 1), None); // empty list
+    }
+
+    fn guard_state(state: LyricsState) -> Arc<RwLock<LyricsState>> {
+        Arc::new(RwLock::new(state))
+    }
+
+    #[test]
+    fn loading_guard_turns_a_stuck_loading_into_an_error() {
+        let state = guard_state(LyricsState::Loading {
+            track_id: "k".into(),
+        });
+        drop(loading_guard(
+            state.clone(),
+            "k".into(),
+            EventManager::new_for_test(),
+        ));
+        match &*state.read() {
+            LyricsState::Error { track_id, message } => {
+                assert_eq!(track_id, "k");
+                assert_eq!(message, "lyrics fetch failed");
+            }
+            _ => panic!("expected an error state"),
+        }
+    }
+
+    #[test]
+    fn loading_guard_leaves_a_finished_or_newer_state_alone() {
+        let state = guard_state(LyricsState::Loading {
+            track_id: "other".into(),
+        });
+        drop(loading_guard(
+            state.clone(),
+            "k".into(),
+            EventManager::new_for_test(),
+        ));
+        assert!(matches!(
+            &*state.read(),
+            LyricsState::Loading { track_id } if track_id == "other"
+        ));
+
+        let state = guard_state(LyricsState::NotFound {
+            track_id: "k".into(),
+            tried: vec![],
+        });
+        drop(loading_guard(
+            state.clone(),
+            "k".into(),
+            EventManager::new_for_test(),
+        ));
+        assert!(matches!(&*state.read(), LyricsState::NotFound { .. }));
     }
 }

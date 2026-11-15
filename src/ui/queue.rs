@@ -8,7 +8,6 @@ use std::sync::Arc;
 
 use crate::command::{Command, MoveMode, ShiftMode};
 use crate::commands::CommandResult;
-use crate::ext_traits::RwLockExt;
 use crate::library::Library;
 use crate::model::playable::Playable;
 use crate::queue::Queue;
@@ -26,7 +25,7 @@ pub struct QueueView {
 
 impl QueueView {
     pub fn new(queue: Arc<Queue>, library: Arc<Library>) -> Self {
-        let list = ListView::new(queue.queue.clone(), queue.clone(), library.clone());
+        let list = ListView::new(queue.list(), queue.clone(), library.clone());
 
         Self {
             list,
@@ -41,7 +40,7 @@ impl QueueView {
         library: Arc<Library>,
         id: Option<String>,
     ) {
-        let tracks = queue.queue.read().unwrap().clone();
+        let tracks = queue.list().read().clone();
         match id {
             Some(id) => {
                 library.queue_overwrite(&id, &tracks);
@@ -70,7 +69,7 @@ impl QueueView {
         let mut list_select: SelectView<Option<String>> = SelectView::new().autojump();
         list_select.add_item("[Create new]", None);
 
-        for list in library.playlists.read_unpoisoned().iter() {
+        for list in library.playlists.read().iter() {
             list_select.add_item(list.name.clone(), Some(list.id.clone()));
         }
 
@@ -114,14 +113,8 @@ impl ViewExt for QueueView {
 
     fn title_sub(&self) -> String {
         let track_count = self.queue.len();
-        let duration_secs: u64 = self
-            .queue
-            .queue
-            .read()
-            .unwrap()
-            .iter()
-            .map(|p| p.duration() as u64 / 1000)
-            .sum();
+        let list = self.queue.list();
+        let duration_secs: u64 = list.read().iter().map(|p| p.duration() as u64 / 1000).sum();
 
         if duration_secs > 0 {
             let duration = std::time::Duration::from_secs(duration_secs);

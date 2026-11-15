@@ -18,7 +18,6 @@ use zbus::zvariant::ObjectPath;
 
 use crate::application::ASYNC_RUNTIME;
 use crate::events::EventManager;
-use crate::ext_traits::RwLockExt;
 use crate::library::Library;
 use crate::queue::Queue;
 use crate::spotify::Spotify;
@@ -187,11 +186,7 @@ impl MprisManager {
                 Some(MprisCommand::EmitTrackAdded { id, after_id }) => {
                     let tl_ctx = tracklist_iface_ref.signal_emitter();
                     let tl = tracklist_iface_ref.get().await;
-                    let playable = tl
-                        .queue
-                        .index_for_id(id)
-                        .and_then(|index| tl.queue.queue.read().unwrap().get(index).cloned());
-                    if let Some(p) = playable {
+                    if let Some(p) = tl.queue.playable_for_id(id) {
                         let spotify = tl.spotify.clone();
                         let library = tl.library.clone();
                         let md = tokio::task::spawn_blocking(move || {
@@ -212,25 +207,16 @@ impl MprisManager {
                 Some(MprisCommand::EmitTrackMetadataChanged(id)) => {
                     let tl_ctx = tracklist_iface_ref.signal_emitter();
                     let tl = tracklist_iface_ref.get().await;
-                    if let Some(index) = tl.queue.index_for_id(id) {
-                        // Separate the lock read from the await to avoid holding
-                        // a RwLockReadGuard across an await point.
-                        let p = tl.queue.queue.read().unwrap().get(index).cloned();
-                        if let Some(p) = p {
-                            let spotify = tl.spotify.clone();
-                            let library = tl.library.clone();
-                            let md = tokio::task::spawn_blocking(move || {
-                                build_metadata(Some(&p), track_path_for_id(id), &spotify, &library)
-                            })
-                            .await
-                            .unwrap_or_default();
-                            MprisTrackList::track_metadata_changed(
-                                tl_ctx,
-                                track_path_for_id(id),
-                                md,
-                            )
+                    if let Some(p) = tl.queue.playable_for_id(id) {
+                        let spotify = tl.spotify.clone();
+                        let library = tl.library.clone();
+                        let md = tokio::task::spawn_blocking(move || {
+                            build_metadata(Some(&p), track_path_for_id(id), &spotify, &library)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        MprisTrackList::track_metadata_changed(tl_ctx, track_path_for_id(id), md)
                             .await?;
-                        }
                     }
                 }
                 Some(MprisCommand::EmitPlaylistChanged(id)) => {
@@ -239,7 +225,7 @@ impl MprisManager {
                     match id {
                         Some(id) => {
                             let tuple = {
-                                let guard = pl.library.playlists.read_unpoisoned();
+                                let guard = pl.library.playlists.read();
                                 guard.iter().find(|p| p.id == id).map(|p| {
                                     (
                                         playlists::playlist_path_for_id(&p.id),

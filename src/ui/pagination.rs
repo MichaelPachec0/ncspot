@@ -1,9 +1,10 @@
-use crate::ext_traits::RwLockExt;
 use crate::library::Library;
 use crate::traits::ListItem;
+use crate::utils::OnDrop;
 use log::debug;
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 pub struct ApiPage<I> {
     pub offset: u32,
@@ -30,7 +31,7 @@ impl<I: ListItem + Clone> ApiResult<I> {
                 first_page.items.len(),
                 first_page.total
             );
-            items.write().unwrap().extend(first_page.items);
+            items.write().extend(first_page.items);
             Self {
                 offset: Arc::new(RwLock::new(first_page.offset)),
                 limit,
@@ -57,7 +58,7 @@ impl<I: ListItem + Clone> ApiResult<I> {
     }
 
     fn offset(&self) -> u32 {
-        *self.offset.read().unwrap()
+        *self.offset.read()
     }
 
     pub fn at_end(&self) -> bool {
@@ -66,7 +67,7 @@ impl<I: ListItem + Clone> ApiResult<I> {
 
     pub fn apply_pagination(self, pagination: &Pagination<I>) {
         let total = self.total as usize;
-        let fetched_items = self.items.read().unwrap().len();
+        let fetched_items = self.items.read().len();
         pagination.set(
             fetched_items,
             total,
@@ -90,8 +91,8 @@ impl<I: ListItem + Clone> ApiResult<I> {
         debug!("fetching next page at offset {offset}");
         if !self.at_end() {
             if let Some(next_page) = (self.fetch_page)(offset) {
-                *self.offset.write().unwrap() = next_page.offset;
-                self.items.write().unwrap().extend(next_page.items.clone());
+                *self.offset.write() = next_page.offset;
+                self.items.write().extend(next_page.items.clone());
                 Some(next_page.items)
             } else {
                 self.failed.store(true, Ordering::SeqCst);
@@ -119,9 +120,9 @@ pub fn fill_in_background<I, F, R>(
 {
     std::thread::spawn(move || {
         let result = fetch();
-        let first_page = result.items.read_unpoisoned().clone();
+        let first_page = result.items.read().clone();
         let loaded = {
-            let mut content = content.write_unpoisoned();
+            let mut content = content.write();
             content.extend(first_page);
             content.len()
         };
@@ -130,7 +131,7 @@ pub fn fill_in_background<I, F, R>(
             result.total as usize,
             Box::new(move |content| {
                 if let Some(items) = result.next() {
-                    content.write_unpoisoned().extend(items);
+                    content.write().extend(items);
                 }
             }),
         );
@@ -152,7 +153,7 @@ pub struct Pagination<I: ListItem> {
     loaded_content: Arc<RwLock<usize>>,
     max_content: Arc<RwLock<Option<usize>>>,
     callback: Arc<RwLock<Option<Paginator<I>>>>,
-    busy: Arc<RwLock<bool>>,
+    busy: Arc<AtomicBool>,
 }
 
 impl<I: ListItem> Default for Pagination<I> {
@@ -161,50 +162,60 @@ impl<I: ListItem> Default for Pagination<I> {
             loaded_content: Arc::new(RwLock::new(0)),
             max_content: Arc::new(RwLock::new(None)),
             callback: Arc::new(RwLock::new(None)),
-            busy: Arc::new(RwLock::new(false)),
+            busy: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 impl<I: ListItem + Clone> Pagination<I> {
     pub fn clear(&mut self) {
-        *self.max_content.write().unwrap() = None;
-        *self.callback.write().unwrap() = None;
+        *self.max_content.write() = None;
+        *self.callback.write() = None;
     }
     pub fn set(&self, loaded_content: usize, max_content: usize, callback: Paginator<I>) {
-        *self.loaded_content.write().unwrap() = loaded_content;
-        *self.max_content.write().unwrap() = Some(max_content);
-        *self.callback.write().unwrap() = Some(callback);
+        *self.loaded_content.write() = loaded_content;
+        *self.max_content.write() = Some(max_content);
+        *self.callback.write() = Some(callback);
     }
 
     pub fn loaded_content(&self) -> usize {
-        *self.loaded_content.read().unwrap()
+        *self.loaded_content.read()
     }
 
     pub fn max_content(&self) -> Option<usize> {
-        *self.max_content.read().unwrap()
+        *self.max_content.read()
     }
 
+    #[cfg(any(test, feature = "harness"))]
     pub(crate) fn is_busy(&self) -> bool {
-        *self.busy.read().unwrap()
+        self.busy.load(Ordering::SeqCst)
     }
 
     pub fn call(&self, content: &Arc<RwLock<Vec<I>>>, library: Arc<Library>) {
+        if self.busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let pagination = self.clone();
         let content = content.clone();
-        if !self.is_busy() {
-            *self.busy.write().unwrap() = true;
-            std::thread::spawn(move || {
-                let cb = pagination.callback.read().unwrap();
-                if let Some(ref cb) = *cb {
-                    debug!("calling paginator!");
-                    cb(content.clone());
-                    *pagination.loaded_content.write().unwrap() = content.read().unwrap().len();
-                    *pagination.busy.write().unwrap() = false;
-                    library.trigger_redraw();
-                }
-            });
-        }
+        // Created here and moved into the thread, so `busy` is cleared and the length
+        // refreshed whether the paginator returns or panics.
+        let guard = OnDrop::new({
+            let pagination = pagination.clone();
+            let content = content.clone();
+            move || {
+                *pagination.loaded_content.write() = content.read().len();
+                pagination.busy.store(false, Ordering::SeqCst);
+                library.trigger_redraw();
+            }
+        });
+        std::thread::spawn(move || {
+            let _guard = guard;
+            let cb = pagination.callback.read();
+            if let Some(ref cb) = *cb {
+                debug!("calling paginator!");
+                cb(content.clone());
+            }
+        });
     }
 }
 
@@ -253,7 +264,7 @@ mod test {
     fn failed_first_page_marks_the_result_failed() {
         let result = ApiResult::new(1, always_failing(Arc::new(AtomicUsize::new(0))));
         assert!(result.failed());
-        assert!(result.items.read().unwrap().is_empty());
+        assert!(result.items.read().is_empty());
     }
 
     #[test]
@@ -272,7 +283,7 @@ mod test {
             assert!(result.next().is_some());
         }
         assert!(!result.failed());
-        assert_eq!(result.items.read().unwrap().len(), 3);
+        assert_eq!(result.items.read().len(), 3);
     }
 
     #[test]
@@ -318,18 +329,79 @@ mod test {
         );
 
         // The first page is still held back, so nothing is loaded yet.
-        assert!(content.read().unwrap().is_empty());
+        assert!(content.read().is_empty());
         assert_eq!(pagination.max_content(), None);
 
         release.send(()).unwrap();
         redraw_seen.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert_eq!(content.read().unwrap().len(), 1);
+        assert_eq!(content.read().len(), 1);
         assert_eq!(pagination.loaded_content(), 1);
         assert_eq!(pagination.max_content(), Some(3));
 
         // The paginator appends later pages to the view's own list.
-        let callback = pagination.callback.read().unwrap();
+        let callback = pagination.callback.read();
         callback.as_ref().unwrap()(content.clone());
-        assert_eq!(content.read().unwrap().len(), 2);
+        assert_eq!(content.read().len(), 2);
+    }
+
+    fn test_library() -> Arc<Library> {
+        let cfg = crate::config::Config::new_for_test();
+        let ev = crate::events::EventManager::new_for_test();
+        let spotify = crate::spotify::Spotify::new_for_test(cfg.clone(), ev.clone());
+        Library::new_for_test(ev, spotify, cfg)
+    }
+
+    fn wait_not_busy(pagination: &Pagination<Playlist>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pagination.is_busy() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "busy was never cleared"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn call_clears_busy_when_the_paginator_panics() {
+        let pagination: Pagination<Playlist> = Pagination::default();
+        pagination.set(0, 3, Box::new(|_| panic!("boom")));
+        let content = Arc::new(RwLock::new(vec![item("a"), item("b")]));
+        pagination.call(&content, test_library());
+        wait_not_busy(&pagination);
+        assert_eq!(pagination.loaded_content(), 2);
+    }
+
+    #[test]
+    fn call_clears_busy_without_a_callback() {
+        let pagination: Pagination<Playlist> = Pagination::default();
+        let content = Arc::new(RwLock::new(vec![item("a")]));
+        pagination.call(&content, test_library());
+        wait_not_busy(&pagination);
+    }
+
+    #[test]
+    fn a_second_call_while_busy_starts_nothing() {
+        let pagination: Pagination<Playlist> = Pagination::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = parking_lot::Mutex::new(wait);
+        let counted = calls.clone();
+        pagination.set(
+            0,
+            3,
+            Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let _ = wait.lock().recv_timeout(std::time::Duration::from_secs(5));
+            }),
+        );
+        let content = Arc::new(RwLock::new(vec![item("a")]));
+        let library = test_library();
+        pagination.call(&content, library.clone());
+        assert!(pagination.is_busy());
+        pagination.call(&content, library);
+        release.send(()).unwrap();
+        wait_not_busy(&pagination);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

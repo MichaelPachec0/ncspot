@@ -14,8 +14,9 @@ impl MprisRoot {
         false
     }
 
+    /// Exported as `HasTrackList`, the name in the MPRIS specification.
     #[zbus(property)]
-    fn has_tracklist(&self) -> bool {
+    fn has_track_list(&self) -> bool {
         true
     }
 
@@ -37,4 +38,22 @@ impl MprisRoot {
     fn raise(&self) {}
 
     fn quit(&self) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use zbus::object_server::Interface;
+
+    use super::MprisRoot;
+
+    #[test]
+    fn has_track_list_is_exported_under_its_mpris_name() {
+        let mut xml = String::new();
+        MprisRoot {}.introspect_to_writer(&mut xml, 0);
+        assert!(
+            xml.contains(r#"<property name="HasTrackList" type="b""#),
+            "{xml}"
+        );
+        assert!(!xml.contains("HasTracklist"), "{xml}");
+    }
 }

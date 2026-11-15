@@ -64,6 +64,22 @@ pub trait ListItem: Sync + Send + 'static {
         false
     }
 
+    /// The Spotify id, used to tell whether a list slot still holds this item.
+    /// `None` never matches.
+    fn id(&self) -> Option<String> {
+        None
+    }
+
+    /// Take over what a play or queue action loaded into `loaded` (tracks, episodes), a copy
+    /// of this item made before the action ran. Everything else stays as it is in `self`,
+    /// which a library sync may have refreshed since the copy was made. Items that load
+    /// nothing keep this default.
+    fn merge_loaded(&mut self, _loaded: Self)
+    where
+        Self: Sized,
+    {
+    }
+
     fn as_listitem(&self) -> Box<dyn ListItem>;
 }
 

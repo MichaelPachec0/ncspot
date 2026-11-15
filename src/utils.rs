@@ -141,10 +141,40 @@ fn xdg_runtime_directory() -> Option<PathBuf> {
     std::env::var("XDG_RUNTIME_DIR").ok().map(Into::into)
 }
 
+/// Runs a closure when dropped, including while a panic unwinds.
+///
+/// The closure must not panic (a panic while unwinding aborts the process), and it must not
+/// take a lock its creator may still hold when the guard drops.
+#[must_use = "the guard runs its closure when dropped"]
+pub struct OnDrop<F: FnOnce()>(Option<F>);
+
+impl<F: FnOnce()> OnDrop<F> {
+    pub fn new(f: F) -> Self {
+        Self(Some(f))
+    }
+
+    /// Drop the guard without running its closure.
+    pub fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl<F: FnOnce()> Drop for OnDrop<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("ncspot-utils-{}-{name}", std::process::id()));
@@ -183,5 +213,31 @@ mod tests {
         assert!(!path.exists(), "a failed download is not cached");
         assert!(!part_path(&path).exists(), "the part file is removed");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn on_drop_runs_on_normal_drop() {
+        let hit = AtomicBool::new(false);
+        drop(OnDrop::new(|| hit.store(true, Ordering::SeqCst)));
+        assert!(hit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn on_drop_runs_while_unwinding() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let seen = hit.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = OnDrop::new(move || seen.store(true, Ordering::SeqCst));
+            panic!("boom");
+        });
+        assert!(result.is_err());
+        assert!(hit.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn disarmed_on_drop_does_not_run() {
+        let hit = AtomicBool::new(false);
+        OnDrop::new(|| hit.store(true, Ordering::SeqCst)).disarm();
+        assert!(!hit.load(Ordering::SeqCst));
     }
 }

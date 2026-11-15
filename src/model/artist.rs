@@ -1,5 +1,6 @@
+use parking_lot::RwLock;
 use std::fmt;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rspotify::model::Id;
 use rspotify::model::artist::{FullArtist, SimplifiedArtist};
@@ -78,15 +79,15 @@ impl fmt::Debug for Artist {
 }
 
 impl ListItem for Artist {
+    fn merge_loaded(&mut self, loaded: Self) {
+        if self.tracks.is_none() {
+            self.tracks = loaded.tracks;
+        }
+    }
+
     fn is_playing(&self, queue: &Queue) -> bool {
         if let Some(tracks) = &self.tracks {
-            let playing: Vec<String> = queue
-                .queue
-                .read()
-                .unwrap()
-                .iter()
-                .filter_map(|t| t.id())
-                .collect();
+            let playing: Vec<String> = queue.list().read().iter().filter_map(|t| t.id()).collect();
             let ids: Vec<String> = tracks.iter().filter_map(|t| t.id.clone()).collect();
             !ids.is_empty() && playing == ids
         } else {
@@ -211,6 +212,10 @@ impl ListItem for Artist {
     #[inline]
     fn is_playable(&self) -> bool {
         true
+    }
+
+    fn id(&self) -> Option<String> {
+        self.id.clone()
     }
 
     fn as_listitem(&self) -> Box<dyn ListItem> {

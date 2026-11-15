@@ -2,7 +2,8 @@
 //! paths the views use and check that metadata stays on the internal API. Run with
 //! `cargo test probe -- --ignored`. They never print credentials, tokens or the username.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use librespot_core::{Session, SessionConfig, cache::Cache};
 use rspotify::model::AlbumType;
@@ -81,7 +82,6 @@ fn probe_a_long_album_pages_to_its_total() {
         let candidates: Vec<String> = albums
             .items
             .read()
-            .unwrap()
             .iter()
             .filter_map(|a| a.id.clone())
             .take(20)
@@ -128,7 +128,7 @@ fn probe_artist_albums_and_top_tracks() {
         let albums = api.artist_albums(ARTIST, Some(AlbumType::Album));
         albums.fetch_all();
         assert!(!albums.failed());
-        assert_eq!(albums.items.read().unwrap().len(), albums.total as usize);
+        assert_eq!(albums.items.read().len(), albums.total as usize);
         assert!(albums.total > 0);
         let top = api.artist_top_tracks(ARTIST).unwrap();
         assert!(!top.is_empty());
@@ -146,7 +146,7 @@ fn probe_show_episodes_page_to_the_end() {
         assert!(!episodes.failed());
         // Episodes Spotify pulled (status 451) are skipped, so the loaded count may trail the total
         // by a few; it must never exceed it.
-        let loaded = episodes.items.read().unwrap().len();
+        let loaded = episodes.items.read().len();
         assert!(loaded <= episodes.total as usize);
         assert!(
             loaded * 100 >= episodes.total as usize * 99,

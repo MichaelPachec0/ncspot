@@ -1,8 +1,7 @@
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
-
+use parking_lot::RwLock;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use cursive::Cursive;
 use cursive::event::{Event, EventResult, MouseButton, MouseEvent};
@@ -11,7 +10,6 @@ use cursive::views::Dialog;
 
 use crate::command::{Command, TargetMode};
 use crate::commands::CommandResult;
-use crate::ext_traits::RwLockExt;
 use crate::internal_api::Area;
 use crate::library::Library;
 use crate::playlist_layout::{PlaylistRow, rows};
@@ -52,9 +50,9 @@ impl PlaylistsView {
     /// Rebuild the rows when the store or the layout in use changed. The layout is used only
     /// while the internal API playlists area is usable; otherwise the list is flat.
     fn refresh_rows(&mut self) {
-        let playlists = self.library.playlists.read_unpoisoned();
+        let playlists = self.library.playlists.read();
         let usable = self.spotify.api.internal_usable(Area::Playlists);
-        let layout = self.library.playlist_layout.read_unpoisoned();
+        let layout = self.library.playlist_layout.read();
         let layout: &[_] = if usable { &layout } else { &[] };
         let mut hasher = DefaultHasher::new();
         playlists.len().hash(&mut hasher);
@@ -66,16 +64,14 @@ impl PlaylistsView {
         layout.hash(&mut hasher);
         let fingerprint = hasher.finish();
         if self.fingerprint != Some(fingerprint) {
-            *self.rows.write_unpoisoned() = rows(&playlists, layout, &self.library.playlists);
+            *self.rows.write() = rows(&playlists, layout, &self.library.playlists);
             self.fingerprint = Some(fingerprint);
         }
     }
 
     fn selected_is_header(&self) -> bool {
         matches!(
-            self.rows
-                .read_unpoisoned()
-                .get(self.list.get_selected_index()),
+            self.rows.read().get(self.list.get_selected_index()),
             Some(PlaylistRow::Header { .. })
         )
     }
@@ -83,7 +79,7 @@ impl PlaylistsView {
     pub fn delete_dialog(&mut self) -> Option<Modal<Dialog>> {
         let id = self
             .rows
-            .read_unpoisoned()
+            .read()
             .get(self.list.get_selected_index())
             .and_then(PlaylistRow::playlist_id)
             .map(str::to_string)?;
@@ -102,7 +98,7 @@ impl PlaylistsView {
     /// The id of the playlist on the selected row; None on a header or folder row.
     fn selected_playlist_id(&self) -> Option<String> {
         self.rows
-            .read_unpoisoned()
+            .read()
             .get(self.list.get_selected_index())
             .and_then(PlaylistRow::playlist_id)
             .map(str::to_string)

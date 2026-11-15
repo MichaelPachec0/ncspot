@@ -18,9 +18,10 @@ use crate::ui::pagination::Pagination;
 use crate::ui::tabbedview::TabbedView;
 use cursive::Cursive;
 use cursive::view::ViewWrapper;
+use parking_lot::RwLock;
 use rspotify::model::SearchType;
 use rspotify::model::search::SearchResult;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 pub struct SearchResultsView {
     search_term: String,
@@ -112,7 +113,7 @@ impl SearchResultsView {
     ) -> u32 {
         if let Ok(results) = spotify.api.track(query) {
             let t = vec![(&results).into()];
-            let mut r = tracks.write().unwrap();
+            let mut r = tracks.write();
             *r = t;
             return 1;
         }
@@ -132,7 +133,7 @@ impl SearchResultsView {
                 .search(SearchType::Track, query, 50, offset as u32)
         {
             let mut t = results.items.iter().map(|ft| ft.into()).collect();
-            let mut r = tracks.write().unwrap();
+            let mut r = tracks.write();
 
             if append {
                 r.append(&mut t);
@@ -153,7 +154,7 @@ impl SearchResultsView {
     ) -> u32 {
         if let Ok(results) = spotify.api.album(query) {
             let a = vec![(&results).into()];
-            let mut r = albums.write().unwrap();
+            let mut r = albums.write();
             *r = a;
             return 1;
         }
@@ -173,7 +174,7 @@ impl SearchResultsView {
                 .search(SearchType::Album, query, 50, offset as u32)
         {
             let mut a = results.items.iter().map(|sa| sa.into()).collect();
-            let mut r = albums.write().unwrap();
+            let mut r = albums.write();
 
             if append {
                 r.append(&mut a);
@@ -194,7 +195,7 @@ impl SearchResultsView {
     ) -> u32 {
         if let Ok(results) = spotify.api.artist(query) {
             let a = vec![(&results).into()];
-            let mut r = artists.write().unwrap();
+            let mut r = artists.write();
             *r = a;
             return 1;
         }
@@ -214,7 +215,7 @@ impl SearchResultsView {
                 .search(SearchType::Artist, query, 50, offset as u32)
         {
             let mut a = results.items.iter().map(|fa| fa.into()).collect();
-            let mut r = artists.write().unwrap();
+            let mut r = artists.write();
 
             if append {
                 r.append(&mut a);
@@ -235,7 +236,7 @@ impl SearchResultsView {
     ) -> u32 {
         if let Ok(result) = spotify.api.playlist(query).as_ref() {
             let pls = vec![result.into()];
-            let mut r = playlists.write().unwrap();
+            let mut r = playlists.write();
             *r = pls;
             return 1;
         }
@@ -255,7 +256,7 @@ impl SearchResultsView {
                 .search(SearchType::Playlist, query, 50, offset as u32)
         {
             let mut pls = results.items.iter().map(|sp| sp.into()).collect();
-            let mut r = playlists.write().unwrap();
+            let mut r = playlists.write();
 
             if append {
                 r.append(&mut pls);
@@ -276,7 +277,7 @@ impl SearchResultsView {
     ) -> u32 {
         if let Ok(result) = spotify.api.show(query).as_ref() {
             let pls = vec![result.into()];
-            let mut r = shows.write().unwrap();
+            let mut r = shows.write();
             *r = pls;
             return 1;
         }
@@ -296,7 +297,7 @@ impl SearchResultsView {
                 .search(SearchType::Show, query, 50, offset as u32)
         {
             let mut pls = results.items.iter().map(|sp| sp.into()).collect();
-            let mut r = shows.write().unwrap();
+            let mut r = shows.write();
 
             if append {
                 r.append(&mut pls);
@@ -317,7 +318,7 @@ impl SearchResultsView {
     ) -> u32 {
         if let Ok(result) = spotify.api.episode(query).as_ref() {
             let e = vec![result.into()];
-            let mut r = episodes.write().unwrap();
+            let mut r = episodes.write();
             *r = e;
             return 1;
         }
@@ -337,7 +338,7 @@ impl SearchResultsView {
                 .search(SearchType::Episode, query, 50, offset as u32)
         {
             let mut e = results.items.iter().map(|se| se.into()).collect();
-            let mut r = episodes.write().unwrap();
+            let mut r = episodes.write();
 
             if append {
                 r.append(&mut e);
@@ -367,13 +368,13 @@ impl SearchResultsView {
 
             // register paginator if the API has more than one page of results
             if let Some(mut paginator) = paginator {
-                let loaded_items = results.read().unwrap().len();
+                let loaded_items = results.read().len();
                 if total_items > loaded_items {
                     let ev = ev.clone();
 
                     // paginator callback
                     let cb = move |items: Arc<RwLock<Vec<I>>>| {
-                        let offset = items.read().unwrap().len();
+                        let offset = items.read().len();
                         handler(&spotify, &results, &query, offset, true);
                         ev.trigger();
                     };

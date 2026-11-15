@@ -1,6 +1,5 @@
 //! Library saves on their way to Spotify, and the store changes they make. Pure functions over a
 //! store, so a save, its undo and its replay over a sync share one implementation.
-#![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
