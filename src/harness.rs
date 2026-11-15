@@ -195,6 +195,16 @@ pub struct SessionState {
 
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// The title a dump reports. A search view's real title carries the search term, which a
+/// dump must not leak, so it reports a fixed text instead.
+pub fn dump_title(view: Option<&str>, title: String) -> String {
+    if view == Some("search") {
+        "Search".to_string()
+    } else {
+        title
+    }
+}
+
 /// Snapshot the view state plus the counters of the web API, the player and the session.
 pub fn build_dump(
     title: String,
@@ -208,6 +218,7 @@ pub fn build_dump(
     let api = &spotify.api;
     let limited = api.rate_limit_status();
     let throttled = |label: ClientLabel| limited.iter().any(|(l, _)| *l == label);
+    let title = dump_title(state.as_ref().map(|s| s.view.as_str()), title);
     let (view, tab, tabs) = match state {
         Some(state) => (Some(state.view), state.tab, state.tabs),
         None => (None, None, Vec::new()),
@@ -945,6 +956,16 @@ mod tests {
             "temp file renamed away"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_search_dump_has_no_term_in_its_title() {
+        assert_eq!(
+            dump_title(Some("search"), "Search: secret words".into()),
+            "Search"
+        );
+        assert_eq!(dump_title(Some("album"), "Some Album".into()), "Some Album");
+        assert_eq!(dump_title(None, "Queue".into()), "Queue");
     }
 
     #[test]

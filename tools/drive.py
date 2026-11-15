@@ -997,6 +997,51 @@ def sc_shuffle(inst, args):
 # Scenarios that start with no playlist cache, so the sync downloads every playlist.
 COLD_PLAYLISTS = {"sync_time_cold"}
 
+SEARCH_TERM = "bonobo"
+SEARCH_TABS = ["Tracks", "Albums", "Artists", "Playlists", "Shows", "Episodes"]
+
+
+def _search(inst, args):
+    """Run the fixed search from a settled baseline; returns the settled dump. Counts only."""
+    d = inst.wait_library(args.settle_timeout * 4, blocked_on=["internal"])
+    blocked_if_throttled(d, ["internal"])
+    inst.base_dump = d
+    inst.send(f"search {SEARCH_TERM}")
+    d = inst.wait_settled(args.settle_timeout)
+    blocked_if_throttled(d, ["internal"])
+    expect(d["view"] == "search", "a search view", d["view"])
+    expect(d["title"] == "Search", "the title without the term", d["title"])
+    for name in SEARCH_TABS:
+        rows = tab(d, name)["rows"]
+        expect(rows > 0, f"rows in the {name} tab", rows)
+    return d
+
+
+def sc_search(inst, args):
+    """A text search fills the six tabs from the internal API, with no fallback and no Web call."""
+    d = _search(inst, args)
+    m = area_delta(inst, d, "search")
+    expect(m["internal_ok"] >= 1, "internal search calls", m)
+    expect(m["fallback"] == 0 and m["web"] == 0, "no fallback and no Web API call", m)
+    expect(not d["areas"]["search"]["latched"], "the search area not latched", d["areas"]["search"])
+    expect(not d["areas"]["metadata"]["latched"], "the metadata area not latched", d["areas"]["metadata"])
+    before = tab(d, "Tracks")["rows"]
+    inst.send("move bottom")
+    d = inst.wait_settled(args.settle_timeout)
+    after = tab(d, "Tracks")["rows"]
+    expect(after > before, "more Tracks rows after paging", (before, after))
+    m = area_delta(inst, d, "search")
+    expect(m["fallback"] == 0, "still no search fallback", m)
+
+
+def sc_search_area_off(inst, args):
+    """With the search area off, the six tabs fill from the Web API only."""
+    d = _search(inst, args)
+    m = area_delta(inst, d, "search")
+    expect(m["internal_ok"] == 0, "no search calls on the internal API", m)
+    expect(m["web"] >= 6, "at least 6 Web API calls", m)
+
+
 SCENARIOS = {
     "album": ({}, sc_album, False),
     "artist": ({}, sc_artist, False),
@@ -1017,6 +1062,8 @@ SCENARIOS = {
     "sync_time_cold": ({}, sc_sync_time, False),
     "reconnect": ({}, sc_reconnect, True),
     "shuffle": ({}, sc_shuffle, True),
+    "search": ({}, sc_search, False),
+    "search_area_off": ({"internal_api_areas": {"search": False}}, sc_search_area_off, False),
 }
 
 

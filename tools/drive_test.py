@@ -676,5 +676,85 @@ class ShuffleScenarioTest(unittest.TestCase):
             self.assertIsNotNone(drive.order_problem(broken), broken)
 
 
+class SearchScenarioTest(unittest.TestCase):
+    NAMES = drive.SEARCH_TABS
+
+    @classmethod
+    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False):
+        rows = rows or {}
+        tabs = [{"name": n, "rows": rows.get(n, tracks if n == "Tracks" else 5)} for n in cls.NAMES]
+        return {
+            "view": "search",
+            "title": title,
+            "tabs": tabs,
+            "throttled": {},
+            "areas": {
+                "search": {"internal_ok": 0 if base else internal_ok, "fallback": 0 if base else fallback, "latched": latched},
+                "metadata": {"internal_ok": 0, "fallback": 0, "latched": False},
+            },
+            "web": {"shared": 0, "personal": 0 if base else web},
+        }
+
+    def run_with(self, func=None, grown=40, **kw):
+        base = self.d(base=True)
+        first = self.d(**kw)
+        second = self.d(**{**kw, "tracks": grown})
+        settled = [first, second]
+        sent = []
+
+        class Inst:
+            base_dump = None
+
+            def send(self, cmd):
+                sent.append(cmd)
+
+            def wait_library(self, timeout, blocked_on=()):
+                return base
+
+            def wait_settled(self, timeout):
+                return settled.pop(0) if settled else second
+
+        class Args:
+            settle_timeout = 1
+
+        (func or drive.sc_search)(Inst(), Args())
+        return sent
+
+    def test_a_filled_search_passes(self):
+        sent = self.run_with()
+        self.assertEqual(sent, [f"search {drive.SEARCH_TERM}", "move bottom"])
+
+    def test_an_empty_tab_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(rows={"Episodes": 0})
+
+    def test_a_fallback_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(fallback=1)
+
+    def test_a_web_call_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(web=1)
+
+    def test_the_term_in_the_title_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(title=f"Search: {drive.SEARCH_TERM}")
+
+    def test_a_tracks_tab_that_does_not_grow_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(grown=20)
+
+    def test_area_off_passes_without_internal_calls(self):
+        self.run_with(drive.sc_search_area_off, internal_ok=0, web=6)
+
+    def test_area_off_fails_when_internal_ok_grew(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_search_area_off, internal_ok=1, web=6)
+
+    def test_area_off_fails_with_too_few_web_calls(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_search_area_off, internal_ok=0, web=5)
+
+
 if __name__ == "__main__":
     unittest.main()
