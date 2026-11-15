@@ -113,12 +113,14 @@ pub(crate) trait SearchBackend {
     /// Whether `area` is on and not latched right now.
     fn usable(&self, area: Area) -> bool;
     /// Send one query (one internal call in `Area::Search`, not counted as `internal_ok`:
-    /// the page logic counts with [Self::count_ok] once an answer was read).
+    /// the page logic counts with [Self::count_ok] once an answer was read) A transient
+    /// failure is sent again at most `retries` times.
     fn send(
         &self,
         op: Operation,
         hash: &str,
         variables: &serde_json::Value,
+        retries: u32,
     ) -> Result<Outcome, InternalError>;
     /// The rows of `uris` for `kind` (one `run_internal(Area::Metadata, ..)` call).
     /// Never called for `Kind::Playlist` or with no uris.
@@ -138,9 +140,10 @@ impl SearchBackend for WebApi {
         op: Operation,
         hash: &str,
         variables: &serde_json::Value,
+        retries: u32,
     ) -> Result<Outcome, InternalError> {
         let name = op.name();
-        self.run_internal_uncounted(Area::Search, QUERY_RETRIES, |session| {
+        self.run_internal_uncounted(Area::Search, retries, |session| {
             pathfinder::query(session, name, hash.to_string(), variables.clone())
         })
     }
@@ -245,7 +248,12 @@ pub(crate) fn first_page_with(
 
     let op = Operation::Desktop;
     let variables = search_variables(term, 0, PAGE);
-    let sections = match rotate(store, op, |hash| b.send(op, hash, &variables), read_all) {
+    let sections = match rotate(
+        store,
+        op,
+        |hash| b.send(op, hash, &variables, QUERY_RETRIES),
+        read_all,
+    ) {
         Ok(sections) => {
             b.count_ok(Area::Search);
             sections
@@ -323,7 +331,7 @@ fn query_section(
     kind: Kind,
     variables: &serde_json::Value,
 ) -> Result<Section, RotateError> {
-    let send = |hash: &str| b.send(op, hash, variables);
+    let send = |hash: &str| b.send(op, hash, variables, QUERY_RETRIES);
     if op == Operation::Desktop {
         rotate(store, op, send, |v| {
             read_all(v).and_then(|mut all| all.remove(&kind))
@@ -418,6 +426,7 @@ mod tests {
         send: Box<SendFn>,
         fetch: Box<FetchFn>,
         sends: Mutex<Vec<(Operation, u64, String)>>,
+        retries: Mutex<Vec<u32>>,
         latched: Mutex<Vec<(Area, InternalError)>>,
         oks: Mutex<usize>,
         fallbacks: Mutex<usize>,
@@ -435,6 +444,7 @@ mod tests {
                 send: Box::new(send),
                 fetch: Box::new(fetch),
                 sends: Mutex::new(Vec::new()),
+                retries: Mutex::new(Vec::new()),
                 latched: Mutex::new(Vec::new()),
                 oks: Mutex::new(0),
                 fallbacks: Mutex::new(0),
@@ -461,7 +471,9 @@ mod tests {
             op: Operation,
             _hash: &str,
             variables: &serde_json::Value,
+            retries: u32,
         ) -> Result<Outcome, InternalError> {
+            self.retries.lock().push(retries);
             let offset = variables["offset"].as_u64().unwrap();
             let term = variables["searchTerm"].as_str().unwrap().to_string();
             self.sends.lock().push((op, offset, term));
@@ -726,6 +738,27 @@ mod tests {
             assert_eq!(fake.counts(), (0, 0));
             assert_eq!(fake.sends.lock().len(), 1, "one request, no rotation");
         }
+    }
+
+    #[test]
+    fn every_search_query_asks_for_one_transient_retry() {
+        let fake = Fake::new(
+            |_, _| Err(InternalError::Transient("x".into())),
+            |kind| Ok(Rows::empty(kind)),
+        );
+        assert!(matches!(
+            first_page_with(&fake, &store(), "x"),
+            FirstPage::Failed
+        ));
+        assert!(matches!(
+            next_page_with(&fake, &store(), Kind::Track, "x", 50),
+            NextPage::Failed
+        ));
+        assert!(matches!(
+            next_page_with(&fake, &store(), Kind::Episode, "x", 50),
+            NextPage::Failed
+        ));
+        assert_eq!(*fake.retries.lock(), vec![1, 1, 1]);
     }
 
     #[test]
