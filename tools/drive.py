@@ -1031,7 +1031,20 @@ def sc_search(inst, args):
     after = tab(d, "Tracks")["rows"]
     expect(after > before, "more Tracks rows after paging", (before, after))
     m = area_delta(inst, d, "search")
-    expect(m["fallback"] == 0, "still no search fallback", m)
+    expect(m["fallback"] == 0 and m["web"] == 0, "still no fallback and no Web API call", m)
+    # Episodes page through searchDesktop, a path the Tracks tab never takes. A page can be
+    # all dropped rows, so the tab may stay the same size.
+    before = tab(d, "Episodes")["rows"]
+    inst.send("move rightmost")
+    d = inst.wait_settled(args.settle_timeout)
+    expect(d.get("tab") == "Episodes", "the Episodes tab selected", d.get("tab"))
+    inst.send("move bottom")
+    d = inst.wait_settled(args.settle_timeout)
+    after = tab(d, "Episodes")["rows"]
+    expect(after >= before, "no Episodes rows lost after paging", (before, after))
+    m = area_delta(inst, d, "search")
+    expect(m["fallback"] == 0 and m["web"] == 0, "no fallback and no Web API call after Episodes", m)
+    expect(not d["areas"]["search"]["latched"], "the search area still not latched", d["areas"]["search"])
 
 
 def sc_search_area_off(inst, args):

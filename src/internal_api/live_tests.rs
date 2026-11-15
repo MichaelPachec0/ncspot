@@ -604,7 +604,7 @@ fn search_first_page_fills_six_kinds() {
         let outcome = search_once(rt, &s, Operation::Desktop, "bonobo", 0)
             .map_err(|e| e.class())
             .expect("query");
-        let Outcome::Answer(answer) = outcome else {
+        let (Outcome::Answer(answer) | Outcome::Partial(answer)) = outcome else {
             panic!("searchDesktop: no answer (bad hash or refused request)");
         };
         let sections = read_all(&answer).expect("all six sections readable");
@@ -628,7 +628,7 @@ fn search_paging_returns_new_rows() {
             let outcome = search_once(rt, &s, Operation::Tracks, "bonobo", offset)
                 .map_err(|e| e.class())
                 .expect("query");
-            let Outcome::Answer(answer) = outcome else {
+            let (Outcome::Answer(answer) | Outcome::Partial(answer)) = outcome else {
                 panic!("searchTracks at {offset}: no answer");
             };
             pages.push(read_section(&answer, Kind::Track).expect("readable tracks section"));
@@ -639,6 +639,7 @@ fn search_paging_returns_new_rows() {
             pages[1].uris.len(),
             pages[1].last_page
         );
+        assert!(!pages[1].uris.is_empty(), "page 2 is empty");
         assert!(
             pages[0].uris.iter().all(|u| !pages[1].uris.contains(u)),
             "the two pages share a uri"
@@ -683,6 +684,7 @@ fn search_bogus_override_hash_is_skipped() {
         );
         println!("hashes sent: {sent}, result ok: {}", result.is_ok());
         assert!(result.is_ok(), "rotation should reach a working hash");
+        assert!(sent >= 2, "the bogus hash and at least one more were sent");
         assert!(
             !store.candidates(Operation::Desktop).contains(&bogus),
             "the bogus hash is no longer a candidate"

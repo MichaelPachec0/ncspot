@@ -680,12 +680,13 @@ class SearchScenarioTest(unittest.TestCase):
     NAMES = drive.SEARCH_TABS
 
     @classmethod
-    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False):
+    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False, tab="Tracks"):
         rows = rows or {}
         tabs = [{"name": n, "rows": rows.get(n, tracks if n == "Tracks" else 5)} for n in cls.NAMES]
         return {
             "view": "search",
             "title": title,
+            "tab": tab,
             "tabs": tabs,
             "throttled": {},
             "areas": {
@@ -695,11 +696,17 @@ class SearchScenarioTest(unittest.TestCase):
             "web": {"shared": 0, "personal": 0 if base else web},
         }
 
-    def run_with(self, func=None, grown=40, **kw):
+    def run_with(self, func=None, grown=40, paged=None, selected="Episodes", episodes=5, last=None, **kw):
+        """Dumps in order: after the search, after paging Tracks, after selecting the last tab,
+        after paging Episodes. `paged` and `last` override the counters of the later dumps."""
         base = self.d(base=True)
         first = self.d(**kw)
-        second = self.d(**{**kw, "tracks": grown})
-        settled = [first, second]
+        paged_kw = {**kw, "tracks": grown, **(paged or {})}
+        second = self.d(**paged_kw)
+        third = self.d(**paged_kw, tab=selected)
+        last_kw = {**paged_kw, "rows": {"Episodes": episodes}, **(last or {})}
+        fourth = self.d(**last_kw, tab=selected)
+        settled = [first, second, third, fourth]
         sent = []
 
         class Inst:
@@ -712,7 +719,7 @@ class SearchScenarioTest(unittest.TestCase):
                 return base
 
             def wait_settled(self, timeout):
-                return settled.pop(0) if settled else second
+                return settled.pop(0) if settled else fourth
 
         class Args:
             settle_timeout = 1
@@ -722,7 +729,36 @@ class SearchScenarioTest(unittest.TestCase):
 
     def test_a_filled_search_passes(self):
         sent = self.run_with()
-        self.assertEqual(sent, [f"search {drive.SEARCH_TERM}", "move bottom"])
+        self.assertEqual(
+            sent, [f"search {drive.SEARCH_TERM}", "move bottom", "move rightmost", "move bottom"]
+        )
+
+    def test_a_web_call_after_paging_tracks_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(paged={"web": 1})
+
+    def test_an_episodes_page_of_dropped_rows_passes(self):
+        self.run_with(episodes=5)
+
+    def test_an_episodes_tab_that_shrinks_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(episodes=4)
+
+    def test_an_episodes_tab_that_is_not_selected_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(selected="Tracks")
+
+    def test_a_web_call_after_paging_episodes_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(last={"web": 1})
+
+    def test_a_fallback_after_paging_episodes_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(last={"fallback": 1})
+
+    def test_a_search_latch_after_paging_episodes_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(last={"latched": True})
 
     def test_an_empty_tab_fails(self):
         with self.assertRaises(drive.Fail):
