@@ -11,7 +11,7 @@ use rspotify::model::{FullArtist, FullTrack, SimplifiedAlbum, SimplifiedEpisode,
 
 use crate::internal_api::Area;
 use crate::internal_api::error::InternalError;
-use crate::internal_api::hashes::{HashStore, Operation, RotateError, rotate};
+use crate::internal_api::hashes::{HashStore, Operation, RotateError, retire, rotate};
 use crate::internal_api::metadata::{self, Missing};
 use crate::internal_api::pathfinder::{self, Outcome, search_variables};
 use crate::internal_api::search::{Kind, PAGE, Section, next_offset, read_all, read_section};
@@ -101,6 +101,7 @@ pub(crate) fn first_page_failure(err: &RotateError) -> (FirstPageFailure, bool) 
             (FirstPageFailure::NotInUse, false)
         }
         RotateError::NoResult
+        | RotateError::Rejected(_)
         | RotateError::Failed(
             InternalError::RateLimited | InternalError::Transient(_) | InternalError::NotFound,
         ) => (FirstPageFailure::Failed, false),
@@ -356,8 +357,24 @@ pub(crate) fn next_page_with(
     let variables = search_variables(term, offset, PAGE);
     let op = kind.operation();
     let mut result = query_section(b, store, op, kind, &variables);
-    if op != Operation::Desktop && result.as_ref().err() == Some(&RotateError::Retired) {
-        result = query_section(b, store, Operation::Desktop, kind, &variables);
+    if op != Operation::Desktop {
+        match result {
+            Err(RotateError::Retired) => {
+                result = query_section(b, store, Operation::Desktop, kind, &variables);
+            }
+            // The hashes of the operation drew an HTTP 400 and none of its own answered.
+            // `searchDesktop` gets the same page: if it answers, the request was fine and
+            // those hashes are bad; if not, the request stays the suspect.
+            Err(RotateError::Rejected(hashes)) => {
+                result = query_section(b, store, Operation::Desktop, kind, &variables);
+                if result.is_ok() {
+                    for hash in &hashes {
+                        retire(store, op, hash);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
     let section = match result {
         Ok(section) => {
@@ -365,7 +382,7 @@ pub(crate) fn next_page_with(
             section
         }
         // Sending the same refused query again would be refused again.
-        Err(RotateError::NoResult) => {
+        Err(RotateError::NoResult | RotateError::Rejected(_)) => {
             warn!("internal search: {kind:?} page refused, paging ends");
             return NextPage::Ended;
         }
@@ -404,6 +421,7 @@ fn error_class(err: &RotateError) -> &'static str {
     match err {
         RotateError::Retired => "retired",
         RotateError::NoResult => "no result",
+        RotateError::Rejected(_) => "rejected",
         RotateError::Failed(err) => err.class(),
     }
 }
@@ -654,6 +672,61 @@ mod tests {
         assert!(fake.latched_areas().is_empty());
         // One counted answer for the page, not one per hash sent.
         assert_eq!(fake.counts(), (1, 0));
+    }
+
+    #[test]
+    fn a_400_on_a_type_operation_is_a_bad_hash_once_search_desktop_answers_the_page() {
+        let fake = Fake::new(
+            |op, _| {
+                Ok(if op == Operation::Tracks {
+                    Outcome::BadRequest
+                } else {
+                    desktop_answer()
+                })
+            },
+            |kind| Ok(Rows::empty(kind)),
+        );
+        let store = store();
+        let page = next_page_with(&fake, &store, Kind::Track, "x", 50);
+        assert!(matches!(page, NextPage::Page(_)));
+        let ops: Vec<_> = fake.sends.lock().iter().map(|(op, _, _)| *op).collect();
+        assert_eq!(ops, vec![Operation::Tracks, Operation::Desktop]);
+        assert!(store.is_retired(Operation::Tracks));
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(fake.counts(), (1, 0));
+
+        // Later pages go straight to `searchDesktop`.
+        let page = next_page_with(&fake, &store, Kind::Track, "x", 100);
+        assert!(matches!(page, NextPage::Page(_)));
+        assert_eq!(fake.sends.lock().len(), 3);
+    }
+
+    #[test]
+    fn a_400_from_the_type_operation_and_search_desktop_ends_paging_and_marks_nothing() {
+        let fake = Fake::new(|_, _| Ok(Outcome::BadRequest), |kind| Ok(Rows::empty(kind)));
+        let store = store();
+        assert!(matches!(
+            next_page_with(&fake, &store, Kind::Track, "x", 50),
+            NextPage::Ended
+        ));
+        assert!(!store.is_retired(Operation::Tracks) && !store.is_retired(Operation::Desktop));
+        assert_eq!(
+            store.candidates(Operation::Desktop).len(),
+            Operation::Desktop.builtin().len()
+        );
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(fake.counts(), (0, 0));
+    }
+
+    #[test]
+    fn a_400_from_every_search_desktop_hash_fails_the_first_page_without_a_latch() {
+        let fake = Fake::new(|_, _| Ok(Outcome::BadRequest), |kind| Ok(Rows::empty(kind)));
+        assert!(matches!(
+            first_page_with(&fake, &store(), "x"),
+            FirstPage::Failed
+        ));
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(fake.counts(), (0, 0));
     }
 
     #[test]

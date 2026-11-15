@@ -289,9 +289,14 @@ impl HashStore {
 pub enum RotateError {
     /// Every candidate is bad; nothing was or will be sent for this operation.
     Retired,
-    /// The request was refused (`Outcome::NoResult`, an unreadable `Outcome::Partial`, or
-    /// `Outcome::BadRequest` from every hash that was tried); no hash was marked for it.
+    /// The request was refused (`Outcome::NoResult`, or an unreadable `Outcome::Partial`);
+    /// no hash was marked for it.
     NoResult,
+    /// The rotation ran out and these hashes drew an HTTP 400 without another hash of the
+    /// operation answering the request: the hashes or the request may be at fault. None of
+    /// them was marked; a caller that gets the same request answered by another operation
+    /// passes them to [retire].
+    Rejected(Vec<String>),
     Failed(InternalError),
 }
 
@@ -361,7 +366,7 @@ pub fn rotate<T>(
             op.name(),
             rejected.len()
         );
-        return Err(RotateError::NoResult);
+        return Err(RotateError::Rejected(rejected));
     }
     warn!("{}: every known hash is retired", op.name());
     Err(RotateError::Retired)
@@ -372,7 +377,8 @@ fn short(hash: &str) -> &str {
     hash.get(..8).unwrap_or(hash)
 }
 
-fn retire(store: &HashStore, op: Operation, hash: &str) {
+/// Mark `hash` bad for the rest of the session and log it.
+pub fn retire(store: &HashStore, op: Operation, hash: &str) {
     warn!(
         "{}: hash {} was not accepted, trying the next one",
         op.name(),
@@ -610,7 +616,8 @@ mod tests {
             },
             |_| Some(1),
         );
-        assert_eq!((got, calls), (Err(RotateError::NoResult), b.len()));
+        let all: Vec<String> = b.iter().map(|h| h.to_string()).collect();
+        assert_eq!((got, calls), (Err(RotateError::Rejected(all)), b.len()));
         assert_eq!(s.candidates(Operation::Desktop).len(), b.len());
         assert!(saved.lock().is_empty() && !s.is_retired(Operation::Desktop));
     }
