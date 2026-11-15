@@ -62,6 +62,7 @@ pub struct Areas {
     pub metadata: AreaCounts,
     pub library: AreaCounts,
     pub playlists: AreaCounts,
+    pub search: AreaCounts,
 }
 
 /// Which clients are inside a rate-limit window.
@@ -228,6 +229,7 @@ pub fn build_dump(
             metadata: api.area_counts(Area::Metadata),
             library: api.area_counts(Area::Library),
             playlists: api.area_counts(Area::Playlists),
+            search: api.area_counts(Area::Search),
         },
         web: api.web_calls(),
         throttled: Throttled {
@@ -866,6 +868,11 @@ mod tests {
                     fallback: 1,
                     latched: false,
                 },
+                search: AreaCounts {
+                    internal_ok: 2,
+                    fallback: 0,
+                    latched: false,
+                },
             },
             web: WebCalls {
                 shared: 0,
@@ -910,7 +917,7 @@ mod tests {
         let json = serde_json::to_string(&sample()).unwrap();
         assert_eq!(
             json,
-            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"pending_writes":0,"item_write":null,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8,"last_test_len":3,"last_test_order":"ABC","last_test_renamed":false,"sync_ms":60000,"library_sync_ms":61000},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"queue":{"len":3,"distinct":3,"current":1,"shuffle":true,"order":[1,2,0]},"test_playlists":[]}"#
+            r#"{"seq":7,"view":"album","title":"T","tab":"Tracks","tabs":[{"name":"Tracks","rows":12,"playable":11,"max":12,"busy":false}],"in_flight":0,"pending_writes":0,"item_write":null,"quiet_ms":850,"error":null,"areas":{"metadata":{"internal_ok":14,"fallback":0,"latched":false},"library":{"internal_ok":3,"fallback":0,"latched":false},"playlists":{"internal_ok":5,"fallback":1,"latched":false},"search":{"internal_ok":2,"fallback":0,"latched":false}},"web":{"shared":0,"personal":2},"throttled":{"shared":false,"personal":false,"internal":false},"library_done":true,"playlists":{"stored":9,"layout":8,"last_test_len":3,"last_test_order":"ABC","last_test_renamed":false,"sync_ms":60000,"library_sync_ms":61000},"player":{"status":"playing","position_ms":1200},"session":{"valid":true,"reconnects":1},"queue":{"len":3,"distinct":3,"current":1,"shuffle":true,"order":[1,2,0]},"test_playlists":[]}"#
         );
     }
 

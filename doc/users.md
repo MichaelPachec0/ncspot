@@ -376,6 +376,7 @@ Possible configuration values are:
 | `internal_api_areas.library`    | Your saved tracks, albums, artists, shows and episodes         | `true`, `false`                                                                       | `true`              |
 | `internal_api_areas.metadata`   | Tracks, albums, artists, shows, episodes and your profile      | `true`, `false`                                                                       | `true`              |
 | `internal_api_areas.playlists`  | Your playlist list and playlist contents                       | `true`, `false`                                                                       | `true`              |
+| `internal_api_areas.search`     | Text search                                                    | `true`, `false`                                                                       | `true`              |
 
 1. If built with the `cover` feature.
 2. By default the statusbar will show a play icon when a track is playing and
@@ -494,7 +495,8 @@ count against the Web API client ID's rate limit.
 - `internal_api = false` turns it off: every request uses the Web API as
   before.
 - `[internal_api_areas]` turns single areas off, for example
-  `metadata = false`.
+  `metadata = false`. The areas are `metadata`, `library`, `playlists` and
+  `search`.
 - Changes to `internal_api` or `[internal_api_areas]` take effect after a
   restart; `:reload` does not apply them.
 - If Spotify changes the internal API, ncspot shows "Spotify internal API

@@ -46,6 +46,8 @@ pub struct Settings {
     pub library: bool,
     /// `[internal_api_areas] playlists`.
     pub playlists: bool,
+    /// `[internal_api_areas] search`.
+    pub search: bool,
 }
 
 impl Settings {
@@ -57,6 +59,7 @@ impl Settings {
             metadata: areas.metadata.unwrap_or(true),
             library: areas.library.unwrap_or(true),
             playlists: areas.playlists.unwrap_or(true),
+            search: areas.search.unwrap_or(true),
         }
     }
 
@@ -67,6 +70,7 @@ impl Settings {
                 Area::Metadata => self.metadata,
                 Area::Library => self.library,
                 Area::Playlists => self.playlists,
+                Area::Search => self.search,
             }
     }
 
@@ -91,6 +95,8 @@ pub enum Area {
     Library,
     /// The playlist list (rootlist) and playlist contents.
     Playlists,
+    /// Text search.
+    Search,
 }
 
 impl Area {
@@ -100,6 +106,7 @@ impl Area {
             Self::Metadata => "metadata",
             Self::Library => "library",
             Self::Playlists => "playlists",
+            Self::Search => "search",
         }
     }
 }
@@ -134,6 +141,8 @@ pub struct InternalApi {
     library_stats: Arc<AreaStats>,
     latched_playlists: Arc<AtomicBool>,
     playlists_stats: Arc<AreaStats>,
+    latched_search: Arc<AtomicBool>,
+    search_stats: Arc<AreaStats>,
 }
 
 impl InternalApi {
@@ -148,6 +157,8 @@ impl InternalApi {
             library_stats: Arc::new(AreaStats::default()),
             latched_playlists: Arc::new(AtomicBool::new(false)),
             playlists_stats: Arc::new(AreaStats::default()),
+            latched_search: Arc::new(AtomicBool::new(false)),
+            search_stats: Arc::new(AreaStats::default()),
         }
     }
 
@@ -174,6 +185,7 @@ impl InternalApi {
             Area::Metadata => &self.latched_metadata,
             Area::Library => &self.latched_library,
             Area::Playlists => &self.latched_playlists,
+            Area::Search => &self.latched_search,
         }
     }
 
@@ -187,6 +199,7 @@ impl InternalApi {
             Area::Metadata => &self.metadata_stats,
             Area::Library => &self.library_stats,
             Area::Playlists => &self.playlists_stats,
+            Area::Search => &self.search_stats,
         }
     }
 
@@ -411,6 +424,7 @@ mod tests {
             metadata: true,
             library: true,
             playlists: true,
+            search: true,
         };
         let api = InternalApi::new(on);
         assert!(!api.skip(Area::Metadata));
@@ -476,6 +490,28 @@ mod tests {
     }
 
     #[test]
+    fn search_area_defaults_on_and_can_be_turned_off() {
+        assert!(settings("internal_api = true").area_enabled(Area::Search));
+        let off = settings("internal_api = true\n[internal_api_areas]\nsearch = false\n");
+        assert!(!off.area_enabled(Area::Search));
+        assert!(off.area_enabled(Area::Metadata));
+        assert!(!settings("internal_api = false").area_enabled(Area::Search));
+    }
+
+    #[test]
+    fn search_area_latches_and_counts_on_its_own() {
+        let api = InternalApi::new(settings("internal_api = true"));
+        assert!(!api.skip(Area::Search));
+        api.count_ok(Area::Search);
+        assert!(api.latch(Area::Search));
+        assert!(api.skip(Area::Search));
+        assert!(!api.skip(Area::Metadata));
+        let c = api.area_counts(Area::Search);
+        assert_eq!((c.internal_ok, c.fallback, c.latched), (1, 0, true));
+        assert_eq!(Area::Search.name(), "search");
+    }
+
+    #[test]
     fn no_session_handle_means_no_session() {
         let api = InternalApi::new(Settings {
             enabled: true,
@@ -483,6 +519,7 @@ mod tests {
             metadata: true,
             library: true,
             playlists: true,
+            search: true,
         });
         assert!(api.session().is_none());
     }

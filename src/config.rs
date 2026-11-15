@@ -131,6 +131,8 @@ pub struct InternalApiAreas {
     pub library: Option<bool>,
     /// The playlist list and playlist contents.
     pub playlists: Option<bool>,
+    /// Text search.
+    pub search: Option<bool>,
 }
 
 /// Configuration for the lyrics feature.
