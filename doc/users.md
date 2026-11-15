@@ -509,6 +509,23 @@ terms. Using it goes against the wording of Spotify's user terms, and the
 risk lands on your Spotify account, not on ncspot. Use it at your own risk.
 It needs Spotify Premium, like playback.
 
+#### Pathfinder hash overrides
+
+Text search uses Spotify's persisted queries, which are selected by a hash that
+Spotify retires without notice. ncspot knows several hashes per operation and
+moves on to the next one when Spotify refuses a hash. If all of them are
+retired, you can supply newer ones in `pathfinder_hashes.json` in the
+configuration folder, next to `config.toml`:
+
+```json
+{ "searchDesktop": ["<64 lowercase hex characters>"] }
+```
+
+The keys are `searchDesktop`, `searchTracks`, `searchArtists`,
+`searchAlbums`, `searchPlaylists` and `searchPodcasts`; each holds a list of at
+most 8 hashes, tried before the built-in ones. Invalid entries are skipped with
+a warning in the log. ncspot never writes this file.
+
 ### Proxy
 
 All of ncspot's network traffic (the Spotify access point, the Spotify APIs,

@@ -27,6 +27,7 @@ use crate::application::ASYNC_RUNTIME;
 use crate::authentication::SPOTIFY_CLIENT_ID;
 use crate::config;
 use crate::events::{Event, EventManager};
+use crate::internal_api::hashes::{self, HashStore};
 use crate::model::playable::Playable;
 #[cfg(feature = "mpris")]
 use crate::mpris::{MprisCommand, MprisManager};
@@ -244,6 +245,18 @@ impl Spotify {
             budget: Default::default(),
         };
         spotify.api.set_session(spotify.session.clone());
+        let persist_cfg = cfg.clone();
+        let persist: hashes::Persist = Arc::new(move |op, hash| {
+            persist_cfg.with_state_mut(|state| {
+                state.search_hashes.insert(op.to_string(), hash.to_string());
+            });
+        });
+        let search_hashes = HashStore::new(
+            hashes::load_overrides(&config::config_path(hashes::OVERRIDE_FILE)),
+            &cfg.state().search_hashes,
+            persist,
+        );
+        spotify.api.set_search_hashes(search_hashes);
 
         let (user_tx, user_rx) = oneshot::channel();
         spotify.start_worker(Some(user_tx))?;

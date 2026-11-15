@@ -7,6 +7,9 @@ pub mod collection;
 pub mod convert;
 pub mod error;
 pub mod fallback;
+// Used from the next tasks of the search work.
+#[allow(dead_code)]
+pub mod hashes;
 pub mod metadata;
 pub mod playlist;
 // Used from the next tasks of the search work.
@@ -146,6 +149,7 @@ pub struct InternalApi {
     playlists_stats: Arc<AreaStats>,
     latched_search: Arc<AtomicBool>,
     search_stats: Arc<AreaStats>,
+    hashes: hashes::HashStore,
 }
 
 impl InternalApi {
@@ -162,12 +166,25 @@ impl InternalApi {
             playlists_stats: Arc::new(AreaStats::default()),
             latched_search: Arc::new(AtomicBool::new(false)),
             search_stats: Arc::new(AreaStats::default()),
+            hashes: hashes::HashStore::default(),
         }
     }
 
     /// Use the session handle that [crate::spotify::Spotify] fills when its worker connects.
     pub fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
         self.session = session;
+    }
+
+    /// Use `store` for the Pathfinder hashes.
+    pub fn set_hashes(&mut self, store: hashes::HashStore) {
+        self.hashes = store;
+    }
+
+    /// The Pathfinder hashes.
+    // Used from the next tasks of the search work.
+    #[allow(dead_code)]
+    pub fn hashes(&self) -> &hashes::HashStore {
+        &self.hashes
     }
 
     /// The resolved switches.

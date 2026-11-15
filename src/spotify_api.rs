@@ -29,6 +29,7 @@ use crate::events::{Event, EventManager};
 use crate::internal_api::AreaCounts;
 use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
+use crate::internal_api::hashes::HashStore;
 use crate::internal_api::metadata::Missing;
 use crate::internal_api::playlist::{self, Head, PlaylistItem, RootHead, Rootlist};
 use crate::internal_api::playlist_write::{self, Created};
@@ -251,6 +252,18 @@ impl WebApi {
     #[cfg(any(test, feature = "harness"))]
     pub fn area_counts(&self, area: Area) -> AreaCounts {
         self.internal.area_counts(area)
+    }
+
+    /// Use `store` for the Pathfinder search hashes.
+    pub fn set_search_hashes(&mut self, store: HashStore) {
+        self.internal.set_hashes(store);
+    }
+
+    /// The Pathfinder search hashes.
+    // Used from the next tasks of the search work.
+    #[allow(dead_code)]
+    pub(crate) fn search_hashes(&self) -> &HashStore {
+        self.internal.hashes()
     }
 
     /// Use `session` (filled by the Spotify worker when it connects) for internal API calls.
