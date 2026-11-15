@@ -98,7 +98,7 @@ pub fn apply_local(playlist: &mut Playlist, kind: &JobKind) -> Option<usize> {
             if at != *index {
                 move_server_item(tracks, *index, at);
             }
-            playlist.snapshot_id.clear();
+            playlist.clear_snapshot();
             return Some(at);
         }
         JobKind::Remove { index, uri } => {
@@ -132,7 +132,7 @@ pub fn apply_local(playlist: &mut Playlist, kind: &JobKind) -> Option<usize> {
         _ => false,
     };
     if changed {
-        playlist.snapshot_id.clear();
+        playlist.clear_snapshot();
     }
     None
 }
@@ -690,6 +690,7 @@ mod tests {
             collaborative: false,
             cover_url: None,
             tracks_unknown: false,
+            web_loaded: false,
         }
     }
 
@@ -1052,7 +1053,7 @@ mod tests {
         assert_eq!(w.confirmed("p").unwrap().snapshot_id, "s1");
         // The store still shows the optimistic copy: a new job must not adopt it.
         let mut cleared = p.clone();
-        cleared.snapshot_id.clear();
+        cleared.clear_snapshot();
         w.queue(Some("p"), JobKind::Rename { name: "n".into() }, || {
             Some(cleared)
         });

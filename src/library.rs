@@ -833,7 +833,7 @@ impl Library {
             );
             playlist.num_tracks = tracks.len();
             playlist.tracks_unknown = false;
-            playlist.snapshot_id.clear();
+            playlist.clear_snapshot();
             self.playlist_update(playlist);
         }
         (written, web_used.get())
@@ -3185,6 +3185,7 @@ fn listed_playlist(root: &RootPlaylist) -> Playlist {
         collaborative: root.collaborative,
         cover_url: root.cover_url.clone(),
         tracks_unknown: false,
+        web_loaded: false,
     }
 }
 
@@ -3873,6 +3874,7 @@ mod test {
             collaborative: false,
             cover_url: None,
             tracks_unknown: false,
+            web_loaded: false,
         }
     }
 

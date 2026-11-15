@@ -504,6 +504,7 @@ mod tests {
             collaborative: false,
             cover_url: None,
             tracks_unknown: true,
+            web_loaded: false,
         }
     }
 

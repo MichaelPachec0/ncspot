@@ -509,6 +509,7 @@ mod tests {
             collaborative,
             cover_url: None,
             tracks_unknown: false,
+            web_loaded: false,
         }
     }
 

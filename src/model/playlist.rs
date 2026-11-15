@@ -40,6 +40,11 @@ pub struct Playlist {
     /// count until the tracks are loaded.
     #[serde(default)]
     pub tracks_unknown: bool,
+    /// The tracks came from the Web API, which gives no snapshot, onto a copy that had none
+    /// (a search row). Such a copy is not read again on every use; a write that clears the
+    /// snapshot ends this. Never saved.
+    #[serde(skip)]
+    pub web_loaded: bool,
 }
 
 impl Playlist {
@@ -56,6 +61,13 @@ impl Playlist {
         self.store_loaded(loaded)
     }
 
+    /// Forget the snapshot, so the copy is read again when the internal API can (see
+    /// [playlist_edit::reload_cleared]).
+    pub fn clear_snapshot(&mut self) {
+        self.snapshot_id.clear();
+        self.web_loaded = false;
+    }
+
     /// Keep the tracks of a load (`None` = it failed, nothing changes) and the snapshot they
     /// were read at. A copy without a snapshot (a search row, a cleared copy) takes the load's,
     /// so it is not reloaded on every later use; a copy with one keeps it. Returns true if the
@@ -65,6 +77,7 @@ impl Playlist {
             return false;
         };
         if self.snapshot_id.is_empty() {
+            self.web_loaded = snapshot_id.is_empty();
             self.snapshot_id = snapshot_id;
         }
         self.tracks = Some(tracks);
@@ -385,6 +398,7 @@ impl From<&SimplifiedPlaylist> for Playlist {
             collaborative: list.collaborative,
             cover_url: list.images.first().map(|i| i.url.clone()),
             tracks_unknown: false,
+            web_loaded: false,
         }
     }
 }
@@ -402,6 +416,7 @@ impl From<&FullPlaylist> for Playlist {
             collaborative: list.collaborative,
             cover_url: list.images.first().map(|i| i.url.clone()),
             tracks_unknown: false,
+            web_loaded: false,
         }
     }
 }
@@ -598,6 +613,7 @@ mod tests {
             collaborative: false,
             cover_url: None,
             tracks_unknown: true,
+            web_loaded: false,
         }
     }
 
@@ -610,6 +626,7 @@ mod tests {
         let loaded = Playlist {
             tracks: Some(Vec::new()),
             tracks_unknown: false,
+            web_loaded: false,
             ..unknown()
         };
         p.merge_loaded(loaded);
@@ -632,6 +649,7 @@ mod tests {
             snapshot_id: "s1".into(),
             tracks: Some(Vec::new()),
             tracks_unknown: false,
+            web_loaded: false,
             ..unknown()
         };
         p.merge_loaded(loaded);
@@ -672,6 +690,27 @@ mod tests {
         };
         assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
         assert_eq!(p.snapshot_id, "s0");
+    }
+
+    #[test]
+    fn a_web_load_onto_a_copy_without_a_snapshot_is_remembered_until_a_write_clears_it() {
+        // The Web read gives no snapshot.
+        let mut p = unknown();
+        assert!(p.store_loaded(Some((Vec::new(), String::new()))));
+        assert!(p.web_loaded && p.snapshot_id.is_empty());
+        p.clear_snapshot();
+        assert!(!p.web_loaded);
+
+        // An internal load (it has a snapshot) and a copy that already had one are not marked.
+        let mut p = unknown();
+        assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
+        assert!(!p.web_loaded);
+        let mut p = Playlist {
+            snapshot_id: "s0".into(),
+            ..unknown()
+        };
+        assert!(p.store_loaded(Some((Vec::new(), String::new()))));
+        assert!(!p.web_loaded);
     }
 
     #[test]

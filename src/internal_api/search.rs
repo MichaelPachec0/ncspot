@@ -165,6 +165,7 @@ pub fn playlist_row(data: &Value) -> Option<Playlist> {
             .and_then(Value::as_str)
             .map(String::from),
         tracks_unknown: true,
+        web_loaded: false,
     })
 }
 
