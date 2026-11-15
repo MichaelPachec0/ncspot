@@ -173,34 +173,36 @@ pub fn next_offset(offset: usize, limit: usize, section: &Section) -> Option<usi
     Some(offset + limit)
 }
 
+/// A `searchDesktop` answer with all six sections, for tests here and in the search pages.
+#[cfg(test)]
+pub(crate) fn test_answer() -> Value {
+    serde_json::json!({
+        "tracksV2": { "totalCount": 427, "items": [
+            { "item": { "data": { "uri": "spotify:track:t1" } } },
+            { "item": { "data": {} } },
+            { "item": { "data": { "uri": "spotify:track:t2" } } } ] },
+        "albumsV2": { "totalCount": 3, "items": [ { "data": { "uri": "spotify:album:a1" } } ] },
+        "artists": { "totalCount": 0, "items": [] },
+        "podcasts": { "totalCount": 2, "items": [ { "data": { "uri": "spotify:show:s1" } } ] },
+        "episodes": { "totalCount": 5000, "items": [ { "data": { "uri": "spotify:episode:e1" } } ] },
+        "playlists": { "totalCount": 180, "items": [
+            { "data": { "uri": "spotify:playlist:p1", "name": "Mix One",
+                        "images": { "items": [ { "sources": [ { "url": "https://img/1" } ] } ] },
+                        "ownerV2": { "data": { "name": "Owner One", "username": "owner1" } } } },
+            { "data": { "uri": "spotify:playlist:p2", "name": "No Owner", "ownerV2": { "data": {} } } },
+            { "data": { "uri": "spotify:user:x:collection", "name": "Not A Playlist",
+                        "ownerV2": { "data": { "username": "owner2" } } } } ] }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    fn answer() -> serde_json::Value {
-        json!({
-            "tracksV2": { "totalCount": 427, "items": [
-                { "item": { "data": { "uri": "spotify:track:t1" } } },
-                { "item": { "data": {} } },
-                { "item": { "data": { "uri": "spotify:track:t2" } } } ] },
-            "albumsV2": { "totalCount": 3, "items": [ { "data": { "uri": "spotify:album:a1" } } ] },
-            "artists": { "totalCount": 0, "items": [] },
-            "podcasts": { "totalCount": 2, "items": [ { "data": { "uri": "spotify:show:s1" } } ] },
-            "episodes": { "totalCount": 5000, "items": [ { "data": { "uri": "spotify:episode:e1" } } ] },
-            "playlists": { "totalCount": 180, "items": [
-                { "data": { "uri": "spotify:playlist:p1", "name": "Mix One",
-                            "images": { "items": [ { "sources": [ { "url": "https://img/1" } ] } ] },
-                            "ownerV2": { "data": { "name": "Owner One", "username": "owner1" } } } },
-                { "data": { "uri": "spotify:playlist:p2", "name": "No Owner", "ownerV2": { "data": {} } } },
-                { "data": { "uri": "spotify:user:x:collection", "name": "Not A Playlist",
-                            "ownerV2": { "data": { "username": "owner2" } } } } ] }
-        })
-    }
-
     #[test]
     fn sections_keep_order_and_skip_odd_items() {
-        let all = read_all(&answer()).unwrap();
+        let all = read_all(&test_answer()).unwrap();
         let t = &all[&Kind::Track];
         assert_eq!(t.uris, ["spotify:track:t1", "spotify:track:t2"]);
         assert_eq!((t.item_count, t.total, t.last_page), (3, 427, None));
@@ -209,14 +211,14 @@ mod tests {
 
     #[test]
     fn empty_sections_are_readable() {
-        let s = read_section(&answer(), Kind::Artist).unwrap();
+        let s = read_section(&test_answer(), Kind::Artist).unwrap();
         assert_eq!((s.uris.len(), s.item_count, s.total), (0, 0, 0));
         assert_eq!(next_offset(0, PAGE, &s), None);
     }
 
     #[test]
     fn a_missing_or_unreadable_section_is_none() {
-        let mut a = answer();
+        let mut a = test_answer();
         a.as_object_mut().unwrap().remove("podcasts");
         assert!(read_all(&a).is_none());
         assert!(read_section(&a, Kind::Track).is_some());
@@ -235,7 +237,7 @@ mod tests {
 
     #[test]
     fn playlist_rows_are_built_from_the_answer() {
-        let s = read_section(&answer(), Kind::Playlist).unwrap();
+        let s = read_section(&test_answer(), Kind::Playlist).unwrap();
         assert_eq!(s.item_count, 3);
         assert_eq!(s.playlists.len(), 1);
         let p = &s.playlists[0];

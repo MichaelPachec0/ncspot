@@ -7,17 +7,11 @@ pub mod collection;
 pub mod convert;
 pub mod error;
 pub mod fallback;
-// Used from the next tasks of the search work.
-#[allow(dead_code)]
 pub mod hashes;
 pub mod metadata;
-pub mod playlist;
-// Used from the next tasks of the search work.
-#[allow(dead_code)]
 pub mod pathfinder;
+pub mod playlist;
 pub mod playlist_write;
-// Used from the next tasks of the search work.
-#[allow(dead_code)]
 pub mod search;
 
 #[cfg(test)]
@@ -184,8 +178,6 @@ impl InternalApi {
     }
 
     /// The Pathfinder hashes.
-    // Used from the next tasks of the search work.
-    #[allow(dead_code)]
     pub fn hashes(&self) -> &hashes::HashStore {
         &self.hashes
     }

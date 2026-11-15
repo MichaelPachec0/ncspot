@@ -33,6 +33,7 @@ use crate::internal_api::hashes::HashStore;
 use crate::internal_api::metadata::Missing;
 use crate::internal_api::playlist::{self, Head, PlaylistItem, RootHead, Rootlist};
 use crate::internal_api::playlist_write::{self, Created};
+use crate::internal_api::search::Kind;
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -46,6 +47,7 @@ use crate::rate_limit::{
     Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
 };
+use crate::search_api::{self, FirstPage, NextPage};
 use crate::spotify_worker::WorkerCommand;
 use crate::ui::pagination::{ApiPage, ApiResult};
 use crate::utils::OnDrop;
@@ -260,10 +262,24 @@ impl WebApi {
     }
 
     /// The Pathfinder search hashes.
-    // Used from the next tasks of the search work.
-    #[allow(dead_code)]
     pub(crate) fn search_hashes(&self) -> &HashStore {
         self.internal.hashes()
+    }
+
+    /// The first page of all six search tabs from the internal API (see
+    /// [search_api::first_page_with]). Blocks on the network: never call it on the UI thread.
+    // Used from the search view, in a later task of the search work.
+    #[allow(dead_code)]
+    pub fn search_first_page(&self, term: &str) -> FirstPage {
+        search_api::first_page_with(self, self.search_hashes(), term)
+    }
+
+    /// The search page of `kind` at `offset` from the internal API (see
+    /// [search_api::next_page_with]). Blocks on the network: never call it on the UI thread.
+    // Used from the search view, in a later task of the search work.
+    #[allow(dead_code)]
+    pub fn search_next_page(&self, kind: Kind, term: &str, offset: usize) -> NextPage {
+        search_api::next_page_with(self, self.search_hashes(), kind, term, offset)
     }
 
     /// Use `session` (filled by the Spotify worker when it connects) for internal API calls.
