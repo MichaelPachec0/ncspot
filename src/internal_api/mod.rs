@@ -9,6 +9,9 @@ pub mod error;
 pub mod fallback;
 pub mod metadata;
 pub mod playlist;
+// Used from the next tasks of the search work.
+#[allow(dead_code)]
+pub mod pathfinder;
 pub mod playlist_write;
 
 #[cfg(test)]
