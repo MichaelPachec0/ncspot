@@ -22,7 +22,7 @@ pub enum Outcome {
     /// HTTP 412: Spotify does not know this hash.
     BadHash,
     /// HTTP 400: the operation name and the hash do not go together, or Spotify rejects
-    /// the request itself. A bad hash unless the hash already answered in this session.
+    /// the request itself. The hash is bad only if another hash answers the same request.
     BadRequest,
     /// HTTP 2xx without a `data.searchV2` object: the request was refused (bad input,
     /// a server-side failure). Not a hash failure, and not worth sending again.

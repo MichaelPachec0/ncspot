@@ -154,8 +154,6 @@ pub fn load_overrides(path: &Path) -> Overrides {
 struct State {
     bad: HashSet<String>,
     working: Option<String>,
-    /// Hashes that gave a readable answer in this session.
-    answered: HashSet<String>,
 }
 
 struct Shared {
@@ -187,7 +185,6 @@ impl HashStore {
                 State {
                     bad: HashSet::new(),
                     working,
-                    answered: HashSet::new(),
                 },
             );
         }
@@ -261,7 +258,9 @@ impl HashStore {
         let changed = {
             let mut state = self.shared.state.lock();
             let entry = state.entry(op).or_default();
-            entry.answered.insert(hash.to_string());
+            // An answer outranks an earlier bad mark (another thread's HTTP 400 for the same
+            // hash while this answer was on its way).
+            entry.bad.remove(hash);
             if entry.working.as_deref() == Some(hash) {
                 false
             } else {
@@ -280,14 +279,6 @@ impl HashStore {
         state.get(&op).is_some_and(|entry| entry.bad.contains(hash))
     }
 
-    /// Whether `hash` gave a readable answer for `op` in this session.
-    pub fn has_answered(&self, op: Operation, hash: &str) -> bool {
-        let state = self.shared.state.lock();
-        state
-            .get(&op)
-            .is_some_and(|entry| entry.answered.contains(hash))
-    }
-
     /// True once every candidate of `op` was marked bad.
     pub fn is_retired(&self, op: Operation) -> bool {
         self.candidates(op).is_empty()
@@ -299,7 +290,7 @@ pub enum RotateError {
     /// Every candidate is bad; nothing was or will be sent for this operation.
     Retired,
     /// The request was refused (`Outcome::NoResult`, an unreadable `Outcome::Partial`, or
-    /// `Outcome::BadRequest` for a hash that already answered); no hash was marked.
+    /// `Outcome::BadRequest` from every hash that was tried); no hash was marked for it.
     NoResult,
     Failed(InternalError),
 }
@@ -315,6 +306,9 @@ pub fn rotate<T>(
     if store.is_retired(op) {
         return Err(RotateError::Retired);
     }
+    // Hashes that drew an HTTP 400 in this rotation. A 400 can be the hash's fault or the
+    // request's, so they are marked bad only once another hash answers the same request.
+    let mut rejected: Vec<String> = Vec::new();
     for hash in store.candidates(op) {
         // The list is a snapshot: another thread may have marked this hash since.
         if store.is_bad(op, &hash) {
@@ -324,6 +318,9 @@ pub fn rotate<T>(
             Ok(Outcome::Answer(answer)) => {
                 if let Some(value) = read(&answer) {
                     store.mark_working(op, &hash);
+                    for hash in &rejected {
+                        retire(store, op, hash);
+                    }
                     return Ok(value);
                 }
             }
@@ -341,35 +338,47 @@ pub fn rotate<T>(
                             "{}: an answer with errors could not be read, hash {} kept; if \
                              this repeats, the answer shape may have changed",
                             op.name(),
-                            hash.get(..8).unwrap_or(&hash)
+                            short(&hash)
                         );
                         Err(RotateError::NoResult)
                     }
                 };
             }
             Ok(Outcome::BadHash) => {}
-            // A hash that already answered is not the cause of a 400: the request is.
-            Ok(Outcome::BadRequest) if store.has_answered(op, &hash) => {
-                warn!(
-                    "{}: request rejected (http 400), hash {} kept",
-                    op.name(),
-                    hash.get(..8).unwrap_or(&hash)
-                );
-                return Err(RotateError::NoResult);
+            Ok(Outcome::BadRequest) => {
+                rejected.push(hash);
+                continue;
             }
-            Ok(Outcome::BadRequest) => {}
             Ok(Outcome::NoResult) => return Err(RotateError::NoResult),
             Err(err) => return Err(RotateError::Failed(err)),
         }
+        retire(store, op, &hash);
+    }
+    if !rejected.is_empty() {
+        // No hash answered this request, so the request may be the cause.
         warn!(
-            "{}: hash {} was not accepted, trying the next one",
+            "{}: request rejected (http 400) with {} hashes, none marked",
             op.name(),
-            hash.get(..8).unwrap_or(&hash)
+            rejected.len()
         );
-        store.mark_bad(op, &hash);
+        return Err(RotateError::NoResult);
     }
     warn!("{}: every known hash is retired", op.name());
     Err(RotateError::Retired)
+}
+
+/// The first characters of a hash, for the log.
+fn short(hash: &str) -> &str {
+    hash.get(..8).unwrap_or(hash)
+}
+
+fn retire(store: &HashStore, op: Operation, hash: &str) {
+    warn!(
+        "{}: hash {} was not accepted, trying the next one",
+        op.name(),
+        short(hash)
+    );
+    store.mark_bad(op, hash);
 }
 
 #[cfg(test)]
@@ -561,9 +570,11 @@ mod tests {
     }
 
     #[test]
-    fn a_400_for_a_hash_that_never_answered_is_a_bad_hash() {
+    fn a_400_marks_the_hash_bad_once_another_hash_answers() {
         let (s, saved) = store([], []);
         let b = Operation::Desktop.builtin();
+        // The first hash answered before: that does not protect it.
+        s.mark_working(Operation::Desktop, b[0]);
         let mut sent = Vec::new();
         let got = rotate(
             &s,
@@ -581,20 +592,14 @@ mod tests {
         assert_eq!(got, Ok(7));
         assert_eq!(sent, vec![b[0], b[1]]);
         assert!(s.is_bad(Operation::Desktop, b[0]));
-        assert_eq!(saved.lock().len(), 1);
+        assert_eq!(s.candidates(Operation::Desktop)[0], b[1]);
+        assert_eq!(saved.lock().len(), 2);
     }
 
     #[test]
-    fn a_400_for_a_hash_that_answered_fails_the_call_and_marks_nothing() {
-        let (s, _) = store([], []);
+    fn a_400_from_every_hash_fails_the_call_and_marks_nothing() {
+        let (s, saved) = store([], []);
         let b = Operation::Desktop.builtin();
-        let first = rotate(
-            &s,
-            Operation::Desktop,
-            |_| Ok(Outcome::Answer(json!({}))),
-            |_| Some(1),
-        );
-        assert_eq!(first, Ok(1));
         let mut calls = 0;
         let got: Result<u8, _> = rotate(
             &s,
@@ -605,23 +610,42 @@ mod tests {
             },
             |_| Some(1),
         );
-        assert_eq!((got, calls), (Err(RotateError::NoResult), 1));
-        assert!(!s.is_bad(Operation::Desktop, b[0]));
+        assert_eq!((got, calls), (Err(RotateError::NoResult), b.len()));
         assert_eq!(s.candidates(Operation::Desktop).len(), b.len());
+        assert!(saved.lock().is_empty() && !s.is_retired(Operation::Desktop));
     }
 
     #[test]
-    fn a_saved_hash_from_an_earlier_session_has_not_answered_yet() {
+    fn a_400_is_not_marked_when_the_rotation_ends_on_another_failure() {
+        let (s, _) = store([], []);
         let b = Operation::Desktop.builtin();
-        let (s, _) = store([], [("searchDesktop", b[0])]);
-        assert!(!s.has_answered(Operation::Desktop, b[0]));
-        let _: Result<u8, _> = rotate(
+        let mut calls = 0;
+        let got: Result<u8, _> = rotate(
             &s,
             Operation::Desktop,
-            |_| Ok(Outcome::BadRequest),
+            |_| {
+                calls += 1;
+                Ok(match calls {
+                    1 => Outcome::BadRequest,
+                    2 => Outcome::BadHash,
+                    _ => Outcome::NoResult,
+                })
+            },
             |_| Some(1),
         );
-        assert!(s.is_retired(Operation::Desktop));
+        assert_eq!((got, calls), (Err(RotateError::NoResult), 3));
+        assert!(!s.is_bad(Operation::Desktop, b[0]));
+        assert!(s.is_bad(Operation::Desktop, b[1]));
+    }
+
+    #[test]
+    fn an_answer_outranks_an_earlier_bad_mark() {
+        let (s, _) = store([], []);
+        let b = Operation::Tracks.builtin()[0];
+        s.mark_bad(Operation::Tracks, b);
+        assert!(s.is_retired(Operation::Tracks));
+        s.mark_working(Operation::Tracks, b);
+        assert_eq!(s.candidates(Operation::Tracks), vec![b.to_string()]);
     }
 
     #[test]
