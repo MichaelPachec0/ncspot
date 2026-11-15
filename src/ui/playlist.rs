@@ -508,6 +508,7 @@ mod tests {
             tracks: None,
             collaborative,
             cover_url: None,
+            tracks_unknown: false,
         }
     }
 

@@ -36,6 +36,10 @@ pub struct Playlist {
     /// Cover image URL (Spotify mosaic/custom), if the playlist has one.
     #[serde(default)]
     pub cover_url: Option<String>,
+    /// The track count is not known: a search answer does not carry it. The row shows no
+    /// count until the tracks are loaded.
+    #[serde(default)]
+    pub tracks_unknown: bool,
 }
 
 impl Playlist {
@@ -49,6 +53,9 @@ impl Playlist {
         }
 
         self.tracks = self.load_all_tracks(spotify);
+        if self.tracks.is_some() {
+            self.tracks_unknown = false;
+        }
         self.tracks.is_some()
     }
 
@@ -86,6 +93,16 @@ impl Playlist {
         }
         let tracks = tracks_result.items.read();
         Some(tracks.clone())
+    }
+
+    /// The count column of the row: blank, as wide as "1234 tracks", while the count is
+    /// unknown, so the rows stay aligned.
+    fn count_text(&self) -> String {
+        if self.tracks_unknown && self.tracks.is_none() {
+            return " ".repeat(11);
+        }
+        let num_tracks = self.tracks.as_ref().map_or(self.num_tracks, Vec::len);
+        format!("{num_tracks:>4} tracks")
     }
 
     pub fn has_track(&self, track_id: &str) -> bool {
@@ -276,6 +293,7 @@ impl Playlist {
                             },
                         ));
                         self.num_tracks = tracks.len();
+                        self.tracks_unknown = false;
                     }
                     None => return true,
                 }
@@ -349,6 +367,7 @@ impl From<&SimplifiedPlaylist> for Playlist {
             tracks: None,
             collaborative: list.collaborative,
             cover_url: list.images.first().map(|i| i.url.clone()),
+            tracks_unknown: false,
         }
     }
 }
@@ -365,6 +384,7 @@ impl From<&FullPlaylist> for Playlist {
             tracks: None,
             collaborative: list.collaborative,
             cover_url: list.images.first().map(|i| i.url.clone()),
+            tracks_unknown: false,
         }
     }
 }
@@ -373,6 +393,7 @@ impl ListItem for Playlist {
     fn merge_loaded(&mut self, loaded: Self) {
         if self.tracks.is_none() && self.snapshot_id == loaded.snapshot_id {
             self.tracks = loaded.tracks;
+            self.tracks_unknown = false;
         }
     }
 
@@ -405,13 +426,7 @@ impl ListItem for Playlist {
             ""
         };
 
-        let num_tracks = self
-            .tracks
-            .as_ref()
-            .map(|t| t.len())
-            .unwrap_or(self.num_tracks);
-
-        format!("{saved}{num_tracks:>4} tracks")
+        format!("{saved}{}", self.count_text())
     }
 
     fn play(&mut self, queue: &Queue) {
@@ -544,5 +559,41 @@ impl ListItem for Playlist {
 
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unknown() -> Playlist {
+        Playlist {
+            id: "p1".into(),
+            name: "Mix".into(),
+            owner_id: "o".into(),
+            owner_name: None,
+            snapshot_id: String::new(),
+            num_tracks: 0,
+            tracks: None,
+            collaborative: false,
+            cover_url: None,
+            tracks_unknown: true,
+        }
+    }
+
+    #[test]
+    fn unknown_count_is_blank_until_tracks_are_loaded() {
+        let mut p = unknown();
+        assert_eq!(p.count_text().trim(), "");
+        assert_eq!(p.count_text().len(), "   3 tracks".len());
+
+        let loaded = Playlist {
+            tracks: Some(Vec::new()),
+            tracks_unknown: false,
+            ..unknown()
+        };
+        p.merge_loaded(loaded);
+        assert!(!p.tracks_unknown);
+        assert_eq!(p.count_text(), "   0 tracks");
     }
 }

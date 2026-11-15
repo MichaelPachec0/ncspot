@@ -108,6 +108,7 @@ pub fn apply_local(playlist: &mut Playlist, kind: &JobKind) -> Option<usize> {
                 .is_some_and(|tracks| remove_server_item(tracks, *index, uri));
             if removed {
                 playlist.num_tracks = playlist.tracks.as_ref().map_or(0, Vec::len);
+                playlist.tracks_unknown = false;
             }
             removed
         }
@@ -119,6 +120,7 @@ pub fn apply_local(playlist: &mut Playlist, kind: &JobKind) -> Option<usize> {
                     playable
                 }));
                 playlist.num_tracks = tracks.len();
+                playlist.tracks_unknown = false;
                 true
             }
             None => false,
@@ -687,6 +689,7 @@ mod tests {
             tracks: Some(tracks),
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
         }
     }
 

@@ -832,6 +832,7 @@ impl Library {
                     .collect(),
             );
             playlist.num_tracks = tracks.len();
+            playlist.tracks_unknown = false;
             playlist.snapshot_id.clear();
             self.playlist_update(playlist);
         }
@@ -3132,6 +3133,7 @@ fn merge_listed(
         local.cover_url = remote.cover_url.clone();
         local.name = remote.name.clone();
         local.num_tracks = remote.num_tracks;
+        local.tracks_unknown = remote.tracks_unknown;
     };
     let mut items_complete = true;
     for remote in listed {
@@ -3182,6 +3184,7 @@ fn listed_playlist(root: &RootPlaylist) -> Playlist {
         tracks: None,
         collaborative: root.collaborative,
         cover_url: root.cover_url.clone(),
+        tracks_unknown: false,
     }
 }
 
@@ -3869,6 +3872,7 @@ mod test {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
         }
     }
 

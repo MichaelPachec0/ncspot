@@ -473,6 +473,7 @@ fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, snapshot_id: &
         playable.set_list_index(index);
     }
     playlist.num_tracks = tracks.len();
+    playlist.tracks_unknown = false;
     playlist.tracks = Some(tracks);
     playlist.snapshot_id = snapshot_id.to_string();
 }
@@ -689,6 +690,7 @@ pub fn remove_after_web(playlist: &mut Playlist, index: usize, uri: &str) {
         .as_mut()
         .is_some_and(|tracks| remove_server_item(tracks, index, uri));
     playlist.num_tracks = playlist.tracks.as_ref().map_or(0, Vec::len);
+    playlist.tracks_unknown = false;
     let ordered = playlist.tracks.as_deref().is_some_and(in_server_order);
     if !removed || !ordered {
         playlist.snapshot_id.clear();
@@ -723,6 +725,7 @@ pub fn remove_track(
     if let Some(tracks) = playlist.tracks.as_mut() {
         remove_server_item(tracks, index, uri);
         playlist.num_tracks = tracks.len();
+        playlist.tracks_unknown = false;
     }
     playlist.snapshot_id = after.snapshot_id;
     Ok(())
@@ -1108,6 +1111,7 @@ pub fn created_playlist(created: &Created, name: &str, owner: Option<&str>) -> P
         tracks: Some(vec![]),
         collaborative: false,
         cover_url: None,
+        tracks_unknown: false,
     }
 }
 
@@ -1279,6 +1283,7 @@ mod tests {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
         }
     }
 

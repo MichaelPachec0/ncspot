@@ -199,6 +199,7 @@ impl PlaylistRow {
             tracks: None,
             collaborative: p.collaborative,
             cover_url: p.cover_url.clone(),
+            tracks_unknown: false,
         })?;
         Some(f(&summary))
     }
@@ -421,6 +422,7 @@ mod tests {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
         }
     }
 

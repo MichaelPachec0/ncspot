@@ -16,6 +16,9 @@ pub mod playlist;
 #[allow(dead_code)]
 pub mod pathfinder;
 pub mod playlist_write;
+// Used from the next tasks of the search work.
+#[allow(dead_code)]
+pub mod search;
 
 #[cfg(test)]
 mod live_tests;

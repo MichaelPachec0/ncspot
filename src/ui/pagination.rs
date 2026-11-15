@@ -236,6 +236,7 @@ mod test {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
         }
     }
 
