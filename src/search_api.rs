@@ -77,7 +77,7 @@ pub enum NextPage {
     Page(TabPage),
     /// Nothing added; the same offset can be asked again.
     Failed,
-    /// Paging of this view is over (an area latched).
+    /// Paging of this view is over (an area latched, or the query was refused).
     Ended,
 }
 
@@ -108,7 +108,8 @@ pub(crate) fn first_page_failure(err: &RotateError) -> (FirstPageFailure, bool) 
 pub(crate) trait SearchBackend {
     /// Whether `area` is on and not latched right now.
     fn usable(&self, area: Area) -> bool;
-    /// Send one query (one `run_internal(Area::Search, ..)` call).
+    /// Send one query (one internal call in `Area::Search`, not counted as `internal_ok`:
+    /// the page logic counts with [Self::count_ok] once an answer was read).
     fn send(
         &self,
         op: Operation,
@@ -119,6 +120,7 @@ pub(crate) trait SearchBackend {
     /// Never called for `Kind::Playlist` or with no uris.
     fn fetch(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError>;
     fn latch(&self, area: Area, err: &InternalError);
+    fn count_ok(&self, area: Area);
     fn count_fallback(&self, area: Area);
 }
 
@@ -134,7 +136,7 @@ impl SearchBackend for WebApi {
         variables: &serde_json::Value,
     ) -> Result<Outcome, InternalError> {
         let name = op.name();
-        self.run_internal(Area::Search, |session| {
+        self.run_internal_uncounted(Area::Search, |session| {
             pathfinder::query(session, name, hash.to_string(), variables.clone())
         })
     }
@@ -175,6 +177,10 @@ impl SearchBackend for WebApi {
 
     fn latch(&self, area: Area, err: &InternalError) {
         self.latch_area(area, err);
+    }
+
+    fn count_ok(&self, area: Area) {
+        self.count_internal_ok(area);
     }
 
     fn count_fallback(&self, area: Area) {
@@ -225,7 +231,10 @@ pub(crate) fn first_page_with(
     let op = Operation::Desktop;
     let variables = search_variables(term, 0, PAGE);
     let sections = match rotate(store, op, |hash| b.send(op, hash, &variables), read_all) {
-        Ok(sections) => sections,
+        Ok(sections) => {
+            b.count_ok(Area::Search);
+            sections
+        }
         Err(err) => {
             let (failure, latch) = first_page_failure(&err);
             if latch {
@@ -234,7 +243,8 @@ pub(crate) fn first_page_with(
                     _ => retired(),
                 };
                 b.latch(Area::Search, &cause);
-            } else if failure == FirstPageFailure::NotInUse {
+            }
+            if failure == FirstPageFailure::NotInUse {
                 b.count_fallback(Area::Search);
             }
             return match failure {
@@ -290,6 +300,7 @@ pub(crate) fn first_page_with(
     if b.usable(Area::Metadata) {
         FirstPage::Internal(tabs)
     } else {
+        b.count_fallback(Area::Search);
         FirstPage::NotInUse
     }
 }
@@ -332,7 +343,15 @@ pub(crate) fn next_page_with(
         result = query_section(b, store, Operation::Desktop, kind, &variables);
     }
     let section = match result {
-        Ok(section) => section,
+        Ok(section) => {
+            b.count_ok(Area::Search);
+            section
+        }
+        // Sending the same refused query again would be refused again.
+        Err(RotateError::NoResult) => {
+            warn!("internal search: {kind:?} page refused, paging ends");
+            return NextPage::Ended;
+        }
         Err(RotateError::Retired) => {
             b.latch(Area::Search, &retired());
             return NextPage::Ended;
@@ -390,12 +409,14 @@ mod tests {
         dyn Fn(Operation, &serde_json::Value) -> Result<Outcome, InternalError> + Send + Sync;
     type FetchFn = dyn Fn(Kind) -> Result<Rows, InternalError> + Send + Sync;
 
-    /// A stand-in for the session: records sends, latches and fallbacks.
+    /// A stand-in for the session: records sends (operation, offset, term), latches, counted
+    /// answers and fallbacks.
     struct Fake {
         send: Box<SendFn>,
         fetch: Box<FetchFn>,
-        sends: Mutex<Vec<(Operation, u64)>>,
-        latched: Mutex<Vec<Area>>,
+        sends: Mutex<Vec<(Operation, u64, String)>>,
+        latched: Mutex<Vec<(Area, InternalError)>>,
+        oks: Mutex<usize>,
         fallbacks: Mutex<usize>,
     }
 
@@ -412,14 +433,24 @@ mod tests {
                 fetch: Box::new(fetch),
                 sends: Mutex::new(Vec::new()),
                 latched: Mutex::new(Vec::new()),
+                oks: Mutex::new(0),
                 fallbacks: Mutex::new(0),
             }
+        }
+
+        fn latched_areas(&self) -> Vec<Area> {
+            self.latched.lock().iter().map(|(area, _)| *area).collect()
+        }
+
+        /// (counted answers, fallbacks)
+        fn counts(&self) -> (usize, usize) {
+            (*self.oks.lock(), *self.fallbacks.lock())
         }
     }
 
     impl SearchBackend for Fake {
         fn usable(&self, area: Area) -> bool {
-            !self.latched.lock().contains(&area)
+            !self.latched.lock().iter().any(|(a, _)| *a == area)
         }
 
         fn send(
@@ -429,7 +460,8 @@ mod tests {
             variables: &serde_json::Value,
         ) -> Result<Outcome, InternalError> {
             let offset = variables["offset"].as_u64().unwrap();
-            self.sends.lock().push((op, offset));
+            let term = variables["searchTerm"].as_str().unwrap().to_string();
+            self.sends.lock().push((op, offset, term));
             (self.send)(op, variables)
         }
 
@@ -438,11 +470,17 @@ mod tests {
             (self.fetch)(kind)
         }
 
-        fn latch(&self, area: Area, _err: &InternalError) {
-            self.latched.lock().push(area);
+        fn latch(&self, area: Area, err: &InternalError) {
+            self.latched.lock().push((area, err.clone()));
         }
 
-        fn count_fallback(&self, _area: Area) {
+        fn count_ok(&self, area: Area) {
+            assert_eq!(area, Area::Search);
+            *self.oks.lock() += 1;
+        }
+
+        fn count_fallback(&self, area: Area) {
+            assert_eq!(area, Area::Search);
             *self.fallbacks.lock() += 1;
         }
     }
@@ -591,8 +629,15 @@ mod tests {
         );
         let page = next_page_with(&fake, &store(), Kind::Track, "x", 50);
         assert!(matches!(page, NextPage::Page(_)));
-        assert_eq!(fake.sends.lock().last(), Some(&(Operation::Desktop, 50)));
-        assert!(fake.latched.lock().is_empty());
+        let last = fake
+            .sends
+            .lock()
+            .last()
+            .map(|(op, offset, _)| (*op, *offset));
+        assert_eq!(last, Some((Operation::Desktop, 50)));
+        assert!(fake.latched_areas().is_empty());
+        // One counted answer for the page, not one per hash sent.
+        assert_eq!(fake.counts(), (1, 0));
     }
 
     #[test]
@@ -602,14 +647,15 @@ mod tests {
             first_page_with(&fake, &store(), "x"),
             FirstPage::NotInUse
         ));
-        assert_eq!(*fake.latched.lock(), [Area::Search]);
+        assert_eq!(fake.latched_areas(), [Area::Search]);
+        assert_eq!(fake.counts(), (0, 1), "bad hashes are not answers");
         // Per-type retired, then desktop retired: paging ends.
         let fake = Fake::new(|_, _| Ok(Outcome::BadHash), |kind| Ok(Rows::empty(kind)));
         assert!(matches!(
             next_page_with(&fake, &store(), Kind::Album, "x", 50),
             NextPage::Ended
         ));
-        assert_eq!(*fake.latched.lock(), [Area::Search]);
+        assert_eq!(fake.latched_areas(), [Area::Search]);
     }
 
     #[test]
@@ -622,13 +668,14 @@ mod tests {
             next_page_with(&fake, &store(), Kind::Episode, "x", 50),
             NextPage::Ended
         ));
-        assert_eq!(*fake.latched.lock(), [Area::Search]);
+        assert_eq!(fake.latched_areas(), [Area::Search]);
     }
 
     #[test]
     fn a_refused_or_rate_limited_query_fails_without_web_or_latch() {
         for outcome in [
             Ok(Outcome::NoResult),
+            Ok(Outcome::Partial(json!({}))),
             Err(InternalError::RateLimited),
             Err(InternalError::Transient("x".into())),
         ] {
@@ -638,18 +685,96 @@ mod tests {
                 first_page_with(&fake, &store(), "x"),
                 FirstPage::Failed
             ));
+            assert!(fake.latched_areas().is_empty());
+            assert_eq!(fake.counts(), (0, 0));
+            assert_eq!(fake.sends.lock().len(), 1, "one request, no rotation");
+        }
+    }
+
+    #[test]
+    fn a_refused_next_page_ends_paging_without_web_or_latch() {
+        for outcome in [Outcome::NoResult, Outcome::Partial(json!({}))] {
+            let o = outcome.clone();
+            let fake = Fake::new(move |_, _| Ok(o.clone()), |kind| Ok(Rows::empty(kind)));
+            assert!(matches!(
+                next_page_with(&fake, &store(), Kind::Track, "x", 50),
+                NextPage::Ended
+            ));
+            assert!(fake.latched_areas().is_empty());
+            assert_eq!(fake.counts(), (0, 0));
+            assert_eq!(fake.sends.lock().len(), 1, "one request, no rotation");
+        }
+    }
+
+    #[test]
+    fn a_failed_next_page_keeps_its_offset_without_web_or_latch() {
+        for outcome in [
+            Err(InternalError::RateLimited),
+            Err(InternalError::Transient("x".into())),
+        ] {
+            let o = outcome.clone();
+            let fake = Fake::new(move |_, _| o.clone(), |kind| Ok(Rows::empty(kind)));
             assert!(matches!(
                 next_page_with(&fake, &store(), Kind::Track, "x", 50),
                 NextPage::Failed
             ));
-            assert!(fake.latched.lock().is_empty());
-            assert_eq!(*fake.fallbacks.lock(), 0);
-            assert_eq!(
-                fake.sends.lock().len(),
-                2,
-                "one request per call, no rotation"
-            );
+            assert!(fake.latched_areas().is_empty());
+            assert_eq!(fake.counts(), (0, 0));
+            assert_eq!(fake.sends.lock().len(), 1, "one request, no rotation");
         }
+    }
+
+    #[test]
+    fn a_protocol_change_on_the_first_page_latches_search() {
+        let fake = Fake::new(
+            |_, _| Err(InternalError::ProtocolChanged("x".into())),
+            |kind| Ok(Rows::empty(kind)),
+        );
+        assert!(matches!(
+            first_page_with(&fake, &store(), "x"),
+            FirstPage::NotInUse
+        ));
+        assert_eq!(
+            *fake.latched.lock(),
+            [(Area::Search, InternalError::ProtocolChanged("x".into()))]
+        );
+        assert_eq!(fake.counts(), (0, 1));
+    }
+
+    #[test]
+    fn an_unreadable_partial_first_page_fails_without_marking_a_hash() {
+        let s = store();
+        let fake = Fake::new(
+            |_, _| Ok(Outcome::Partial(json!({ "tracksV2": null }))),
+            |kind| Ok(Rows::empty(kind)),
+        );
+        assert!(matches!(first_page_with(&fake, &s, "x"), FirstPage::Failed));
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(
+            s.candidates(Operation::Desktop).len(),
+            Operation::Desktop.builtin().len()
+        );
+    }
+
+    #[test]
+    fn the_term_is_sent_verbatim() {
+        let term = "artist:x year:2017  y";
+        let fake = Fake::new(|_, _| Ok(desktop_answer()), |kind| Ok(Rows::empty(kind)));
+        assert!(matches!(
+            first_page_with(&fake, &store(), term),
+            FirstPage::Internal(_)
+        ));
+        assert!(matches!(
+            next_page_with(&fake, &store(), Kind::Album, term, 50),
+            NextPage::Page(_)
+        ));
+        let sends = fake.sends.lock();
+        assert_eq!(sends.len(), 2);
+        assert!(sends.iter().all(|(_, _, sent)| sent == term));
+        assert_eq!(
+            (sends[0].0, sends[0].1, sends[1].0, sends[1].1),
+            (Operation::Desktop, 0, Operation::Albums, 50)
+        );
     }
 
     #[test]
@@ -671,7 +796,8 @@ mod tests {
         assert_eq!(tabs[&Kind::Album].next_offset, Some(0));
         assert_eq!(tabs[&Kind::Track].next_offset, Some(50));
         assert_eq!(tabs[&Kind::Playlist].rows.len(), 1);
-        assert!(fake.latched.lock().is_empty());
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(fake.counts(), (1, 0));
     }
 
     #[test]
@@ -690,7 +816,9 @@ mod tests {
             first_page_with(&fake, &store(), "x"),
             FirstPage::NotInUse
         ));
-        assert_eq!(*fake.latched.lock(), [Area::Metadata]);
+        assert_eq!(fake.latched_areas(), [Area::Metadata]);
+        // The search answer was read, then the page went to the Web API.
+        assert_eq!(fake.counts(), (1, 1));
         let fake = Fake::new(
             |_, _| Ok(desktop_answer()),
             |_| Err(InternalError::ProtocolChanged("x".into())),
@@ -699,7 +827,7 @@ mod tests {
             next_page_with(&fake, &store(), Kind::Track, "x", 50),
             NextPage::Ended
         ));
-        assert_eq!(*fake.latched.lock(), [Area::Metadata]);
+        assert_eq!(fake.latched_areas(), [Area::Metadata]);
     }
 
     #[test]
@@ -711,7 +839,7 @@ mod tests {
                 first_page_with(&fake, &store(), "x"),
                 FirstPage::NotInUse
             ));
-            assert_eq!((*fake.fallbacks.lock(), fake.latched.lock().len()), (1, 0));
+            assert_eq!((*fake.fallbacks.lock(), fake.latched_areas().len()), (1, 0));
         }
     }
 }

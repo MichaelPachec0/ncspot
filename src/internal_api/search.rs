@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 
+use log::debug;
 use serde_json::Value;
 
 use super::hashes::Operation;
@@ -68,7 +69,8 @@ pub struct Section {
     pub playlists: Vec<Playlist>,
     /// Length of the `items` array, odd items included.
     pub item_count: usize,
-    /// `totalCount`, capped at `MAX_TOTAL`; 0 when absent.
+    /// `totalCount`, capped at `MAX_TOTAL`; `MAX_TOTAL` when absent or not a number, so paging
+    /// goes on until a page comes back empty.
     pub total: usize,
     /// `Some(true)` when `pagingInfo.nextOffset` is null, `Some(false)` when it is a
     /// number, `None` when the section has no `pagingInfo` object.
@@ -105,12 +107,16 @@ pub fn read_section(search_v2: &Value, kind: Kind) -> Option<Section> {
         uris.push(uri.to_string());
     }
 
-    let total = section
-        .get("totalCount")
-        .and_then(Value::as_u64)
-        .map_or(0, |n| {
-            usize::try_from(n).unwrap_or(usize::MAX).min(MAX_TOTAL)
-        });
+    let total = match section.get("totalCount").and_then(Value::as_u64) {
+        Some(n) => usize::try_from(n).unwrap_or(usize::MAX).min(MAX_TOTAL),
+        None => {
+            debug!(
+                "internal search: {} has no total, paging until a page is empty",
+                kind.section()
+            );
+            MAX_TOTAL
+        }
+    };
     let last_page = section
         .get("pagingInfo")
         .and_then(Value::as_object)
@@ -214,6 +220,26 @@ mod tests {
         let s = read_section(&test_answer(), Kind::Artist).unwrap();
         assert_eq!((s.uris.len(), s.item_count, s.total), (0, 0, 0));
         assert_eq!(next_offset(0, PAGE, &s), None);
+    }
+
+    #[test]
+    fn an_absent_total_keeps_paging_until_a_page_is_empty() {
+        for total in [None, Some(json!("many"))] {
+            let mut tracks =
+                json!({ "items": [ { "item": { "data": { "uri": "spotify:track:t1" } } } ] });
+            if let Some(total) = total {
+                tracks["totalCount"] = total;
+            }
+            let s = read_section(&json!({ "tracksV2": tracks }), Kind::Track).unwrap();
+            assert_eq!(s.total, MAX_TOTAL);
+            assert_eq!(next_offset(0, PAGE, &s), Some(PAGE));
+        }
+        let empty = json!({ "tracksV2": { "items": [] } });
+        let s = read_section(&empty, Kind::Track).unwrap();
+        assert_eq!(next_offset(PAGE, PAGE, &s), None);
+        // A present total of 0 stays 0.
+        let zero = json!({ "tracksV2": { "totalCount": 0, "items": [] } });
+        assert_eq!(read_section(&zero, Kind::Track).unwrap().total, 0);
     }
 
     #[test]

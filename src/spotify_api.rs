@@ -319,7 +319,27 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, true, internal)
+        self.run_internal_with(area, true, true, internal)
+    }
+
+    /// Like [Self::run_internal] but a success is not counted as `internal_ok`: for callers
+    /// that count once they know the answer was usable (see [Self::count_internal_ok]).
+    pub(crate) fn run_internal_uncounted<T, F, Fut>(
+        &self,
+        area: Area,
+        internal: F,
+    ) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_internal_with(area, true, false, internal)
+    }
+
+    /// Count a call in `area` answered by the internal API.
+    pub(crate) fn count_internal_ok(&self, area: Area) {
+        self.internal.count_ok(area);
     }
 
     /// Like [Self::run_internal] but the request is sent at most once on our side: no transient
@@ -330,13 +350,14 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, false, internal)
+        self.run_internal_with(area, false, true, internal)
     }
 
     fn run_internal_with<T, F, Fut>(
         &self,
         area: Area,
         may_retry: bool,
+        count_ok: bool,
         internal: F,
     ) -> Result<T, InternalError>
     where
@@ -361,7 +382,7 @@ impl WebApi {
             |window| self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window),
             thread::sleep,
         );
-        if result.is_ok() {
+        if count_ok && result.is_ok() {
             self.internal.count_ok(area);
         }
         result
