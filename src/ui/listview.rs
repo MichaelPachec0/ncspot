@@ -112,7 +112,7 @@ impl<I: ListItem + Clone> ListView<I> {
     /// `true` if there are unloaded items
     /// `false` if all items are loaded
     fn can_paginate(&self) -> bool {
-        self.get_pagination().max_content().unwrap_or(0) > self.get_pagination().loaded_content()
+        self.get_pagination().can_load_more()
     }
 
     /// Try to load more items into the list if neccessary.
@@ -387,8 +387,7 @@ impl<I: ListItem + Clone> View for ListView<I> {
             if i == len && self.can_paginate() {
                 let style = ColorStyle::secondary();
 
-                let max = self.pagination.max_content().unwrap();
-                let buf = format!("{} more items, scroll to load", max - i);
+                let buf = format!("{} more items, scroll to load", self.pagination.remaining());
                 printer.with_color(style, |printer| {
                     printer.print((0, 0), &buf);
                 });
