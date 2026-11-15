@@ -1559,12 +1559,12 @@ impl Library {
             .find(|p| p.id == listed.id)
             .map(|p| p.snapshot_id.clone());
         let mut playlist = listed.clone();
-        playlist.snapshot_id = listed_snapshot(
+        playlist.set_snapshot(listed_snapshot(
             &listed.snapshot_id,
             owned,
             head.as_deref(),
             cached.as_deref(),
-        );
+        ));
         playlist
     }
 
@@ -2648,7 +2648,10 @@ impl Library {
     }
 
     /// Queue following `playlist`.
-    pub fn queue_follow(&self, playlist: Playlist) {
+    pub fn queue_follow(&self, mut playlist: Playlist) {
+        // A library entry must get a snapshot: let a copy loaded from the Web API be read
+        // again.
+        playlist.web_loaded = false;
         let id = playlist.id.clone();
         let playlist = Box::new(playlist);
         self.queue_as_is(Some(&id), JobKind::Follow { playlist });

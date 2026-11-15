@@ -64,7 +64,13 @@ impl Playlist {
     /// Forget the snapshot, so the copy is read again when the internal API can (see
     /// [playlist_edit::reload_cleared]).
     pub fn clear_snapshot(&mut self) {
-        self.snapshot_id.clear();
+        self.set_snapshot(String::new());
+    }
+
+    /// Set the snapshot the copy is at. Whatever a Web API load left behind (`web_loaded`)
+    /// ends here: the copy is at a snapshot again, or was cleared to be read again.
+    pub fn set_snapshot(&mut self, snapshot_id: String) {
+        self.snapshot_id = snapshot_id;
         self.web_loaded = false;
     }
 
@@ -77,8 +83,9 @@ impl Playlist {
             return false;
         };
         if self.snapshot_id.is_empty() {
-            self.web_loaded = snapshot_id.is_empty();
-            self.snapshot_id = snapshot_id;
+            let from_web = snapshot_id.is_empty();
+            self.set_snapshot(snapshot_id);
+            self.web_loaded = from_web;
         }
         self.tracks = Some(tracks);
         self.tracks_unknown = false;
@@ -427,7 +434,8 @@ impl ListItem for Playlist {
         let same_version = self.snapshot_id.is_empty() || self.snapshot_id == loaded.snapshot_id;
         if self.tracks.is_none() && same_version && loaded.tracks.is_some() {
             self.tracks = loaded.tracks;
-            self.snapshot_id = loaded.snapshot_id;
+            self.set_snapshot(loaded.snapshot_id);
+            self.web_loaded = loaded.web_loaded;
             self.tracks_unknown = false;
         }
     }
@@ -503,6 +511,14 @@ impl ListItem for Playlist {
             library.queue_unfollow(&self.id);
         } else {
             library.queue_follow(self.clone());
+        }
+    }
+
+    fn prepare_open(&mut self, queue: &Queue) {
+        // A search row: load here, so the list row keeps what the open loads and the next
+        // open or play does not read the playlist again.
+        if self.tracks.is_none() && self.snapshot_id.is_empty() {
+            self.load_tracks(&queue.get_spotify());
         }
     }
 
@@ -711,6 +727,20 @@ mod tests {
         };
         assert!(p.store_loaded(Some((Vec::new(), String::new()))));
         assert!(!p.web_loaded);
+    }
+
+    #[test]
+    fn a_row_keeps_the_web_load_mark_of_the_copy_that_loaded() {
+        // What the list does: the action runs on a clone, the row takes what it loaded.
+        let mut row = unknown();
+        let mut copy = row.clone();
+        assert!(copy.store_loaded(Some((Vec::new(), String::new()))));
+        row.merge_loaded(copy);
+        assert!(row.tracks.is_some() && row.web_loaded);
+
+        // A snapshot set later ends it.
+        row.set_snapshot("s1".into());
+        assert!(!row.web_loaded);
     }
 
     #[test]

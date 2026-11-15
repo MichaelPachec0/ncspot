@@ -480,7 +480,7 @@ fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, snapshot_id: &
     playlist.num_tracks = tracks.len();
     playlist.tracks_unknown = false;
     playlist.tracks = Some(tracks);
-    playlist.snapshot_id = snapshot_id.to_string();
+    playlist.set_snapshot(snapshot_id.to_string());
 }
 
 /// The position of a POST in its action.
@@ -734,7 +734,7 @@ pub fn remove_track(
         playlist.num_tracks = tracks.len();
         playlist.tracks_unknown = false;
     }
-    playlist.snapshot_id = after.snapshot_id;
+    playlist.set_snapshot(after.snapshot_id);
     Ok(())
 }
 
@@ -831,7 +831,7 @@ pub fn move_track(
             if let Some(tracks) = playlist.tracks.as_mut() {
                 move_server_item(tracks, index, at);
             }
-            playlist.snapshot_id = after.snapshot_id;
+            playlist.set_snapshot(after.snapshot_id);
             Ok(at)
         }
         // Not latched: the POST went through and may have applied (see send_verified).
@@ -880,7 +880,7 @@ pub fn move_after_web(
                 && server_item(tracks, from, uri) == Some(from) =>
         {
             move_server_item(tracks, from, at);
-            playlist.snapshot_id = reply_snapshot.to_string();
+            playlist.set_snapshot(reply_snapshot.to_string());
         }
         _ => playlist.clear_snapshot(),
     }
@@ -911,7 +911,7 @@ pub fn rename(
         Some(applied) if applied == name.trim() => {
             playlist.name = name.to_string();
             if current && !after.revision.is_empty() {
-                playlist.snapshot_id = after.snapshot_id;
+                playlist.set_snapshot(after.snapshot_id);
             }
             Ok(())
         }

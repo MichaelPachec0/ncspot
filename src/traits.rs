@@ -80,6 +80,10 @@ pub trait ListItem: Sync + Send + 'static {
     {
     }
 
+    /// Called on a copy of a list row before the row is opened; what it loads is merged
+    /// into the row (see [Self::merge_loaded]). Items that need nothing keep this default.
+    fn prepare_open(&mut self, _queue: &Queue) {}
+
     fn as_listitem(&self) -> Box<dyn ListItem>;
 }
 
