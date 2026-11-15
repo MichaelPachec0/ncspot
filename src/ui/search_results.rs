@@ -513,7 +513,11 @@ impl SearchResultsView {
         query: String,
         paginator: Option<Pagination<I>>,
     ) {
+        // Taken before the thread starts, so the app does not look idle between the caller
+        // letting go of its own guard and this search sending its request.
+        let activity = crate::activity::ACTIVITY.begin();
         std::thread::spawn(move || {
+            let _activity = activity;
             let total_items = handler(&spotify, &results, &query, 0, false) as usize;
 
             // register paginator if the API has more than one page of results

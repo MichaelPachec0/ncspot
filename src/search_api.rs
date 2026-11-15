@@ -214,6 +214,17 @@ pub(crate) fn build_tab(
     })
 }
 
+/// Log a failed row fetch for the tab of `kind`; a protocol change latches `Area::Metadata`.
+fn rows_failed(b: &impl SearchBackend, kind: Kind, err: &InternalError) {
+    if matches!(err, InternalError::ProtocolChanged(_)) {
+        b.latch(Area::Metadata, err);
+    }
+    warn!(
+        "internal search: {kind:?} rows could not be fetched ({})",
+        err.class()
+    );
+}
+
 fn retired() -> InternalError {
     InternalError::ProtocolChanged("search hashes retired".into())
 }
@@ -281,13 +292,7 @@ pub(crate) fn first_page_with(
     let mut tabs = HashMap::new();
     for (kind, result) in built {
         let tab = result.unwrap_or_else(|err| {
-            if matches!(err, InternalError::ProtocolChanged(_)) {
-                b.latch(Area::Metadata, &err);
-            }
-            warn!(
-                "internal search: {kind:?} rows could not be fetched ({})",
-                err.class()
-            );
+            rows_failed(b, kind, &err);
             TabPage {
                 rows: Rows::empty(kind),
                 next_offset: Some(0),
@@ -372,13 +377,7 @@ pub(crate) fn next_page_with(
     match build_tab(kind, &section, offset, |k, uris| b.fetch(k, uris)) {
         Ok(page) => NextPage::Page(page),
         Err(err) => {
-            if matches!(err, InternalError::ProtocolChanged(_)) {
-                b.latch(Area::Metadata, &err);
-            }
-            warn!(
-                "internal search: {kind:?} rows could not be fetched ({})",
-                err.class()
-            );
+            rows_failed(b, kind, &err);
             if b.usable(Area::Metadata) {
                 NextPage::Failed
             } else {
