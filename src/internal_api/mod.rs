@@ -28,8 +28,7 @@ use log::warn;
 
 use crate::config::ConfigValues;
 use crate::rate_limit::{
-    Attempt, ClientLabel, MAX_RATE_LIMIT_RETRIES, ThrottleState, backoff, random_jitter,
-    run_rate_limited,
+    Attempt, ClientLabel, ThrottleState, backoff, random_jitter, run_rate_limited,
 };
 use error::InternalError;
 
@@ -246,10 +245,11 @@ impl InternalApi {
 }
 
 /// Run `attempt` with the rate-limit gate of `throttle` (see [run_rate_limited]) and retry
-/// transient failures on background threads, at most [MAX_RATE_LIMIT_RETRIES] times with
+/// transient failures on background threads, at most `max_transient_retries` times with
 /// [backoff] delays (`sleep` is injected for tests). Other errors return at once.
 pub fn run_attempts<T>(
     on_ui_thread: bool,
+    max_transient_retries: u32,
     throttle: &RwLock<ThrottleState>,
     mut attempt: impl FnMut() -> Result<T, InternalError>,
     mut on_429: impl FnMut(Duration),
@@ -279,7 +279,7 @@ pub fn run_attempts<T>(
                 // run_rate_limited gave up on (or refused to send because of) a 429.
                 None => return Err(InternalError::RateLimited),
                 Some(InternalError::Transient(why))
-                    if !on_ui_thread && transient_retries < MAX_RATE_LIMIT_RETRIES =>
+                    if !on_ui_thread && transient_retries < max_transient_retries =>
                 {
                     warn!(
                         "internal API call failed ({why}), retry {}",
@@ -298,7 +298,7 @@ pub fn run_attempts<T>(
 mod tests {
     use super::*;
     use crate::config::ConfigValues;
-    use crate::rate_limit::ThrottleState;
+    use crate::rate_limit::{MAX_RATE_LIMIT_RETRIES, ThrottleState};
     use parking_lot::RwLock;
     use std::cell::RefCell;
 
@@ -360,6 +360,14 @@ mod tests {
         on_ui: bool,
         script: Vec<Result<u8, InternalError>>,
     ) -> (Result<u8, InternalError>, usize, usize, usize) {
+        attempts_with(on_ui, MAX_RATE_LIMIT_RETRIES, script)
+    }
+
+    fn attempts_with(
+        on_ui: bool,
+        max_transient_retries: u32,
+        script: Vec<Result<u8, InternalError>>,
+    ) -> (Result<u8, InternalError>, usize, usize, usize) {
         let throttle = RwLock::new(ThrottleState::default());
         let script = RefCell::new(script.into_iter());
         let calls = RefCell::new(0);
@@ -367,6 +375,7 @@ mod tests {
         let sleeps = RefCell::new(0);
         let out = run_attempts(
             on_ui,
+            max_transient_retries,
             &throttle,
             || {
                 *calls.borrow_mut() += 1;
@@ -393,6 +402,14 @@ mod tests {
         let t = || Err(InternalError::Transient("x".into()));
         let (out, calls, _, sleeps) = attempts(false, vec![t(), t(), Ok(4)]);
         assert_eq!((out, calls, sleeps), (Ok(4), 3, 2));
+    }
+
+    #[test]
+    fn a_lower_retry_limit_gives_up_sooner() {
+        let t = || Err(InternalError::Transient("x".into()));
+        let (out, calls, _, sleeps) = attempts_with(false, 1, vec![t(), t()]);
+        assert!(matches!(out, Err(InternalError::Transient(_))));
+        assert_eq!((calls, sleeps), (2, 1));
     }
 
     #[test]

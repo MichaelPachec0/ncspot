@@ -319,14 +319,22 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, true, true, internal)
+        self.run_internal_with(
+            area,
+            true,
+            crate::rate_limit::MAX_RATE_LIMIT_RETRIES,
+            true,
+            internal,
+        )
     }
 
     /// Like [Self::run_internal] but a success is not counted as `internal_ok`: for callers
-    /// that count once they know the answer was usable (see [Self::count_internal_ok]).
+    /// that count once they know the answer was usable (see [Self::count_internal_ok]). A
+    /// transient failure is retried at most `transient_retries` times.
     pub(crate) fn run_internal_uncounted<T, F, Fut>(
         &self,
         area: Area,
+        transient_retries: u32,
         internal: F,
     ) -> Result<T, InternalError>
     where
@@ -334,7 +342,7 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, true, false, internal)
+        self.run_internal_with(area, true, transient_retries, false, internal)
     }
 
     /// Count a call in `area` answered by the internal API.
@@ -350,13 +358,14 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, false, true, internal)
+        self.run_internal_with(area, false, 0, true, internal)
     }
 
     fn run_internal_with<T, F, Fut>(
         &self,
         area: Area,
         may_retry: bool,
+        transient_retries: u32,
         count_ok: bool,
         internal: F,
     ) -> Result<T, InternalError>
@@ -377,6 +386,7 @@ impl WebApi {
         let _call = ACTIVITY.begin();
         let result = run_attempts(
             no_waits,
+            transient_retries,
             &self.internal.throttle,
             || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
             |window| self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window),

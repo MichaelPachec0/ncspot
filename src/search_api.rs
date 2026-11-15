@@ -18,6 +18,10 @@ use crate::internal_api::search::{Kind, PAGE, Section, next_offset, read_all, re
 use crate::model::playlist::Playlist;
 use crate::spotify_api::WebApi;
 
+/// Transient retries of one search query. Fewer than other internal calls get: someone is
+/// waiting for the answer, and on a dead link every attempt runs into its timeout.
+const QUERY_RETRIES: u32 = 1;
+
 /// The rows of one tab, in the search answer's order.
 #[derive(Debug, Clone)]
 pub enum Rows {
@@ -136,7 +140,7 @@ impl SearchBackend for WebApi {
         variables: &serde_json::Value,
     ) -> Result<Outcome, InternalError> {
         let name = op.name();
-        self.run_internal_uncounted(Area::Search, |session| {
+        self.run_internal_uncounted(Area::Search, QUERY_RETRIES, |session| {
             pathfinder::query(session, name, hash.to_string(), variables.clone())
         })
     }
