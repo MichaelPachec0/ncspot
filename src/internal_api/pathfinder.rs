@@ -19,8 +19,11 @@ pub enum Outcome {
     /// `data.searchV2`, an object, next to a non-empty top-level `errors` array: a GraphQL
     /// partial answer (a server-side failure in some fields). Never a hash failure.
     Partial(serde_json::Value),
-    /// HTTP 412 or 400: this hash cannot be used.
+    /// HTTP 412: Spotify does not know this hash.
     BadHash,
+    /// HTTP 400: the operation name and the hash do not go together, or Spotify rejects
+    /// the request itself. A bad hash unless the hash already answered in this session.
+    BadRequest,
     /// HTTP 2xx without a `data.searchV2` object: the request was refused (bad input,
     /// a server-side failure). Not a hash failure, and not worth sending again.
     NoResult,
@@ -53,7 +56,8 @@ pub fn request_body(operation: &str, hash: &str, variables: &Value) -> String {
 /// text, since the body may echo the search term.
 pub fn outcome_of(status: u16, body: &[u8]) -> Result<Outcome, InternalError> {
     match status {
-        412 | 400 => Ok(Outcome::BadHash),
+        412 => Ok(Outcome::BadHash),
+        400 => Ok(Outcome::BadRequest),
         200..=299 => {
             let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
                 return Ok(Outcome::NoResult);
@@ -70,7 +74,10 @@ pub fn outcome_of(status: u16, body: &[u8]) -> Result<Outcome, InternalError> {
         }
         429 => Err(InternalError::RateLimited),
         401 | 403 => Err(InternalError::Denied),
-        400..=499 => Err(InternalError::NotFound),
+        // A request timeout is worth sending again, unlike the other 4xx statuses.
+        408 => Err(InternalError::Transient("pathfinder: http 408".into())),
+        // Every other 4xx; the ones with their own meaning are matched above.
+        status if (400..=499).contains(&status) => Err(InternalError::NotFound),
         _ => Err(InternalError::Transient(format!(
             "pathfinder: http {status}"
         ))),
@@ -153,7 +160,17 @@ mod tests {
     #[test]
     fn bad_hash_statuses() {
         assert_eq!(outcome_of(412, b""), Ok(Outcome::BadHash));
-        assert_eq!(outcome_of(400, b""), Ok(Outcome::BadHash));
+        assert_eq!(outcome_of(400, b""), Ok(Outcome::BadRequest));
+    }
+
+    #[test]
+    fn a_request_timeout_is_transient_unlike_other_4xx() {
+        assert!(matches!(
+            outcome_of(408, b""),
+            Err(InternalError::Transient(_))
+        ));
+        assert_eq!(outcome_of(404, b""), Err(InternalError::NotFound));
+        assert_eq!(outcome_of(409, b""), Err(InternalError::NotFound));
     }
 
     #[test]
