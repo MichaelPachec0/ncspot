@@ -2,7 +2,7 @@
 //! outcome its HTTP status and body mean.
 
 use bytes::Bytes;
-use http::{Method, Request, header};
+use http::{HeaderValue, Method, Request, header};
 use http_body_util::BodyExt;
 use librespot_core::Session;
 use serde_json::{Value, json};
@@ -16,6 +16,9 @@ pub const URL: &str = "https://api-partner.spotify.com/pathfinder/v2/query";
 pub enum Outcome {
     /// `data.searchV2`, an object.
     Answer(serde_json::Value),
+    /// `data.searchV2`, an object, next to a non-empty top-level `errors` array: a GraphQL
+    /// partial answer (a server-side failure in some fields). Never a hash failure.
+    Partial(serde_json::Value),
     /// HTTP 412 or 400: this hash cannot be used.
     BadHash,
     /// HTTP 2xx without a `data.searchV2` object: the request was refused (bad input,
@@ -52,18 +55,22 @@ pub fn outcome_of(status: u16, body: &[u8]) -> Result<Outcome, InternalError> {
     match status {
         412 | 400 => Ok(Outcome::BadHash),
         200..=299 => {
-            let answer = serde_json::from_slice::<Value>(body)
-                .ok()
-                .and_then(
-                    |mut v| match v.pointer_mut("/data/searchV2").map(Value::take) {
-                        Some(found) if found.is_object() => Some(found),
-                        _ => None,
-                    },
-                );
-            Ok(answer.map_or(Outcome::NoResult, Outcome::Answer))
+            let Ok(mut v) = serde_json::from_slice::<Value>(body) else {
+                return Ok(Outcome::NoResult);
+            };
+            let partial = v
+                .get("errors")
+                .and_then(Value::as_array)
+                .is_some_and(|errors| !errors.is_empty());
+            Ok(match v.pointer_mut("/data/searchV2").map(Value::take) {
+                Some(found) if found.is_object() && partial => Outcome::Partial(found),
+                Some(found) if found.is_object() => Outcome::Answer(found),
+                _ => Outcome::NoResult,
+            })
         }
         429 => Err(InternalError::RateLimited),
         401 | 403 => Err(InternalError::Denied),
+        400..=499 => Err(InternalError::NotFound),
         _ => Err(InternalError::Transient(format!(
             "pathfinder: http {status}"
         ))),
@@ -94,7 +101,13 @@ pub async fn query(
         .auth_token()
         .await
         .map_err(|e| token_error(&e))?;
-    let client_token = session.spclient().client_token().await.ok();
+    // A client-token that is not a valid header value is left out, not an error.
+    let client_token = session
+        .spclient()
+        .client_token()
+        .await
+        .ok()
+        .and_then(|token| HeaderValue::from_str(&token).ok());
 
     let mut builder = Request::builder()
         .method(Method::POST)
@@ -153,6 +166,19 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_with_errors_is_partial() {
+        let body =
+            br#"{"data":{"searchV2":{"tracksV2":null}},"errors":[{"message":"SECRETTERM"}]}"#;
+        let Ok(Outcome::Partial(v)) = outcome_of(200, body) else {
+            panic!()
+        };
+        assert!(v["tracksV2"].is_null());
+        // An empty `errors` array is a plain answer.
+        let body = br#"{"data":{"searchV2":{}},"errors":[]}"#;
+        assert!(matches!(outcome_of(200, body), Ok(Outcome::Answer(_))));
+    }
+
+    #[test]
     fn a_200_without_results_is_no_result() {
         for body in [
             &br#"{"errors":[{"message":"term was SECRETTERM"}]}"#[..],
@@ -168,7 +194,13 @@ mod tests {
         assert_eq!(outcome_of(429, b""), Err(InternalError::RateLimited));
         assert_eq!(outcome_of(401, b""), Err(InternalError::Denied));
         assert_eq!(outcome_of(403, b""), Err(InternalError::Denied));
-        for status in [404, 405, 413, 500, 503] {
+        for status in [404, 405, 413] {
+            assert_eq!(
+                outcome_of(status, b"SECRETTERM"),
+                Err(InternalError::NotFound)
+            );
+        }
+        for status in [500, 503] {
             let err = outcome_of(status, b"SECRETTERM").unwrap_err();
             assert_eq!(
                 err,

@@ -281,7 +281,8 @@ impl HashStore {
 pub enum RotateError {
     /// Every candidate is bad; nothing was or will be sent for this operation.
     Retired,
-    /// The request was refused (`Outcome::NoResult`); no hash was marked.
+    /// The request was refused (`Outcome::NoResult`, or an unreadable `Outcome::Partial`);
+    /// no hash was marked.
     NoResult,
     Failed(InternalError),
 }
@@ -304,6 +305,17 @@ pub fn rotate<T>(
                     store.mark_working(op, &hash);
                     return Ok(value);
                 }
+            }
+            // A partial answer is a server-side failure: read what came back, never blame
+            // the hash.
+            Ok(Outcome::Partial(answer)) => {
+                return match read(&answer) {
+                    Some(value) => {
+                        store.mark_working(op, &hash);
+                        Ok(value)
+                    }
+                    None => Err(RotateError::NoResult),
+                };
             }
             Ok(Outcome::BadHash) => {}
             Ok(Outcome::NoResult) => return Err(RotateError::NoResult),
@@ -457,6 +469,48 @@ mod tests {
                 Ok(Outcome::NoResult)
             },
             |_| Some(1),
+        );
+        assert_eq!((got, calls), (Err(RotateError::NoResult), 1));
+        assert_eq!(
+            s.candidates(Operation::Desktop).len(),
+            Operation::Desktop.builtin().len()
+        );
+        assert!(saved.lock().is_empty() && !s.is_retired(Operation::Desktop));
+    }
+
+    #[test]
+    fn a_readable_partial_answer_is_an_answer() {
+        let (s, saved) = store([], []);
+        let b = Operation::Desktop.builtin();
+        let mut calls = 0;
+        let got = rotate(
+            &s,
+            Operation::Desktop,
+            |_| {
+                calls += 1;
+                Ok(Outcome::Partial(json!({})))
+            },
+            |_| Some(3),
+        );
+        assert_eq!((got, calls), (Ok(3), 1));
+        assert_eq!(
+            *saved.lock(),
+            vec![("searchDesktop".to_string(), b[0].to_string())]
+        );
+    }
+
+    #[test]
+    fn an_unreadable_partial_answer_marks_nothing() {
+        let (s, saved) = store([], []);
+        let mut calls = 0;
+        let got: Result<u8, _> = rotate(
+            &s,
+            Operation::Desktop,
+            |_| {
+                calls += 1;
+                Ok(Outcome::Partial(json!({})))
+            },
+            |_| None,
         );
         assert_eq!((got, calls), (Err(RotateError::NoResult), 1));
         assert_eq!(
