@@ -2,7 +2,9 @@
 //! `searchDesktop` query, later pages of one tab from its own operation, and the rules that
 //! decide when the internal path is not used, has failed, or is over for the session.
 
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::thread;
 
 use librespot_core::SpotifyUri;
@@ -11,7 +13,7 @@ use rspotify::model::{FullArtist, FullTrack, SimplifiedAlbum, SimplifiedEpisode,
 
 use crate::internal_api::Area;
 use crate::internal_api::error::InternalError;
-use crate::internal_api::hashes::{HashStore, Operation, RotateError, retire, rotate};
+use crate::internal_api::hashes::{HashStore, Operation, RotateError, rotate, witness};
 use crate::internal_api::metadata::{self, Missing};
 use crate::internal_api::pathfinder::{self, Outcome, search_variables};
 use crate::internal_api::search::{Kind, PAGE, Section, next_offset, read_all, read_section};
@@ -100,8 +102,10 @@ pub(crate) fn first_page_failure(err: &RotateError) -> (FirstPageFailure, bool) 
         RotateError::Failed(InternalError::NoSession | InternalError::Denied) => {
             (FirstPageFailure::NotInUse, false)
         }
+        // Every `searchDesktop` hash drew an HTTP 400: hashes or request, nothing here can
+        // tell. This one search goes to the Web API and the next one asks again.
+        RotateError::Rejected(_) => (FirstPageFailure::NotInUse, false),
         RotateError::NoResult
-        | RotateError::Rejected(_)
         | RotateError::Failed(
             InternalError::RateLimited | InternalError::Transient(_) | InternalError::NotFound,
         ) => (FirstPageFailure::Failed, false),
@@ -323,23 +327,39 @@ pub(crate) fn first_page_with(
     }
 }
 
-/// The section of `kind` from one rotated query of `op`. A `searchDesktop` answer must have
-/// all six sections even when one is wanted.
+/// The section of `kind` from one rotated query of `op`, and whether it came from a plain
+/// answer (one without errors). A `searchDesktop` answer must have all six sections even
+/// when one is wanted.
 fn query_section(
     b: &impl SearchBackend,
     store: &HashStore,
     op: Operation,
     kind: Kind,
     variables: &serde_json::Value,
-) -> Result<Section, RotateError> {
-    let send = |hash: &str| b.send(op, hash, variables, QUERY_RETRIES);
-    if op == Operation::Desktop {
+) -> Result<(Section, bool), RotateError> {
+    // The rotation returns on the send that answered, so the last send decides.
+    let plain = Cell::new(false);
+    let send = |hash: &str| {
+        let outcome = b.send(op, hash, variables, QUERY_RETRIES);
+        plain.set(matches!(outcome, Ok(Outcome::Answer(_))));
+        outcome
+    };
+    let section = if op == Operation::Desktop {
         rotate(store, op, send, |v| {
             read_all(v).and_then(|mut all| all.remove(&kind))
         })
     } else {
         rotate(store, op, send, |v| read_section(v, kind))
-    }
+    }?;
+    Ok((section, plain.get()))
+}
+
+/// A number that stands for one request, so the hash store can tell requests apart without
+/// keeping the search term.
+fn request_key(variables: &serde_json::Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    variables.to_string().hash(&mut hasher);
+    hasher.finish()
 }
 
 pub(crate) fn next_page_with(
@@ -356,22 +376,21 @@ pub(crate) fn next_page_with(
 
     let variables = search_variables(term, offset, PAGE);
     let op = kind.operation();
-    let mut result = query_section(b, store, op, kind, &variables);
+    let section_of = |op| query_section(b, store, op, kind, &variables).map(|(section, _)| section);
+    let mut result = section_of(op);
     if op != Operation::Desktop {
         match result {
-            Err(RotateError::Retired) => {
-                result = query_section(b, store, Operation::Desktop, kind, &variables);
-            }
+            Err(RotateError::Retired) => result = section_of(Operation::Desktop),
             // The hashes of the operation drew an HTTP 400 and none of its own answered.
-            // `searchDesktop` gets the same page: if it answers, the request was fine and
-            // those hashes are bad; if not, the request stays the suspect.
-            Err(RotateError::Rejected(hashes)) => {
-                result = query_section(b, store, Operation::Desktop, kind, &variables);
-                if result.is_ok() {
-                    for hash in &hashes {
-                        retire(store, op, hash);
-                    }
+            // `searchDesktop` gets the same page. A plain answer counts against those
+            // hashes (the store marks them bad after two such requests); an answer with
+            // errors only supplies the page; a refusal leaves the request as the suspect.
+            Err(RotateError::Rejected(suspects)) => {
+                let desktop = query_section(b, store, Operation::Desktop, kind, &variables);
+                if matches!(desktop, Ok((_, true))) {
+                    witness(store, op, &suspects, request_key(&variables));
                 }
+                result = desktop.map(|(section, _)| section);
             }
             _ => {}
         }
@@ -557,6 +576,10 @@ mod tests {
         assert_eq!(f(InternalError::Transient("x".into())), (Failed, false));
         assert_eq!(f(InternalError::NotFound), (Failed, false));
         assert_eq!(first_page_failure(&RotateError::NoResult), (Failed, false));
+        assert_eq!(
+            first_page_failure(&RotateError::Rejected(Vec::new())),
+            (NotInUse, false)
+        );
     }
 
     #[test]
@@ -674,59 +697,133 @@ mod tests {
         assert_eq!(fake.counts(), (1, 0));
     }
 
-    #[test]
-    fn a_400_on_a_type_operation_is_a_bad_hash_once_search_desktop_answers_the_page() {
-        let fake = Fake::new(
-            |op, _| {
-                Ok(if op == Operation::Tracks {
-                    Outcome::BadRequest
+    /// A backend where `searchTracks` draws an HTTP 400 and `searchDesktop` gives `desktop()`.
+    fn tracks_refused(
+        desktop: impl Fn() -> Result<Outcome, InternalError> + Send + Sync + 'static,
+    ) -> Fake {
+        Fake::new(
+            move |op, _| {
+                if op == Operation::Tracks {
+                    Ok(Outcome::BadRequest)
                 } else {
-                    desktop_answer()
-                })
+                    desktop()
+                }
             },
             |kind| Ok(Rows::empty(kind)),
-        );
+        )
+    }
+
+    fn sent_ops(fake: &Fake) -> Vec<Operation> {
+        fake.sends.lock().iter().map(|(op, _, _)| *op).collect()
+    }
+
+    #[test]
+    fn a_400_on_a_type_operation_is_a_bad_hash_once_search_desktop_answers_two_pages() {
+        use Operation::{Desktop, Tracks};
+        let fake = tracks_refused(|| Ok(desktop_answer()));
         let store = store();
         let page = next_page_with(&fake, &store, Kind::Track, "x", 50);
         assert!(matches!(page, NextPage::Page(_)));
-        let ops: Vec<_> = fake.sends.lock().iter().map(|(op, _, _)| *op).collect();
-        assert_eq!(ops, vec![Operation::Tracks, Operation::Desktop]);
-        assert!(store.is_retired(Operation::Tracks));
-        assert!(fake.latched_areas().is_empty());
-        assert_eq!(fake.counts(), (1, 0));
+        assert_eq!(sent_ops(&fake), vec![Tracks, Desktop]);
+        // One request may be something only `searchTracks` refuses.
+        assert!(!store.is_retired(Tracks));
+        // The same page again is not a second request.
+        next_page_with(&fake, &store, Kind::Track, "x", 50);
+        assert!(!store.is_retired(Tracks));
 
-        // Later pages go straight to `searchDesktop`.
         let page = next_page_with(&fake, &store, Kind::Track, "x", 100);
         assert!(matches!(page, NextPage::Page(_)));
-        assert_eq!(fake.sends.lock().len(), 3);
+        assert!(store.is_retired(Tracks));
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(fake.counts(), (3, 0));
+
+        // Later pages go straight to `searchDesktop`.
+        let page = next_page_with(&fake, &store, Kind::Track, "x", 150);
+        assert!(matches!(page, NextPage::Page(_)));
+        assert_eq!(
+            sent_ops(&fake),
+            vec![Tracks, Desktop, Tracks, Desktop, Tracks, Desktop, Desktop]
+        );
+    }
+
+    #[test]
+    fn a_search_desktop_answer_with_errors_supplies_the_page_but_is_no_witness() {
+        let fake = tracks_refused(|| Ok(Outcome::Partial(search::test_answer())));
+        let store = store();
+        for offset in [50, 100, 150] {
+            let page = next_page_with(&fake, &store, Kind::Track, "x", offset);
+            assert!(matches!(page, NextPage::Page(_)));
+        }
+        assert!(!store.is_retired(Operation::Tracks));
+        assert_eq!(fake.counts(), (3, 0));
     }
 
     #[test]
     fn a_400_from_the_type_operation_and_search_desktop_ends_paging_and_marks_nothing() {
         let fake = Fake::new(|_, _| Ok(Outcome::BadRequest), |kind| Ok(Rows::empty(kind)));
         let store = store();
-        assert!(matches!(
-            next_page_with(&fake, &store, Kind::Track, "x", 50),
-            NextPage::Ended
-        ));
+        for offset in [50, 100] {
+            assert!(matches!(
+                next_page_with(&fake, &store, Kind::Track, "x", offset),
+                NextPage::Ended
+            ));
+        }
         assert!(!store.is_retired(Operation::Tracks) && !store.is_retired(Operation::Desktop));
         assert_eq!(
             store.candidates(Operation::Desktop).len(),
             Operation::Desktop.builtin().len()
         );
+        // Per page: the one `searchTracks` hash, then every `searchDesktop` hash.
+        let per_page = 1 + Operation::Desktop.builtin().len();
+        let ops = sent_ops(&fake);
+        assert_eq!(ops.len(), 2 * per_page);
+        assert_eq!(ops[0], Operation::Tracks);
+        assert!(ops[1..per_page].iter().all(|op| *op == Operation::Desktop));
         assert!(fake.latched_areas().is_empty());
         assert_eq!(fake.counts(), (0, 0));
     }
 
     #[test]
-    fn a_400_from_every_search_desktop_hash_fails_the_first_page_without_a_latch() {
+    fn a_refusing_search_desktop_after_a_type_400_marks_no_type_hash() {
+        // (what `searchDesktop` gives, the page outcome is Ended, Search latches)
+        type Desktop = fn() -> Result<Outcome, InternalError>;
+        let cases: [(Desktop, bool, bool); 4] = [
+            (|| Ok(Outcome::NoResult), true, false),
+            // An answer with errors that cannot be read.
+            (|| Ok(Outcome::Partial(json!({}))), true, false),
+            (|| Err(InternalError::Transient("x".into())), false, false),
+            // Every `searchDesktop` hash unknown: search is over for the session.
+            (|| Ok(Outcome::BadHash), true, true),
+        ];
+        for (at, (desktop, ended, latched)) in cases.into_iter().enumerate() {
+            let fake = tracks_refused(desktop);
+            let store = store();
+            for offset in [50, 100] {
+                let page = next_page_with(&fake, &store, Kind::Track, "x", offset);
+                assert_eq!(matches!(page, NextPage::Ended), ended, "case {at}");
+                assert_eq!(matches!(page, NextPage::Failed), !ended, "case {at}");
+            }
+            assert!(!store.is_retired(Operation::Tracks), "case {at}");
+            assert_eq!(!fake.latched_areas().is_empty(), latched, "case {at}");
+            assert_eq!(fake.counts(), (0, 0), "case {at}");
+        }
+    }
+
+    #[test]
+    fn a_400_from_every_search_desktop_hash_sends_that_search_to_the_web_api_without_a_latch() {
         let fake = Fake::new(|_, _| Ok(Outcome::BadRequest), |kind| Ok(Rows::empty(kind)));
+        let store = store();
         assert!(matches!(
-            first_page_with(&fake, &store(), "x"),
-            FirstPage::Failed
+            first_page_with(&fake, &store, "x"),
+            FirstPage::NotInUse
         ));
         assert!(fake.latched_areas().is_empty());
-        assert_eq!(fake.counts(), (0, 0));
+        assert_eq!(fake.counts(), (0, 1));
+        // Nothing was marked: the next search asks every hash again.
+        assert_eq!(
+            store.candidates(Operation::Desktop).len(),
+            Operation::Desktop.builtin().len()
+        );
     }
 
     #[test]

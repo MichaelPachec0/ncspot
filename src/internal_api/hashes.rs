@@ -154,7 +154,24 @@ pub fn load_overrides(path: &Path) -> Overrides {
 struct State {
     bad: HashSet<String>,
     working: Option<String>,
+    /// How often each hash answered in this session.
+    answers: HashMap<String, u64>,
+    /// Per hash under suspicion after an HTTP 400: the requests it refused that another
+    /// operation answered.
+    witnessed: HashMap<String, Vec<u64>>,
 }
+
+/// A hash that drew an HTTP 400, with its answer count from just before it was sent. The
+/// count shows whether the hash answered some other request since.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Suspect {
+    pub hash: String,
+    answered: u64,
+}
+
+/// Distinct requests another operation must answer before a hash that refused them is
+/// marked bad: one request may be something only that operation refuses.
+const WITNESSES: usize = 2;
 
 struct Shared {
     overrides: Overrides,
@@ -183,8 +200,8 @@ impl HashStore {
             state.insert(
                 op,
                 State {
-                    bad: HashSet::new(),
                     working,
+                    ..State::default()
                 },
             );
         }
@@ -248,9 +265,58 @@ impl HashStore {
         let mut state = self.shared.state.lock();
         let entry = state.entry(op).or_default();
         entry.bad.insert(hash.to_string());
+        entry.witnessed.remove(hash);
         if entry.working.as_deref() == Some(hash) {
             entry.working = None;
         }
+    }
+
+    /// How often `hash` answered in this session.
+    fn answered(&self, op: Operation, hash: &str) -> u64 {
+        let state = self.shared.state.lock();
+        state
+            .get(&op)
+            .and_then(|entry| entry.answers.get(hash).copied())
+            .unwrap_or(0)
+    }
+
+    /// Mark the suspect bad unless it answered since its HTTP 400. True when it was marked.
+    fn mark_suspect_bad(&self, op: Operation, suspect: &Suspect) -> bool {
+        let mut state = self.shared.state.lock();
+        let entry = state.entry(op).or_default();
+        if entry.answers.get(&suspect.hash).copied().unwrap_or(0) != suspect.answered {
+            return false;
+        }
+        entry.bad.insert(suspect.hash.clone());
+        entry.witnessed.remove(&suspect.hash);
+        if entry.working.as_deref() == Some(suspect.hash.as_str()) {
+            entry.working = None;
+        }
+        true
+    }
+
+    /// Record that another operation answered `request`, which the suspect refused. The
+    /// suspect is marked bad once that holds for [WITNESSES] distinct requests, and never
+    /// when it answered since its HTTP 400. True when it was marked.
+    fn witness_suspect(&self, op: Operation, suspect: &Suspect, request: u64) -> bool {
+        let mut state = self.shared.state.lock();
+        let entry = state.entry(op).or_default();
+        if entry.answers.get(&suspect.hash).copied().unwrap_or(0) != suspect.answered {
+            return false;
+        }
+        let seen = entry.witnessed.entry(suspect.hash.clone()).or_default();
+        if !seen.contains(&request) {
+            seen.push(request);
+        }
+        if seen.len() < WITNESSES {
+            return false;
+        }
+        entry.bad.insert(suspect.hash.clone());
+        entry.witnessed.remove(&suspect.hash);
+        if entry.working.as_deref() == Some(suspect.hash.as_str()) {
+            entry.working = None;
+        }
+        true
     }
 
     /// Remember `hash` as working; calls `persist` only when it differs from the last one.
@@ -261,6 +327,9 @@ impl HashStore {
             // An answer outranks an earlier bad mark (another thread's HTTP 400 for the same
             // hash while this answer was on its way).
             entry.bad.remove(hash);
+            // It also ends any suspicion from an HTTP 400.
+            entry.witnessed.remove(hash);
+            *entry.answers.entry(hash.to_string()).or_default() += 1;
             if entry.working.as_deref() == Some(hash) {
                 false
             } else {
@@ -295,8 +364,8 @@ pub enum RotateError {
     /// The rotation ran out and these hashes drew an HTTP 400 without another hash of the
     /// operation answering the request: the hashes or the request may be at fault. None of
     /// them was marked; a caller that gets the same request answered by another operation
-    /// passes them to [retire].
-    Rejected(Vec<String>),
+    /// passes them to [witness].
+    Rejected(Vec<Suspect>),
     Failed(InternalError),
 }
 
@@ -313,18 +382,23 @@ pub fn rotate<T>(
     }
     // Hashes that drew an HTTP 400 in this rotation. A 400 can be the hash's fault or the
     // request's, so they are marked bad only once another hash answers the same request.
-    let mut rejected: Vec<String> = Vec::new();
+    let mut rejected: Vec<Suspect> = Vec::new();
     for hash in store.candidates(op) {
         // The list is a snapshot: another thread may have marked this hash since.
         if store.is_bad(op, &hash) {
             continue;
         }
+        let answered = store.answered(op, &hash);
         match send(&hash) {
             Ok(Outcome::Answer(answer)) => {
                 if let Some(value) = read(&answer) {
                     store.mark_working(op, &hash);
-                    for hash in &rejected {
-                        retire(store, op, hash);
+                    // Same operation, same request: one answer is enough. A suspect that
+                    // answered on another thread meanwhile is left alone.
+                    for suspect in &rejected {
+                        if store.mark_suspect_bad(op, suspect) {
+                            log_marked(op, &suspect.hash);
+                        }
                     }
                     return Ok(value);
                 }
@@ -351,7 +425,7 @@ pub fn rotate<T>(
             }
             Ok(Outcome::BadHash) => {}
             Ok(Outcome::BadRequest) => {
-                rejected.push(hash);
+                rejected.push(Suspect { hash, answered });
                 continue;
             }
             Ok(Outcome::NoResult) => return Err(RotateError::NoResult),
@@ -377,14 +451,29 @@ fn short(hash: &str) -> &str {
     hash.get(..8).unwrap_or(hash)
 }
 
-/// Mark `hash` bad for the rest of the session and log it.
-pub fn retire(store: &HashStore, op: Operation, hash: &str) {
+fn log_marked(op: Operation, hash: &str) {
     warn!(
-        "{}: hash {} was not accepted, trying the next one",
+        "{}: hash {} was not accepted, marked bad for this session",
         op.name(),
         short(hash)
     );
+}
+
+/// Mark `hash` bad for the rest of the session and log it.
+fn retire(store: &HashStore, op: Operation, hash: &str) {
+    log_marked(op, hash);
     store.mark_bad(op, hash);
+}
+
+/// Another operation answered `request` (a number that stands for the request's variables),
+/// which every suspect of `op` refused with an HTTP 400. A suspect is marked bad once this
+/// happened for [WITNESSES] distinct requests; one that answered since its 400 is left alone.
+pub fn witness(store: &HashStore, op: Operation, suspects: &[Suspect], request: u64) {
+    for suspect in suspects {
+        if store.witness_suspect(op, suspect, request) {
+            log_marked(op, &suspect.hash);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -616,7 +705,13 @@ mod tests {
             },
             |_| Some(1),
         );
-        let all: Vec<String> = b.iter().map(|h| h.to_string()).collect();
+        let all: Vec<Suspect> = b
+            .iter()
+            .map(|h| Suspect {
+                hash: h.to_string(),
+                answered: 0,
+            })
+            .collect();
         assert_eq!((got, calls), (Err(RotateError::Rejected(all)), b.len()));
         assert_eq!(s.candidates(Operation::Desktop).len(), b.len());
         assert!(saved.lock().is_empty() && !s.is_retired(Operation::Desktop));
@@ -643,6 +738,96 @@ mod tests {
         assert_eq!((got, calls), (Err(RotateError::NoResult), 3));
         assert!(!s.is_bad(Operation::Desktop, b[0]));
         assert!(s.is_bad(Operation::Desktop, b[1]));
+    }
+
+    #[test]
+    fn a_rotation_that_runs_out_on_400_and_412_reports_only_the_400_hashes() {
+        let (s, _) = store([], []);
+        let b = Operation::Desktop.builtin();
+        let mut calls = 0;
+        let got: Result<u8, _> = rotate(
+            &s,
+            Operation::Desktop,
+            |_| {
+                calls += 1;
+                Ok(if calls == 2 {
+                    Outcome::BadRequest
+                } else {
+                    Outcome::BadHash
+                })
+            },
+            |_| Some(1),
+        );
+        let Err(RotateError::Rejected(suspects)) = got else {
+            panic!("expected Rejected, got {got:?}");
+        };
+        let hashes: Vec<&str> = suspects.iter().map(|s| s.hash.as_str()).collect();
+        assert_eq!((hashes, calls), (vec![b[1]], b.len()));
+        // The 412 hashes are bad, the 400 hash is still a candidate.
+        assert_eq!(s.candidates(Operation::Desktop), vec![b[1].to_string()]);
+    }
+
+    fn suspect(s: &HashStore, op: Operation, hash: &str) -> Suspect {
+        Suspect {
+            hash: hash.to_string(),
+            answered: s.answered(op, hash),
+        }
+    }
+
+    #[test]
+    fn a_suspect_is_marked_bad_after_two_distinct_witnessed_requests() {
+        let (s, _) = store([], []);
+        let op = Operation::Tracks;
+        let b = op.builtin()[0];
+        let first = [suspect(&s, op, b)];
+        witness(&s, op, &first, 1);
+        // The same request again is not a second witness.
+        witness(&s, op, &first, 1);
+        assert!(!s.is_bad(op, b));
+        witness(&s, op, &[suspect(&s, op, b)], 2);
+        assert!(s.is_bad(op, b) && s.is_retired(op));
+    }
+
+    #[test]
+    fn a_suspect_that_answered_since_its_400_is_not_marked() {
+        let (s, _) = store([], []);
+        let op = Operation::Tracks;
+        let b = op.builtin()[0];
+        let before = [suspect(&s, op, b)];
+        witness(&s, op, &before, 1);
+        // Another thread gets an answer from the hash: the suspicion is gone, and the
+        // suspect taken before that answer no longer counts.
+        s.mark_working(op, b);
+        witness(&s, op, &before, 2);
+        assert!(!s.is_bad(op, b));
+        // A new 400 starts over: one more witness is not enough.
+        witness(&s, op, &[suspect(&s, op, b)], 3);
+        assert!(!s.is_bad(op, b));
+    }
+
+    #[test]
+    fn a_400_hash_that_answers_on_another_thread_is_not_marked_when_the_next_hash_answers() {
+        let (s, _) = store([], []);
+        let b = Operation::Desktop.builtin();
+        let mut calls = 0;
+        let got = rotate(
+            &s,
+            Operation::Desktop,
+            |hash| {
+                calls += 1;
+                if calls == 1 {
+                    return Ok(Outcome::BadRequest);
+                }
+                assert_eq!(hash, b[1]);
+                // Stands for another thread's answer from the first hash, arriving while
+                // this request is on its way.
+                s.mark_working(Operation::Desktop, b[0]);
+                Ok(Outcome::Answer(json!({})))
+            },
+            |_| Some(7),
+        );
+        assert_eq!(got, Ok(7));
+        assert!(!s.is_bad(Operation::Desktop, b[0]));
     }
 
     #[test]
