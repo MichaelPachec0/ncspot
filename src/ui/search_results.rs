@@ -601,7 +601,10 @@ impl SearchResultsView {
         std::thread::spawn(move || {
             let _activity = activity;
             match spotify.api.search_first_page(&term) {
-                FirstPage::Internal(mut pages) => {
+                FirstPage::Internal {
+                    tabs: mut pages,
+                    top: _,
+                } => {
                     let (term, spotify, events) = (&term, &spotify, &events);
                     tabs.tracks.fill(
                         pages.remove(&Kind::Track),

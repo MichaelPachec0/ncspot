@@ -47,7 +47,7 @@ use crate::rate_limit::{
     Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
 };
-use crate::search_api::{self, FirstPage, NextPage};
+use crate::search_api::{self, FirstPage, NextPage, TopDraft};
 use crate::spotify_worker::WorkerCommand;
 use crate::ui::pagination::{ApiPage, ApiResult};
 use crate::utils::OnDrop;
@@ -166,6 +166,16 @@ pub struct WebApi {
     events: Option<EventManager>,
     /// Spotify's internal API client, shared by all clones.
     internal: InternalApi,
+    /// Whether the last text search was served by the Web API, shared by all clones.
+    search_served_by_web: Arc<AtomicBool>,
+}
+
+/// Pause before the one retry of a Top tab stray fetch after a transient failure.
+const STRAY_RETRY_PAUSE: Duration = Duration::from_millis(500);
+
+/// Whether a stray fetch that failed with `first` is sent once more.
+fn retry_stray(first: &InternalError) -> bool {
+    matches!(first, InternalError::Transient(_))
 }
 
 /// `call` once per `size` items of `items`, in order, with the results concatenated; the first
@@ -211,6 +221,7 @@ impl WebApi {
             worker_channel: Arc::new(RwLock::new(None)),
             events: None,
             internal: InternalApi::new(settings),
+            search_served_by_web: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -269,7 +280,28 @@ impl WebApi {
     /// The first page of all six search tabs from the internal API (see
     /// [search_api::first_page_with]). Blocks on the network: never call it on the UI thread.
     pub fn search_first_page(&self, term: &str) -> FirstPage {
-        search_api::first_page_with(self, self.search_hashes(), term)
+        let page = search_api::first_page_with(self, self.search_hashes(), term);
+        if !term.trim().is_empty() {
+            let before = self.search_served_by_web.load(Ordering::Relaxed);
+            self.search_served_by_web.store(
+                search_api::served_by_web_after(before, &page),
+                Ordering::Relaxed,
+            );
+        }
+        page
+    }
+
+    /// See [search_api::fetch_strays_with]. Blocks on the network: never on the UI thread.
+    pub fn search_top_strays(&self, draft: &mut TopDraft) {
+        search_api::fetch_strays_with(self, draft);
+    }
+
+    /// Whether a text search started now would get a Top tab: search and metadata areas
+    /// usable, and the last text search not served by the Web API. Sends nothing.
+    pub fn internal_search_in_use(&self) -> bool {
+        self.internal_usable(Area::Search)
+            && self.internal_usable(Area::Metadata)
+            && !self.search_served_by_web.load(Ordering::Relaxed)
     }
 
     /// The search page of `kind` at `offset` from the internal API (see
@@ -359,6 +391,34 @@ impl WebApi {
         T: Send + 'static,
     {
         self.run_internal_with(area, false, 0, true, internal)
+    }
+
+    /// Like [Self::run_internal] for calls only the search Top tab needs: no waiting for a
+    /// rate-limit window (an open window or a rate-limit answer fails at once with
+    /// `RateLimited`), and one more send after [STRAY_RETRY_PAUSE] on a transient failure.
+    /// Interim: the async rework of the internal-call runner is to give calls separate retry
+    /// and rate-limit-wait policy and remove this.
+    pub(crate) fn run_internal_stray<T, F, Fut>(
+        &self,
+        area: Area,
+        internal: F,
+    ) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        match self.run_internal_with(area, false, 0, true, &internal) {
+            Err(err) if retry_stray(&err) => {
+                debug!(
+                    "internal API {} call failed (transient), one retry",
+                    area.name()
+                );
+                thread::sleep(STRAY_RETRY_PAUSE);
+                self.run_internal_with(area, false, 0, true, internal)
+            }
+            result => result,
+        }
     }
 
     fn run_internal_with<T, F, Fut>(
@@ -1861,6 +1921,41 @@ mod test {
             Err(InternalError::NoSession)
         ));
         assert_eq!(api.library_episodes(&[]).map(|v| v.len()), Ok(0));
+    }
+
+    #[test]
+    fn internal_search_in_use_needs_both_areas() {
+        let api = WebApi::new(&Config::new_for_test());
+        assert!(api.internal_search_in_use());
+        api.latch_area(Area::Metadata, &InternalError::ProtocolChanged("x".into()));
+        assert!(!api.internal_search_in_use());
+    }
+
+    #[test]
+    fn a_search_served_by_the_web_api_is_remembered_across_clones() {
+        let api = WebApi::new(&Config::new_for_test());
+        let earlier = api.clone();
+        assert!(matches!(api.search_first_page("x"), FirstPage::NotInUse));
+        assert!(!api.internal_search_in_use());
+        assert!(!earlier.internal_search_in_use());
+
+        let fresh = WebApi::new(&Config::new_for_test());
+        assert!(matches!(fresh.search_first_page("  "), FirstPage::NotInUse));
+        assert!(fresh.internal_search_in_use());
+    }
+
+    #[test]
+    fn retry_stray_is_true_for_transient_only() {
+        for (err, retry) in [
+            (InternalError::ProtocolChanged("x".into()), false),
+            (InternalError::NoSession, false),
+            (InternalError::NotFound, false),
+            (InternalError::Denied, false),
+            (InternalError::RateLimited, false),
+            (InternalError::Transient("x".into()), true),
+        ] {
+            assert_eq!(retry_stray(&err), retry, "{}", err.class());
+        }
     }
 
     #[test]

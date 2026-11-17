@@ -171,7 +171,6 @@ pub fn playlist_row(data: &Value) -> Option<Playlist> {
 
 /// One usable entry of `topResultsV2.itemsV2`, in the answer's order.
 #[derive(Debug, Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub struct TopEntry {
     pub kind: Kind,
     pub uri: String,
@@ -180,7 +179,6 @@ pub struct TopEntry {
 }
 
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub struct TopResults {
     pub items: Vec<TopEntry>,
     /// `topResultsV2.featured`, without playlists already in `items`.
@@ -190,7 +188,6 @@ pub struct TopResults {
 }
 
 /// The kind a `spotify:<kind>:<id>` uri names; `None` for any other uri.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub fn kind_of_uri(uri: &str) -> Option<Kind> {
     let rest = uri.strip_prefix("spotify:")?;
     let (name, id) = rest.split_once(':')?;
@@ -209,7 +206,6 @@ pub fn kind_of_uri(uri: &str) -> Option<Kind> {
 }
 
 /// Never fails: anything missing or unreadable only costs entries.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub fn read_top(search_v2: &Value) -> TopResults {
     let mut top = TopResults::default();
     let mut seen: HashSet<String> = HashSet::new();
