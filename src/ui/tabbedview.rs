@@ -616,6 +616,22 @@ mod tests {
     }
 
     #[test]
+    fn the_fit_mode_bar_gives_the_spare_columns_to_the_last_tab_as_before() {
+        let mut tabs = named_tabs(&SEARCH_TITLES[..3], 32);
+        tabs.set_selected(2);
+        let (text, colors, primary, highlight) = draw_bar(&mut tabs, 32);
+        assert_eq!(text, "   Top      Tracks     Albums   ");
+        for (x, color) in colors.iter().enumerate() {
+            let expected = if (20..32).contains(&x) {
+                highlight
+            } else {
+                primary
+            };
+            assert_eq!(*color, Some(expected), "column {x}");
+        }
+    }
+
+    #[test]
     fn the_scroll_mode_bar_draws_titles_padding_and_arrows() {
         let mut tabs = named_tabs(&SEARCH_TITLES, 56);
         tabs.first = 2;
@@ -777,20 +793,9 @@ mod tests {
                         && only.width < title + 4
                     {
                         assert_eq!(only.tab, selected, "{count} tabs, width {width}");
-                        let start = if bar.first > 0 { ARROW_WIDTH } else { 0 };
-                        let end = if selected + 1 == count {
-                            width
-                        } else {
-                            width.saturating_sub(ARROW_WIDTH)
-                        };
-                        assert_eq!(*only, slot(selected, start, end - start));
                     }
                     tabs.set_selected(selected);
                     draw_bar(&mut tabs, width);
-                    for x in 0..width + 2 {
-                        on_bar(&mut tabs, x, MouseEvent::Press(MouseButton::Left));
-                        tabs.set_selected(selected);
-                    }
                 }
             }
         }
@@ -845,6 +850,72 @@ mod tests {
     }
 
     #[test]
+    fn a_click_on_any_drawn_cell_hits_what_the_cell_shows() {
+        let wide = ["Top", "Tracks", "A rather wide title", "Artists", "Shows"];
+        let sets: [&[&str]; 4] = [&[], &SEARCH_TITLES[..1], &SEARCH_TITLES, &wide];
+        for titles in sets {
+            let count = titles.len();
+            for width in 0..=120 {
+                let mut tabs = named_tabs(titles, width);
+                // Up through the tabs, then back down, carrying the bar's position.
+                for selected in (0..count.max(1)).chain((0..count).rev()) {
+                    let at = format!("{count} tabs, width {width}, selected {selected}");
+                    tabs.set_selected(selected);
+                    let (text, colors, _, highlight) = draw_bar(&mut tabs, width);
+                    let row: Vec<char> = text.chars().collect();
+                    let lit = |colors: &[Option<ColorPair>]| -> Vec<usize> {
+                        (0..width)
+                            .filter(|x| colors[*x] == Some(highlight))
+                            .collect()
+                    };
+
+                    // A slot is the cells its tab lights when selected with the bar where it
+                    // is: for the selected tab this draw, for another tab a fresh view at the
+                    // same position. A tab whose selection moves the bar is hidden.
+                    let mut owner: Vec<Option<usize>> = vec![None; width];
+                    for x in lit(&colors) {
+                        owner[x] = Some(selected);
+                    }
+                    for other in (0..count).filter(|tab| *tab != selected) {
+                        let mut probe = named_tabs(titles, width);
+                        probe.first = tabs.first;
+                        probe.set_selected(other);
+                        let (probe_text, probe_colors, ..) = draw_bar(&mut probe, width);
+                        if probe.first != tabs.first {
+                            continue;
+                        }
+                        assert_eq!(probe_text, text, "{at}, probing {other}");
+                        for x in lit(&probe_colors) {
+                            assert_eq!(owner[x], None, "{at}, column {x} lit twice");
+                            owner[x] = Some(other);
+                        }
+                    }
+
+                    // The arrows as drawn; the left one is drawn over the right one.
+                    let left = row.first() == Some(&'<');
+                    let right = row.last() == Some(&'>');
+                    for (x, tab) in owner.iter().enumerate() {
+                        let expected = if left && x < LEFT_ARROW.len() {
+                            BarClick::Left
+                        } else if right && x + RIGHT_ARROW.len() >= width {
+                            BarClick::Right
+                        } else if let Some(tab) = tab {
+                            BarClick::Tab(*tab)
+                        } else {
+                            BarClick::Nothing
+                        };
+                        assert_eq!(
+                            bar_click(&tabs.current_bar(), x, width),
+                            expected,
+                            "{at}, column {x}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_click_maps_to_the_tab_under_it_or_to_an_arrow() {
         let scroll = bar(&WIDTHS, 56, 4, 2);
         assert!(scroll.left_arrow && scroll.right_arrow);
@@ -870,6 +941,20 @@ mod tests {
         for x in 0..100 {
             assert_eq!(bar_click(&fit, x, 100), BarClick::Tab(min(x / 14, 6)));
         }
+    }
+
+    #[test]
+    fn the_widget_keeps_the_bar_where_it_is_while_the_selected_tab_is_shown() {
+        let mut tabs = named_tabs(&SEARCH_TITLES, 56);
+        tabs.set_selected(6);
+        let (at_six, ..) = draw_bar(&mut tabs, 56);
+        assert!(
+            at_six.starts_with("<-   Artists  "),
+            "the bar starts at Artists"
+        );
+        tabs.set_selected(4);
+        let (at_four, ..) = draw_bar(&mut tabs, 56);
+        assert_eq!(at_four, at_six, "Playlists was shown, so the bar stays");
     }
 
     #[test]
