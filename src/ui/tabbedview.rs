@@ -110,12 +110,12 @@ pub(crate) fn bar(titles: &[usize], width: usize, selected: usize, first: usize)
         }
     }
 
-    // With no slot at all, the selected tab stands for the tab shown.
-    let last_shown = slots.last().map_or(selected, |slot| slot.tab);
+    // With no slot at all there is no tab a right arrow could lead past.
+    let right_arrow = slots.last().is_some_and(|slot| slot.tab != count - 1);
     Bar {
         slots,
         left_arrow: first > 0,
-        right_arrow: last_shown != count - 1,
+        right_arrow,
         first,
     }
 }
@@ -799,7 +799,8 @@ mod tests {
             none.slots.is_empty(),
             "zero columns left between the arrows"
         );
-        assert!(none.left_arrow && none.right_arrow);
+        assert!(none.left_arrow, "tabs 0..=2 are hidden on the left");
+        assert!(!none.right_arrow, "no right arrow without a slot");
         let last = bar(&WIDTHS, 7, 6, 0);
         assert_eq!(last.slots, vec![slot(6, 3, 4)]);
         assert!(last.left_arrow && !last.right_arrow);
