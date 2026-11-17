@@ -528,8 +528,10 @@ pub fn run_with_retries(
 
 #[cfg(test)]
 pub mod test_items {
+    use crate::model::album::Album;
     use crate::model::artist::Artist;
     use crate::model::episode::Episode;
+    use crate::model::playlist::Playlist;
     use crate::model::show::Show;
     use crate::model::track::Track;
 
@@ -552,6 +554,45 @@ pub mod test_items {
             list_index: 0,
             is_local: false,
             is_playable: None,
+        }
+    }
+
+    /// As [track], playable (so that playing it fires no events).
+    pub fn playable_track(id: &str) -> Track {
+        Track {
+            is_playable: Some(true),
+            ..track(id, &[])
+        }
+    }
+
+    pub fn album(id: &str) -> Album {
+        Album {
+            id: Some(id.to_string()),
+            title: id.to_string(),
+            artists: Vec::new(),
+            artist_ids: Vec::new(),
+            year: String::new(),
+            cover_url: None,
+            url: None,
+            tracks: None,
+            added_at: None,
+            total_tracks: None,
+        }
+    }
+
+    pub fn playlist(id: &str) -> Playlist {
+        Playlist {
+            id: id.to_string(),
+            name: id.to_string(),
+            owner_id: String::new(),
+            owner_name: None,
+            snapshot_id: String::new(),
+            num_tracks: 0,
+            tracks: None,
+            collaborative: false,
+            cover_url: None,
+            tracks_unknown: false,
+            web_loaded: false,
         }
     }
 

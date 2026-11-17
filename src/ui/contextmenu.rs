@@ -57,6 +57,19 @@ enum ContextMenuAction {
 }
 
 impl ContextMenu {
+    /// The labels of the entries, in order.
+    #[cfg(test)]
+    pub fn labels_for_test(&mut self) -> Vec<String> {
+        self.dialog
+            .call_on_name(
+                "contextmenu_select",
+                |v: &mut SelectView<ContextMenuAction>| {
+                    v.iter().map(|(label, _)| label.to_string()).collect()
+                },
+            )
+            .unwrap_or_default()
+    }
+
     pub fn add_track_dialog(library: Arc<Library>, track: Track) -> NamedView<AddToPlaylistMenu> {
         let mut list_select: SelectView<Playlist> = SelectView::new();
         let current_user_id = library.user_id.as_ref().unwrap();

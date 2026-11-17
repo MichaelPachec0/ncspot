@@ -5,4 +5,5 @@ pub mod episode;
 pub mod playable;
 pub mod playlist;
 pub mod show;
+pub mod top_item;
 pub mod track;
