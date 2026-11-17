@@ -382,7 +382,9 @@ mod tests {
         let top = read_top(&top_answer());
         let ids: Vec<&str> = top.featured.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["pf1", "pf2"]);
-        assert_eq!(top.unbuildable, 2); // p7 and pf8; repeats are not counted
+        // p7 and pf8: every unbuildable playlist entry left out counts, a repeat too; the
+        // playlist repeats here (p1, pf1) are buildable copies of accepted entries.
+        assert_eq!(top.unbuildable, 2);
     }
 
     #[test]
