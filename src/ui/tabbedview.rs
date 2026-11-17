@@ -392,10 +392,17 @@ impl View for TabbedView {
                     MouseEvent::Press(MouseButton::Left) => {
                         let Some(position) = position else { return };
                         let width = tabs.last_layout_size.x;
-                        match bar_click(&tabs.current_bar(), position.x, width) {
+                        let bar = tabs.current_bar();
+                        match bar_click(&bar, position.x, width) {
                             BarClick::Tab(tab) => tabs.set_selected(tab),
-                            BarClick::Left => tabs.move_left(),
-                            BarClick::Right => tabs.move_right(),
+                            // The nearest tab hidden on the left.
+                            BarClick::Left => tabs.set_selected(bar.first.saturating_sub(1)),
+                            // The first tab hidden on the right.
+                            BarClick::Right => {
+                                if let Some(last) = bar.slots.last() {
+                                    tabs.set_selected(last.tab + 1);
+                                }
+                            }
                             BarClick::Nothing => {}
                         }
                     }
@@ -866,19 +873,30 @@ mod tests {
     }
 
     #[test]
-    fn clicking_an_arrow_moves_one_tab_and_counts_as_a_user_move() {
+    fn clicking_the_right_arrow_selects_the_first_tab_hidden_on_the_right() {
+        let mut tabs = named_tabs(&SEARCH_TITLES, 56);
+        let (text, ..) = draw_bar(&mut tabs, 56);
+        assert!(text.starts_with("  Top    Tracks    Albums    Artists    Playlists  "));
+        assert!(text.ends_with(" ->"));
+        on_bar(&mut tabs, 55, MouseEvent::Press(MouseButton::Left));
+        assert_eq!(tabs.selected(), 5, "Shows, the tab after Playlists");
+        assert!(tabs.moved_by_user());
+        let (text, ..) = draw_bar(&mut tabs, 56);
+        assert!(text.contains("  Shows  "), "the selected tab is shown");
+    }
+
+    #[test]
+    fn clicking_the_left_arrow_selects_the_nearest_tab_hidden_on_the_left() {
         let mut tabs = named_tabs(&SEARCH_TITLES, 56);
         tabs.set_selected(6);
-        tabs.layout(Vec2::new(56, 10));
+        let (text, ..) = draw_bar(&mut tabs, 56);
+        assert!(text.starts_with("<-   Artists    Playlists  "));
         assert!(!tabs.moved_by_user());
         on_bar(&mut tabs, 1, MouseEvent::Press(MouseButton::Left));
-        assert_eq!(tabs.selected(), 5);
+        assert_eq!(tabs.selected(), 2, "Albums, the tab before Artists");
         assert!(tabs.moved_by_user());
-
-        let mut tabs = named_tabs(&SEARCH_TITLES, 56);
-        on_bar(&mut tabs, 55, MouseEvent::Press(MouseButton::Left));
-        assert_eq!(tabs.selected(), 1);
-        assert!(tabs.moved_by_user());
+        let (text, ..) = draw_bar(&mut tabs, 56);
+        assert!(text.contains("  Albums  "), "the selected tab is shown");
     }
 
     #[test]
