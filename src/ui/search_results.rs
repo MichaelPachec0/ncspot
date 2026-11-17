@@ -9,22 +9,24 @@ use crate::model::artist::Artist;
 use crate::model::episode::Episode;
 use crate::model::playlist::Playlist;
 use crate::model::show::Show;
+use crate::model::top_item::{TopItem, top_items};
 use crate::model::track::Track;
 use crate::queue::Queue;
-use crate::search_api::{FirstPage, NextPage, Rows, TabPage};
+use crate::search_api::{FirstPage, NextPage, Rows, TabPage, TopDraft};
 use crate::spotify::{Spotify, UriType};
 use crate::spotify_url::SpotifyUrl;
 use crate::traits::{ListItem, ViewExt};
 use crate::ui::listview::ListView;
 use crate::ui::pagination::{Pagination, Position};
 use crate::ui::tabbedview::TabbedView;
-use cursive::Cursive;
 use cursive::view::ViewWrapper;
+use cursive::{Cursive, Vec2, View};
 use parking_lot::RwLock;
 use rspotify::model::SearchType;
 use rspotify::model::search::SearchResult;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct SearchResultsView {
     search_term: String,
@@ -40,9 +42,109 @@ pub struct SearchResultsView {
     pagination_shows: Pagination<Show>,
     results_episodes: Arc<RwLock<Vec<Episode>>>,
     pagination_episodes: Pagination<Episode>,
+    /// The rows of the Top tab; `None` when the view has no Top tab.
+    top: Option<Arc<RwLock<Vec<TopItem>>>>,
+    /// Set by the search thread to ask for the move from Top to Tracks; applied and cleared
+    /// on the next layout.
+    to_tracks: Arc<AtomicBool>,
     tabs: TabbedView,
     spotify: Spotify,
     events: EventManager,
+}
+
+/// What a search term is, known before the tabs are built.
+pub(crate) enum TermKind {
+    Uri(UriType),
+    Url(SpotifyUrl),
+    Text,
+}
+
+pub(crate) fn term_kind(term: &str) -> TermKind {
+    if let Ok(uri_type) = term.parse() {
+        TermKind::Uri(uri_type)
+    } else if let Some(url) = SpotifyUrl::from_url(term) {
+        TermKind::Url(url)
+    } else {
+        TermKind::Text
+    }
+}
+
+/// Whether a search for `term` gets a Top tab: a text term while the internal search is in
+/// use.
+fn with_top(term: &TermKind, internal_search_in_use: bool) -> bool {
+    matches!(term, TermKind::Text) && internal_search_in_use
+}
+
+/// The tab a lookup of `uri_type` shows its item in, in a view without a Top tab.
+fn uri_tab(uri_type: UriType) -> usize {
+    match uri_type {
+        UriType::Track => 0,
+        UriType::Album => 1,
+        UriType::Artist => 2,
+        UriType::Playlist => 3,
+        UriType::Show => 4,
+        UriType::Episode => 5,
+    }
+}
+
+/// The index of the Tracks tab in a view with a Top tab.
+const TRACKS_AFTER_TOP: usize = 1;
+
+/// Pure: the tab to move to when a move to Tracks was asked for, if any.
+pub(crate) fn tracks_hop(asked: bool, moved_by_user: bool, has_top: bool) -> Option<usize> {
+    (asked && !moved_by_user && has_top).then_some(TRACKS_AFTER_TOP)
+}
+
+/// The Top tab's part of a finished internal first page: settle the strays with
+/// `fetch_strays`, write the rows once, and ask for the move to Tracks when no item row
+/// came of it.
+fn fill_top(
+    mut top: TopDraft,
+    fetch_strays: impl FnOnce(&mut TopDraft),
+    rows: &RwLock<Vec<TopItem>>,
+    to_tracks: &AtomicBool,
+) {
+    if top.has_strays() {
+        fetch_strays(&mut top);
+    }
+    let items = top_items(top.rows(), top.featured());
+    if !items.iter().any(TopItem::is_item) {
+        to_tracks.store(true, Ordering::Relaxed);
+    }
+    *rows.write() = items;
+}
+
+/// How the first page of a text search came back.
+#[derive(Clone, Copy)]
+pub(crate) enum FirstPageClass {
+    Internal,
+    NotInUse,
+    Failed,
+}
+
+impl FirstPageClass {
+    fn of(page: &FirstPage) -> Self {
+        match page {
+            FirstPage::Internal { .. } => Self::Internal,
+            FirstPage::NotInUse => Self::NotInUse,
+            FirstPage::Failed => Self::Failed,
+        }
+    }
+}
+
+/// What the background thread does with the first page, apart from filling the six tabs.
+/// Returns whether the Web API search must run. A Top tab the internal search did not serve
+/// asks for the move to Tracks.
+fn after_first_page(page_is: FirstPageClass, has_top: bool, to_tracks: &AtomicBool) -> bool {
+    match page_is {
+        FirstPageClass::Internal | FirstPageClass::Failed => false,
+        FirstPageClass::NotInUse => {
+            if has_top {
+                to_tracks.store(true, Ordering::Relaxed);
+            }
+            true
+        }
+    }
 }
 
 /// The status bar text for a search whose first page failed. Never carries the term.
@@ -205,6 +307,21 @@ impl SearchResultsView {
         queue: Arc<Queue>,
         library: Arc<Library>,
     ) -> Self {
+        let term = term_kind(&search_term);
+        let top = with_top(&term, queue.get_spotify().api.internal_search_in_use());
+        let mut view = Self::build(search_term, events, queue, library, top);
+        view.run_search(term);
+        view
+    }
+
+    /// Build the view and its tabs without starting the search.
+    fn build(
+        search_term: String,
+        events: EventManager,
+        queue: Arc<Queue>,
+        library: Arc<Library>,
+        with_top: bool,
+    ) -> Self {
         let results_tracks = Arc::new(RwLock::new(Vec::new()));
         let results_albums = Arc::new(RwLock::new(Vec::new()));
         let results_artists = Arc::new(RwLock::new(Vec::new()));
@@ -223,10 +340,16 @@ impl SearchResultsView {
         let pagination_playlists = list_playlists.get_pagination().clone();
         let list_shows = ListView::new(results_shows.clone(), queue.clone(), library.clone());
         let pagination_shows = list_shows.get_pagination().clone();
-        let list_episodes = ListView::new(results_episodes.clone(), queue.clone(), library);
+        let list_episodes = ListView::new(results_episodes.clone(), queue.clone(), library.clone());
         let pagination_episodes = list_episodes.get_pagination().clone();
 
         let mut tabs = TabbedView::new();
+        let top = with_top.then(|| {
+            let results_top = Arc::new(RwLock::new(Vec::new()));
+            let list_top = ListView::new(results_top.clone(), queue.clone(), library.clone());
+            tabs.add_tab("Top", list_top);
+            results_top
+        });
         tabs.add_tab("Tracks", list_tracks);
         tabs.add_tab("Albums", list_albums);
         tabs.add_tab("Artists", list_artists);
@@ -234,7 +357,7 @@ impl SearchResultsView {
         tabs.add_tab("Shows", list_shows);
         tabs.add_tab("Episodes", list_episodes);
 
-        let mut view = Self {
+        Self {
             search_term,
             results_tracks,
             pagination_tracks,
@@ -248,13 +371,12 @@ impl SearchResultsView {
             pagination_shows,
             results_episodes,
             pagination_episodes,
+            top,
+            to_tracks: Arc::new(AtomicBool::new(false)),
             tabs,
             spotify: queue.get_spotify(),
             events,
-        };
-
-        view.run_search();
-        view
+        }
     }
 
     fn get_track(
@@ -589,7 +711,9 @@ impl SearchResultsView {
 
     /// Search for `term` on a background thread: the internal API serves the first page of
     /// every tab when it is in use, today's six Web API searches run when it is not, and the
-    /// tabs stay empty when it failed.
+    /// tabs stay empty when it failed. A Top tab gets its rows after the six tabs are shown,
+    /// and asks for the move to Tracks when it stays without an item row or the internal API
+    /// was not used.
     fn search_text(&self, term: String) {
         // Taken here so the app does not look idle between the search command and the first
         // request; dropped once the tabs are written.
@@ -597,13 +721,17 @@ impl SearchResultsView {
         let tabs = self.search_tabs();
         let spotify = self.spotify.clone();
         let events = self.events.clone();
+        let top_rows = self.top.clone();
+        let to_tracks = self.to_tracks.clone();
 
         std::thread::spawn(move || {
             let _activity = activity;
-            match spotify.api.search_first_page(&term) {
+            let page = spotify.api.search_first_page(&term);
+            let page_is = FirstPageClass::of(&page);
+            match page {
                 FirstPage::Internal {
                     tabs: mut pages,
-                    top: _,
+                    top,
                 } => {
                     let (term, spotify, events) = (&term, &spotify, &events);
                     tabs.tracks.fill(
@@ -644,12 +772,17 @@ impl SearchResultsView {
                         events,
                     );
                     events.trigger();
+                    if let Some(rows) = &top_rows {
+                        fill_top(top, |d| spotify.api.search_top_strays(d), rows, &to_tracks);
+                        events.trigger();
+                    }
                 }
-                FirstPage::NotInUse => {
-                    Self::refresh_web_token(&spotify);
-                    Self::search_web_api(&spotify, &events, tabs, &term);
-                }
+                FirstPage::NotInUse => {}
                 FirstPage::Failed => report_failed_search(&events),
+            }
+            if after_first_page(page_is, top_rows.is_some(), &to_tracks) {
+                Self::refresh_web_token(&spotify);
+                Self::search_web_api(&spotify, &events, tabs, &term);
             }
         });
     }
@@ -716,84 +849,51 @@ impl SearchResultsView {
             .map(move |h| ASYNC_RUNTIME.get().unwrap().block_on(h).ok());
     }
 
-    pub fn run_search(&mut self) {
-        let query = self.search_term.clone();
+    /// Show the item `id` of `uri_type` in its tab and select that tab.
+    fn lookup_uri(&mut self, uri_type: UriType, id: &str) {
+        match uri_type {
+            UriType::Track => self.lookup(Box::new(Self::get_track), &self.results_tracks, id),
+            UriType::Album => self.lookup(Box::new(Self::get_album), &self.results_albums, id),
+            UriType::Artist => self.lookup(Box::new(Self::get_artist), &self.results_artists, id),
+            UriType::Playlist => {
+                self.lookup(Box::new(Self::get_playlist), &self.results_playlists, id)
+            }
+            UriType::Show => self.lookup(Box::new(Self::get_show), &self.results_shows, id),
+            UriType::Episode => {
+                self.lookup(Box::new(Self::get_episode), &self.results_episodes, id)
+            }
+        }
+        self.tabs.set_selected(uri_tab(uri_type));
+    }
 
-        // is the query a Spotify URI?
-        if let Ok(uritype) = query.parse() {
-            Self::refresh_web_token(&self.spotify);
-            match uritype {
-                UriType::Track => {
-                    self.lookup(Box::new(Self::get_track), &self.results_tracks, &query);
-                    self.tabs.set_selected(0);
-                }
-                UriType::Album => {
-                    self.lookup(Box::new(Self::get_album), &self.results_albums, &query);
-                    self.tabs.set_selected(1);
-                }
-                UriType::Artist => {
-                    self.lookup(Box::new(Self::get_artist), &self.results_artists, &query);
-                    self.tabs.set_selected(2);
-                }
-                UriType::Playlist => {
-                    self.lookup(
-                        Box::new(Self::get_playlist),
-                        &self.results_playlists,
-                        &query,
-                    );
-                    self.tabs.set_selected(3);
-                }
-                UriType::Show => {
-                    self.lookup(Box::new(Self::get_show), &self.results_shows, &query);
-                    self.tabs.set_selected(4);
-                }
-                UriType::Episode => {
-                    self.lookup(Box::new(Self::get_episode), &self.results_episodes, &query);
-                    self.tabs.set_selected(5);
-                }
+    pub fn run_search(&mut self, term: TermKind) {
+        match term {
+            TermKind::Uri(uri_type) => {
+                Self::refresh_web_token(&self.spotify);
+                let query = self.search_term.clone();
+                self.lookup_uri(uri_type, &query);
             }
-        // Is the query a spotify URL?
-        // https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC
-        } else if let Some(url) = SpotifyUrl::from_url(&query) {
-            Self::refresh_web_token(&self.spotify);
-            match url.uri_type {
-                UriType::Track => {
-                    self.lookup(Box::new(Self::get_track), &self.results_tracks, &url.id);
-                    self.tabs.set_selected(0);
-                }
-                UriType::Album => {
-                    self.lookup(Box::new(Self::get_album), &self.results_albums, &url.id);
-                    self.tabs.set_selected(1);
-                }
-                UriType::Artist => {
-                    self.lookup(Box::new(Self::get_artist), &self.results_artists, &url.id);
-                    self.tabs.set_selected(2);
-                }
-                UriType::Playlist => {
-                    self.lookup(
-                        Box::new(Self::get_playlist),
-                        &self.results_playlists,
-                        &url.id,
-                    );
-                    self.tabs.set_selected(3);
-                }
-                UriType::Show => {
-                    self.lookup(Box::new(Self::get_show), &self.results_shows, &url.id);
-                    self.tabs.set_selected(4);
-                }
-                UriType::Episode => {
-                    self.lookup(Box::new(Self::get_episode), &self.results_episodes, &url.id);
-                    self.tabs.set_selected(5);
-                }
+            // A Spotify URL, like https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC
+            TermKind::Url(url) => {
+                Self::refresh_web_token(&self.spotify);
+                self.lookup_uri(url.uri_type, &url.id);
             }
-        } else {
-            self.search_text(query);
+            TermKind::Text => self.search_text(self.search_term.clone()),
         }
     }
 }
 
 impl ViewWrapper for SearchResultsView {
     wrap_impl!(self.tabs: TabbedView);
+
+    /// Apply a move to Tracks the search thread asked for, then lay the tabs out.
+    fn wrap_layout(&mut self, size: Vec2) {
+        let asked = self.to_tracks.swap(false, Ordering::Relaxed);
+        if let Some(index) = tracks_hop(asked, self.tabs.moved_by_user(), self.top.is_some()) {
+            self.tabs.set_selected(index);
+        }
+        self.tabs.layout(size);
+    }
 }
 
 impl ViewExt for SearchResultsView {
@@ -815,8 +915,15 @@ impl ViewExt for SearchResultsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{MoveAmount, MoveMode};
+    use crate::config::Config;
+    use crate::model::playable::Playable;
     use crate::save_log::test_items;
+    use crate::search_api::TopRow;
+    use crate::spotify_api::WebApi;
     use crate::ui::pagination::Position;
+    use rspotify::model::{AlbumId, SimplifiedAlbum};
+    use std::collections::HashMap;
 
     fn track(id: &str) -> Track {
         test_items::track(id, &[])
@@ -874,5 +981,281 @@ mod tests {
         assert_eq!((rows.read().len(), pos.next_offset()), (2, Some(100)));
         apply_next_page(&rows, &pos, NextOutcome::<Track>::Ended);
         assert_eq!(pos.next_offset(), None);
+    }
+
+    fn setup() -> (EventManager, Arc<Queue>, Arc<Library>) {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev.clone(), spotify.clone(), cfg.clone());
+        let queue = Arc::new(Queue::new(spotify, cfg, library.clone()));
+        (ev, queue, library)
+    }
+
+    fn view(with_top: bool) -> SearchResultsView {
+        let (ev, queue, library) = setup();
+        SearchResultsView::build("x".into(), ev, queue, library, with_top)
+    }
+
+    fn tab_names(view: &SearchResultsView) -> Vec<String> {
+        view.tabs.names_for_test()
+    }
+
+    fn selected_name(view: &SearchResultsView) -> String {
+        tab_names(view)[view.tabs.selected()].clone()
+    }
+
+    fn move_tab(view: &mut SearchResultsView, mode: MoveMode) {
+        let mut siv = Cursive::new();
+        view.on_command(&mut siv, &Command::Move(mode, MoveAmount::Integer(1)))
+            .unwrap();
+    }
+
+    fn lay_out(view: &mut SearchResultsView) {
+        view.layout(Vec2::new(80, 24));
+    }
+
+    const SIX: [&str; 6] = [
+        "Tracks",
+        "Albums",
+        "Artists",
+        "Playlists",
+        "Shows",
+        "Episodes",
+    ];
+    const URI_TYPES: [UriType; 6] = [
+        UriType::Track,
+        UriType::Album,
+        UriType::Artist,
+        UriType::Playlist,
+        UriType::Show,
+        UriType::Episode,
+    ];
+
+    /// An album row with nothing set but its id.
+    fn album_row(id: &str) -> SimplifiedAlbum {
+        SimplifiedAlbum {
+            id: Some(AlbumId::from_id(id.to_string()).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// The ids of `items`, `rule` for the rule row.
+    fn item_ids(items: &[TopItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| i.id().unwrap_or_else(|| "rule".into()))
+            .collect()
+    }
+
+    #[test]
+    fn term_kind_tells_uri_url_and_text_apart() {
+        assert!(matches!(
+            term_kind("spotify:track:t1"),
+            TermKind::Uri(UriType::Track)
+        ));
+        assert!(matches!(
+            term_kind("spotify:user:u1:playlist:p1"),
+            TermKind::Uri(UriType::Playlist)
+        ));
+        assert!(matches!(
+            term_kind("https://open.spotify.com/album/b1"),
+            TermKind::Url(SpotifyUrl {
+                uri_type: UriType::Album,
+                ..
+            })
+        ));
+        assert!(matches!(term_kind("some words"), TermKind::Text));
+        assert!(matches!(
+            term_kind("https://example.com/album/b1"),
+            TermKind::Text
+        ));
+    }
+
+    #[test]
+    fn tracks_hop_table() {
+        assert_eq!(tracks_hop(true, false, true), Some(1));
+        for (asked, moved, has_top) in [
+            (false, false, true),
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+        ] {
+            assert_eq!(tracks_hop(asked, moved, has_top), None);
+        }
+    }
+
+    #[test]
+    fn a_view_built_with_top_has_seven_tabs_and_top_selected() {
+        let view = view(true);
+        let mut names = vec!["Top"];
+        names.extend(SIX);
+        assert_eq!(tab_names(&view), names);
+        assert_eq!(selected_name(&view), "Top");
+    }
+
+    #[test]
+    fn a_view_built_without_top_is_todays_six_tabs_on_tracks() {
+        let view = view(false);
+        assert_eq!(tab_names(&view), SIX);
+        assert_eq!(selected_name(&view), "Tracks");
+        assert!(view.top.is_none());
+    }
+
+    #[test]
+    fn a_uri_search_selects_by_todays_index_in_a_six_tab_view() {
+        let names = tab_names(&view(false));
+        for (uri_type, name) in URI_TYPES.into_iter().zip(SIX) {
+            assert_eq!(names[uri_tab(uri_type)], name);
+        }
+    }
+
+    #[test]
+    fn a_move_to_tracks_applies_once_on_layout_and_not_after_a_user_move() {
+        let mut first = view(true);
+        first.to_tracks.store(true, Ordering::Relaxed);
+        lay_out(&mut first);
+        assert_eq!(selected_name(&first), "Tracks");
+        assert!(!first.to_tracks.load(Ordering::Relaxed));
+        move_tab(&mut first, MoveMode::Left);
+        lay_out(&mut first);
+        assert_eq!(selected_name(&first), "Top", "the move applies once");
+
+        let mut second = view(true);
+        move_tab(&mut second, MoveMode::Right);
+        move_tab(&mut second, MoveMode::Left);
+        second.to_tracks.store(true, Ordering::Relaxed);
+        lay_out(&mut second);
+        assert_eq!(selected_name(&second), "Top");
+        assert!(!second.to_tracks.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_move_asked_for_one_view_leaves_another_view_alone() {
+        let first = view(true);
+        let mut second = view(true);
+        first.to_tracks.store(true, Ordering::Relaxed);
+        lay_out(&mut second);
+        assert_eq!(selected_name(&second), "Top");
+    }
+
+    #[test]
+    fn a_dropped_view_ignores_a_late_answer() {
+        let view = view(true);
+        let flag = view.to_tracks.clone();
+        let rows = view.top.clone().unwrap();
+        drop(view);
+        fill_top(TopDraft::default(), |_| {}, &rows, &flag);
+        assert!(flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn fill_top_writes_once_in_the_answers_order() {
+        let draft = TopDraft::for_test(
+            vec![
+                Ok(TopRow::Playlist(test_items::playlist("p1"))),
+                Err((Kind::Album, "spotify:album:b2".into())),
+                Ok(TopRow::Playlist(test_items::playlist("p3"))),
+            ],
+            vec![test_items::playlist("f1")],
+        );
+        let rows = RwLock::new(Vec::new());
+        let flag = AtomicBool::new(false);
+        fill_top(
+            draft,
+            |d| {
+                assert!(rows.read().is_empty(), "written before the strays settled");
+                d.settle(Kind::Album, Some(Rows::Albums(vec![album_row("b2")])));
+            },
+            &rows,
+            &flag,
+        );
+        assert_eq!(item_ids(&rows.read()), ["p1", "b2", "p3", "rule", "f1"]);
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn fill_top_skips_the_fetch_without_strays() {
+        let draft = TopDraft::for_test(
+            vec![Ok(TopRow::Playlist(test_items::playlist("p1")))],
+            Vec::new(),
+        );
+        let rows = RwLock::new(Vec::new());
+        let flag = AtomicBool::new(false);
+        fill_top(draft, |_| panic!("no stray to fetch"), &rows, &flag);
+        assert_eq!(item_ids(&rows.read()), ["p1"]);
+    }
+
+    #[test]
+    fn an_empty_top_tab_asks_for_the_move_to_tracks() {
+        let draft = TopDraft::for_test(
+            vec![Err((Kind::Album, "spotify:album:b2".into()))],
+            Vec::new(),
+        );
+        let rows = RwLock::new(Vec::new());
+        let flag = AtomicBool::new(false);
+        fill_top(draft, |d| d.settle(Kind::Album, None), &rows, &flag);
+        assert!(rows.read().is_empty());
+        assert!(flag.load(Ordering::Relaxed));
+
+        let draft = TopDraft::for_test(Vec::new(), vec![test_items::playlist("f1")]);
+        let flag = AtomicBool::new(false);
+        fill_top(draft, |_| {}, &rows, &flag);
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "a featured playlist is an item row"
+        );
+    }
+
+    #[test]
+    fn after_first_page_table() {
+        for (class, has_top, web, flag) in [
+            (FirstPageClass::Internal, true, false, false),
+            (FirstPageClass::Internal, false, false, false),
+            (FirstPageClass::NotInUse, true, true, true),
+            (FirstPageClass::NotInUse, false, true, false),
+            (FirstPageClass::Failed, true, false, false),
+            (FirstPageClass::Failed, false, false, false),
+        ] {
+            let to_tracks = AtomicBool::new(false);
+            assert_eq!(after_first_page(class, has_top, &to_tracks), web);
+            assert_eq!(to_tracks.load(Ordering::Relaxed), flag);
+        }
+    }
+
+    #[test]
+    fn enter_on_a_track_row_in_a_top_list_replaces_the_queue_with_that_track() {
+        let (_ev, queue, library) = setup();
+        queue.append(Playable::Track(test_items::playable_track("other")));
+        let content = Arc::new(RwLock::new(vec![
+            TopItem::Artist(test_items::artist("a1", "A", false)),
+            TopItem::Track(test_items::playable_track("t1")),
+            TopItem::Track(test_items::playable_track("t2")),
+        ]));
+        let mut list = ListView::new(content, queue.clone(), library);
+        list.move_focus_to(1);
+        let mut siv = Cursive::new();
+        list.on_command(&mut siv, &Command::Play).unwrap();
+        let ids: Vec<Option<String>> = queue.list().read().iter().map(|p| p.id()).collect();
+        assert_eq!(ids, [Some("t1".to_string())]);
+    }
+
+    #[test]
+    fn six_tabs_after_a_web_served_search_and_seven_again_after_an_internal_one() {
+        let api = WebApi::new(&Config::new_for_test());
+        let internal = || FirstPage::Internal {
+            tabs: HashMap::new(),
+            top: TopDraft::default(),
+        };
+        api.remember_first_page_for_test(&FirstPage::NotInUse);
+        assert!(!with_top(&term_kind("x"), api.internal_search_in_use()));
+        api.remember_first_page_for_test(&internal());
+        assert!(with_top(&term_kind("x"), api.internal_search_in_use()));
+        assert!(!with_top(
+            &term_kind("spotify:track:t1"),
+            api.internal_search_in_use()
+        ));
+        api.remember_first_page_for_test(&FirstPage::Failed);
+        assert!(with_top(&term_kind("x"), api.internal_search_in_use()));
     }
 }

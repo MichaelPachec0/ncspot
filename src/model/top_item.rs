@@ -13,7 +13,6 @@ use crate::traits::{ListItem, ViewExt};
 
 /// A row of the search view's Top tab.
 #[derive(Clone)]
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub enum TopItem {
     Track(Track),
     Album(Album),
@@ -28,7 +27,6 @@ pub enum TopItem {
 }
 
 /// The label of the rule line above the featured playlists.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub const FEATURED_LABEL: &str = "Featured playlists";
 
 impl From<TopRow> for TopItem {
@@ -46,7 +44,6 @@ impl From<TopRow> for TopItem {
 
 /// The rows of the Top tab: `rows`, then, only if `featured` is not empty, `Rule` and
 /// the featured playlists.
-#[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
 pub fn top_items(rows: Vec<TopRow>, featured: &[Playlist]) -> Vec<TopItem> {
     let mut items: Vec<TopItem> = rows.into_iter().map(TopItem::from).collect();
     if !featured.is_empty() {
@@ -58,13 +55,11 @@ pub fn top_items(rows: Vec<TopRow>, featured: &[Playlist]) -> Vec<TopItem> {
 
 impl TopItem {
     /// Whether this is an item row (anything but `Rule`).
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
     pub fn is_item(&self) -> bool {
         !matches!(self, Self::Rule)
     }
 
     /// The model inside, `None` for the rule.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
     fn inner(&self) -> Option<&dyn ListItem> {
         match self {
             Self::Track(i) => Some(i),
@@ -78,7 +73,6 @@ impl TopItem {
     }
 
     /// The model inside, `None` for the rule.
-    #[cfg_attr(not(test), expect(dead_code, reason = "used by the search Top tab"))]
     fn inner_mut(&mut self) -> Option<&mut dyn ListItem> {
         match self {
             Self::Track(i) => Some(i),

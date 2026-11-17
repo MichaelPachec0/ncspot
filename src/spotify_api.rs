@@ -291,6 +291,16 @@ impl WebApi {
         page
     }
 
+    /// Remember `page` as `search_first_page` does after a non-blank term, without searching.
+    #[cfg(test)]
+    pub(crate) fn remember_first_page_for_test(&self, page: &FirstPage) {
+        let before = self.search_served_by_web.load(Ordering::Relaxed);
+        self.search_served_by_web.store(
+            search_api::served_by_web_after(before, page),
+            Ordering::Relaxed,
+        );
+    }
+
     /// See [search_api::fetch_strays_with]. Blocks on the network: never on the UI thread.
     pub fn search_top_strays(&self, draft: &mut TopDraft) {
         search_api::fetch_strays_with(self, draft);

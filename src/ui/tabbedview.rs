@@ -25,6 +25,8 @@ pub struct TabbedView {
     selected: usize,
     /// The size given to the last call to `layout()`
     last_layout_size: Vec2,
+    /// Whether the user has changed the selected tab since this view was built.
+    moved_by_user: bool,
 }
 
 impl TabbedView {
@@ -112,6 +114,26 @@ impl TabbedView {
     pub fn tab_width(&self) -> usize {
         self.last_layout_size.x / self.len()
     }
+
+    /// Whether the user has asked for another tab since this view was built, also if they
+    /// came back. Code that selects a tab does not count.
+    pub fn moved_by_user(&self) -> bool {
+        self.moved_by_user
+    }
+
+    /// Run `user_action` and remember it as a user move if it changed the selected tab.
+    fn by_user(&mut self, user_action: impl FnOnce(&mut Self)) {
+        let before = self.selected;
+        user_action(self);
+        if self.selected != before {
+            self.moved_by_user = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn names_for_test(&self) -> Vec<String> {
+        self.tabs.iter().map(|tab| tab.name().to_string()).collect()
+    }
 }
 
 impl View for TabbedView {
@@ -167,18 +189,18 @@ impl View for TabbedView {
         {
             let position = position.checked_sub(offset);
             if let Some(0) = position.map(|p| p.y) {
-                match event {
-                    MouseEvent::WheelUp => self.move_left(),
-                    MouseEvent::WheelDown => self.move_right(),
+                self.by_user(|tabs| match event {
+                    MouseEvent::WheelUp => tabs.move_left(),
+                    MouseEvent::WheelDown => tabs.move_right(),
                     MouseEvent::Press(MouseButton::Left) => {
-                        let tabwidth = self.tab_width();
+                        let tabwidth = tabs.tab_width();
                         if let Some(selected_tab) = position.and_then(|p| p.x.checked_div(tabwidth))
                         {
-                            self.set_selected(selected_tab);
+                            tabs.set_selected(selected_tab);
                         }
                     }
                     _ => {}
-                };
+                });
                 return EventResult::consumed();
             }
         }
@@ -217,19 +239,21 @@ impl ViewExt for TabbedView {
     fn on_command(&mut self, s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         match cmd {
             Command::Move(mode, amount) if matches!(mode, MoveMode::Left | MoveMode::Right) => {
-                if matches!(mode, MoveMode::Left) && !self.on_first_tab() {
-                    match amount {
-                        MoveAmount::Extreme => self.select_first(),
-                        MoveAmount::Integer(amount) => self.move_selected(-(*amount) as isize),
-                        _ => (),
+                self.by_user(|tabs| {
+                    if matches!(mode, MoveMode::Left) && !tabs.on_first_tab() {
+                        match amount {
+                            MoveAmount::Extreme => tabs.select_first(),
+                            MoveAmount::Integer(amount) => tabs.move_selected(-(*amount) as isize),
+                            _ => (),
+                        }
+                    } else if matches!(mode, MoveMode::Right) && !tabs.on_last_tab() {
+                        match amount {
+                            MoveAmount::Extreme => tabs.select_last(),
+                            MoveAmount::Integer(amount) => tabs.move_selected(*amount as isize),
+                            _ => (),
+                        }
                     }
-                } else if matches!(mode, MoveMode::Right) && !self.on_last_tab() {
-                    match amount {
-                        MoveAmount::Extreme => self.select_last(),
-                        MoveAmount::Integer(amount) => self.move_selected(*amount as isize),
-                        _ => (),
-                    }
-                }
+                });
                 Ok(CommandResult::Consumed(None))
             }
             _ => {
@@ -240,5 +264,76 @@ impl ViewExt for TabbedView {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cursive::event::Event;
+
+    struct Blank;
+
+    impl View for Blank {
+        fn draw(&self, _printer: &Printer<'_, '_>) {}
+    }
+
+    impl ViewExt for Blank {}
+
+    /// Six tabs, each 10 columns wide once laid out.
+    fn six_tabs() -> TabbedView {
+        let mut tabs = TabbedView::new();
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            tabs.add_tab(name, Blank);
+        }
+        tabs.layout(Vec2::new(60, 10));
+        tabs
+    }
+
+    fn mv(tabs: &mut TabbedView, mode: MoveMode) {
+        let mut siv = Cursive::new();
+        tabs.on_command(&mut siv, &Command::Move(mode, MoveAmount::Integer(1)))
+            .unwrap();
+    }
+
+    fn on_bar(tabs: &mut TabbedView, x: usize, event: MouseEvent) {
+        tabs.on_event(Event::Mouse {
+            offset: Vec2::zero(),
+            position: Vec2::new(x, 0),
+            event,
+        });
+    }
+
+    #[test]
+    fn a_user_tab_move_is_remembered_and_a_programmatic_one_is_not() {
+        let mut tabs = six_tabs();
+        assert!(!tabs.moved_by_user());
+        mv(&mut tabs, MoveMode::Right);
+        mv(&mut tabs, MoveMode::Left);
+        assert_eq!(tabs.selected(), 0);
+        assert!(tabs.moved_by_user(), "coming back still counts");
+
+        let mut tabs = six_tabs();
+        tabs.set_selected(3);
+        tabs.select_last();
+        tabs.select_first();
+        assert!(!tabs.moved_by_user());
+
+        let mut tabs = six_tabs();
+        on_bar(&mut tabs, 5, MouseEvent::WheelDown);
+        assert_eq!(tabs.selected(), 1);
+        assert!(tabs.moved_by_user());
+
+        let mut tabs = six_tabs();
+        on_bar(&mut tabs, 25, MouseEvent::Press(MouseButton::Left));
+        assert_eq!(tabs.selected(), 2);
+        assert!(tabs.moved_by_user());
+
+        let mut tabs = six_tabs();
+        on_bar(&mut tabs, 5, MouseEvent::Press(MouseButton::Left));
+        mv(&mut tabs, MoveMode::Left);
+        on_bar(&mut tabs, 5, MouseEvent::WheelUp);
+        assert_eq!(tabs.selected(), 0);
+        assert!(!tabs.moved_by_user());
     }
 }
