@@ -69,10 +69,10 @@ pub(crate) fn term_kind(term: &str) -> TermKind {
     }
 }
 
-/// Whether a search for `term` gets a Top tab: a text term while the internal search is in
-/// use.
-fn with_top(term: &TermKind, internal_search_in_use: bool) -> bool {
-    matches!(term, TermKind::Text) && internal_search_in_use
+/// Whether a search for `term` (of kind `kind`) gets a Top tab: a text term that is not blank,
+/// while the internal search is in use.
+fn with_top(term: &str, kind: &TermKind, internal_search_in_use: bool) -> bool {
+    matches!(kind, TermKind::Text) && !term.trim().is_empty() && internal_search_in_use
 }
 
 /// The tab a lookup of `uri_type` shows its item in, in a view without a Top tab.
@@ -315,7 +315,11 @@ impl SearchResultsView {
         library: Arc<Library>,
     ) -> Self {
         let term = term_kind(&search_term);
-        let top = with_top(&term, queue.get_spotify().api.internal_search_in_use());
+        let top = with_top(
+            &search_term,
+            &term,
+            queue.get_spotify().api.internal_search_in_use(),
+        );
         let mut view = Self::build(search_term, events, queue, library, top);
         view.run_search(term);
         view
@@ -1267,15 +1271,28 @@ mod tests {
             tabs: HashMap::new(),
             top: TopDraft::default(),
         };
+        let top = |term: &str| with_top(term, &term_kind(term), api.internal_search_in_use());
         api.remember_first_page_for_test(&FirstPage::NotInUse);
-        assert!(!with_top(&term_kind("x"), api.internal_search_in_use()));
+        assert!(!top("x"));
         api.remember_first_page_for_test(&internal());
-        assert!(with_top(&term_kind("x"), api.internal_search_in_use()));
-        assert!(!with_top(
-            &term_kind("spotify:track:t1"),
-            api.internal_search_in_use()
-        ));
+        assert!(top("x"));
+        assert!(!top("spotify:track:t1"));
         api.remember_first_page_for_test(&FirstPage::Failed);
-        assert!(with_top(&term_kind("x"), api.internal_search_in_use()));
+        assert!(top("x"));
+    }
+
+    #[test]
+    fn with_top_table() {
+        for (term, in_use, top) in [
+            ("some words", true, true),
+            ("some words", false, false),
+            ("spotify:track:t1", true, false),
+            ("https://open.spotify.com/album/b1", true, false),
+            ("", true, false),
+            ("   ", true, false),
+            ("\t", true, false),
+        ] {
+            assert_eq!(with_top(term, &term_kind(term), in_use), top, "{term:?}");
+        }
     }
 }
