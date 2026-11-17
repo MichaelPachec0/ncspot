@@ -618,6 +618,38 @@ fn search_first_page_fills_six_kinds() {
 
 #[test]
 #[ignore = "needs cached librespot credentials and network"]
+fn search_top_results_are_readable() {
+    use super::hashes::Operation;
+    use super::pathfinder::Outcome;
+    use super::search::{Kind, read_top};
+    with_session(|rt, s| {
+        let outcome = search_once(rt, &s, Operation::Desktop, "bonobo", 0)
+            .map_err(|e| e.class())
+            .expect("query");
+        let (Outcome::Answer(answer) | Outcome::Partial(answer)) = outcome else {
+            panic!("searchDesktop: no answer (bad hash or refused request)");
+        };
+        let top = read_top(&answer);
+        let per_kind: Vec<String> = Kind::ALL
+            .iter()
+            .map(|kind| {
+                let n = top.items.iter().filter(|e| e.kind == *kind).count();
+                format!("{kind:?}: {n}")
+            })
+            .collect();
+        println!(
+            "top: {} usable, per kind [{}], featured playlists: {}, unbuildable: {}",
+            top.items.len(),
+            per_kind.join(", "),
+            top.featured.len(),
+            top.unbuildable
+        );
+        assert!(!top.items.is_empty(), "no usable top result");
+    });
+}
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
 fn search_paging_returns_new_rows() {
     use super::hashes::Operation;
     use super::pathfinder::Outcome;
