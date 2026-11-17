@@ -307,6 +307,84 @@ struct SearchTabs {
     episodes: TabHandle<Episode>,
 }
 
+/// The body of a text search's thread once the first page is in: an internal page fills the
+/// six tabs, calls `trigger`, then fills the Top tab (settling its strays with `fetch_strays`)
+/// and calls `trigger` again; a page the internal search did not serve hands the tabs to
+/// `search_web`; a failed one posts the failure note. `term`, `spotify` and `events` serve
+/// the paging of the filled tabs and the note.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the seams a test of the search thread needs, plus what the tabs page with"
+)]
+fn finish_text_search(
+    page: FirstPage,
+    tabs: SearchTabs,
+    top_rows: Option<&RwLock<Vec<TopItem>>>,
+    to_tracks: &AtomicBool,
+    term: &str,
+    spotify: &Spotify,
+    events: &EventManager,
+    fetch_strays: impl FnOnce(&mut TopDraft),
+    trigger: impl Fn(),
+    search_web: impl FnOnce(SearchTabs),
+) {
+    let page_is = FirstPageClass::of(&page);
+    match page {
+        FirstPage::Internal {
+            tabs: mut pages,
+            top,
+        } => {
+            tabs.tracks.fill(
+                pages.remove(&Kind::Track),
+                Kind::Track,
+                term,
+                spotify,
+                events,
+            );
+            tabs.albums.fill(
+                pages.remove(&Kind::Album),
+                Kind::Album,
+                term,
+                spotify,
+                events,
+            );
+            tabs.artists.fill(
+                pages.remove(&Kind::Artist),
+                Kind::Artist,
+                term,
+                spotify,
+                events,
+            );
+            tabs.playlists.fill(
+                pages.remove(&Kind::Playlist),
+                Kind::Playlist,
+                term,
+                spotify,
+                events,
+            );
+            tabs.shows
+                .fill(pages.remove(&Kind::Show), Kind::Show, term, spotify, events);
+            tabs.episodes.fill(
+                pages.remove(&Kind::Episode),
+                Kind::Episode,
+                term,
+                spotify,
+                events,
+            );
+            trigger();
+            if let Some(rows) = top_rows {
+                fill_top(top, fetch_strays, rows, to_tracks);
+                trigger();
+            }
+        }
+        FirstPage::NotInUse => {}
+        FirstPage::Failed => report_failed_search(events),
+    }
+    if after_first_page(page_is, top_rows.is_some(), to_tracks, &trigger) {
+        search_web(tabs);
+    }
+}
+
 impl SearchResultsView {
     pub fn new(
         search_term: String,
@@ -738,63 +816,21 @@ impl SearchResultsView {
         std::thread::spawn(move || {
             let _activity = activity;
             let page = spotify.api.search_first_page(&term);
-            let page_is = FirstPageClass::of(&page);
-            match page {
-                FirstPage::Internal {
-                    tabs: mut pages,
-                    top,
-                } => {
-                    let (term, spotify, events) = (&term, &spotify, &events);
-                    tabs.tracks.fill(
-                        pages.remove(&Kind::Track),
-                        Kind::Track,
-                        term,
-                        spotify,
-                        events,
-                    );
-                    tabs.albums.fill(
-                        pages.remove(&Kind::Album),
-                        Kind::Album,
-                        term,
-                        spotify,
-                        events,
-                    );
-                    tabs.artists.fill(
-                        pages.remove(&Kind::Artist),
-                        Kind::Artist,
-                        term,
-                        spotify,
-                        events,
-                    );
-                    tabs.playlists.fill(
-                        pages.remove(&Kind::Playlist),
-                        Kind::Playlist,
-                        term,
-                        spotify,
-                        events,
-                    );
-                    tabs.shows
-                        .fill(pages.remove(&Kind::Show), Kind::Show, term, spotify, events);
-                    tabs.episodes.fill(
-                        pages.remove(&Kind::Episode),
-                        Kind::Episode,
-                        term,
-                        spotify,
-                        events,
-                    );
-                    events.trigger();
-                    if let Some(rows) = &top_rows {
-                        fill_top(top, |d| spotify.api.search_top_strays(d), rows, &to_tracks);
-                        events.trigger();
-                    }
-                }
-                FirstPage::NotInUse => {}
-                FirstPage::Failed => report_failed_search(&events),
-            }
-            if after_first_page(page_is, top_rows.is_some(), &to_tracks, || events.trigger()) {
-                Self::refresh_web_token(&spotify);
-                Self::search_web_api(&spotify, &events, tabs, &term);
-            }
+            finish_text_search(
+                page,
+                tabs,
+                top_rows.as_deref(),
+                &to_tracks,
+                &term,
+                &spotify,
+                &events,
+                |draft| spotify.api.search_top_strays(draft),
+                || events.trigger(),
+                |tabs| {
+                    Self::refresh_web_token(&spotify);
+                    Self::search_web_api(&spotify, &events, tabs, &term);
+                },
+            );
         });
     }
 
@@ -1151,13 +1187,43 @@ mod tests {
     }
 
     #[test]
-    fn a_dropped_view_ignores_a_late_answer() {
-        let view = view(true);
-        let flag = view.to_tracks.clone();
-        let rows = view.top.clone().unwrap();
-        drop(view);
-        fill_top(TopDraft::default(), |_| {}, &rows, &flag);
+    fn a_late_answer_for_a_dropped_view_lands_in_that_views_state_only() {
+        let dropped = view(true);
+        let mut live = view(true);
+        let tabs = dropped.search_tabs();
+        let albums = dropped.results_albums.clone();
+        let top = dropped.top.clone().unwrap();
+        let flag = dropped.to_tracks.clone();
+        let (term, spotify, events) = (
+            dropped.search_term.clone(),
+            dropped.spotify.clone(),
+            dropped.events.clone(),
+        );
+        drop(dropped);
+        // An empty Top tab: the answer asks the dropped view for the move to Tracks.
+        finish_text_search(
+            internal_page(TopDraft::default()),
+            tabs,
+            Some(&top),
+            &flag,
+            &term,
+            &spotify,
+            &events,
+            |_| panic!("no stray to fetch"),
+            || {},
+            |_| panic!("no Web API search"),
+        );
+        assert_eq!(albums.read().len(), 1);
+        assert!(top.read().is_empty());
         assert!(flag.load(Ordering::Relaxed));
+
+        assert!(!live.to_tracks.load(Ordering::Relaxed));
+        lay_out(&mut live);
+        assert_eq!(selected_name(&live), "Top");
+        assert!(live.results_albums.read().is_empty());
+        assert!(live.results_playlists.read().is_empty());
+        assert!(live.top.as_ref().unwrap().read().is_empty());
+        assert_eq!(totals(&live), [None; 6]);
     }
 
     #[test]
@@ -1279,6 +1345,148 @@ mod tests {
         assert!(!top("spotify:track:t1"));
         api.remember_first_page_for_test(&FirstPage::Failed);
         assert!(top("x"));
+    }
+
+    /// An internal first page with `top` as its Top tab: one album and one playlist row, and
+    /// every tab its own total (100 plus its place in `Kind::ALL`).
+    fn internal_page(top: TopDraft) -> FirstPage {
+        let tabs = Kind::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(at, kind)| {
+                let rows = match kind {
+                    Kind::Album => Rows::Albums(vec![album_row("b1")]),
+                    Kind::Playlist => Rows::Playlists(vec![test_items::playlist("p1")]),
+                    _ => Rows::empty(kind),
+                };
+                let page = TabPage {
+                    rows,
+                    next_offset: Some(50),
+                    total: 100 + at,
+                };
+                (kind, page)
+            })
+            .collect();
+        FirstPage::Internal { tabs, top }
+    }
+
+    /// The total of each of the six tabs of `view`, Tracks to Episodes.
+    fn totals(view: &SearchResultsView) -> [Option<usize>; 6] {
+        [
+            view.pagination_tracks.max_content(),
+            view.pagination_albums.max_content(),
+            view.pagination_artists.max_content(),
+            view.pagination_playlists.max_content(),
+            view.pagination_shows.max_content(),
+            view.pagination_episodes.max_content(),
+        ]
+    }
+
+    /// The totals of `internal_page`.
+    const INTERNAL_TOTALS: [Option<usize>; 6] = [
+        Some(100),
+        Some(101),
+        Some(102),
+        Some(103),
+        Some(104),
+        Some(105),
+    ];
+
+    /// Run the search thread's body for `page` on `view`'s handles and return its calls in
+    /// order: `strays` (then `check_strays` runs), `trigger`, and `web` (`web, flag set` when
+    /// the move to Tracks was asked for by then).
+    fn finish(
+        view: &SearchResultsView,
+        page: FirstPage,
+        check_strays: impl FnOnce(&mut TopDraft),
+    ) -> Vec<&'static str> {
+        let calls = std::cell::RefCell::new(Vec::new());
+        finish_text_search(
+            page,
+            view.search_tabs(),
+            view.top.as_deref(),
+            &view.to_tracks,
+            &view.search_term,
+            &view.spotify,
+            &view.events,
+            |draft| {
+                calls.borrow_mut().push("strays");
+                check_strays(draft);
+            },
+            || calls.borrow_mut().push("trigger"),
+            |_tabs| {
+                let flag = view.to_tracks.load(Ordering::Relaxed);
+                calls
+                    .borrow_mut()
+                    .push(if flag { "web, flag set" } else { "web" });
+            },
+        );
+        calls.into_inner()
+    }
+
+    #[test]
+    fn an_internal_page_fills_the_six_tabs_before_the_strays_and_the_top_rows_after() {
+        let view = view(true);
+        let draft = TopDraft::for_test(
+            vec![
+                Ok(TopRow::Playlist(test_items::playlist("p1"))),
+                Err((Kind::Album, "spotify:album:b2".into())),
+            ],
+            Vec::new(),
+        );
+        let calls = finish(&view, internal_page(draft), |d| {
+            assert_eq!(totals(&view), INTERNAL_TOTALS);
+            assert_eq!(view.results_albums.read().len(), 1);
+            assert_eq!(view.results_playlists.read().len(), 1);
+            assert!(
+                view.top.as_ref().unwrap().read().is_empty(),
+                "Top rows written before the strays settled"
+            );
+            d.settle(Kind::Album, Some(Rows::Albums(vec![album_row("b2")])));
+        });
+        assert_eq!(calls, ["trigger", "strays", "trigger"]);
+        assert_eq!(item_ids(&view.top.as_ref().unwrap().read()), ["p1", "b2"]);
+        assert!(!view.to_tracks.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn an_internal_page_without_a_top_tab_never_fetches_strays() {
+        let view = view(false);
+        let draft = TopDraft::for_test(vec![Err((Kind::Album, "spotify:album:b2".into()))], vec![]);
+        let calls = finish(&view, internal_page(draft), |_| panic!("no stray fetch"));
+        assert_eq!(calls, ["trigger"]);
+        assert_eq!(totals(&view), INTERNAL_TOTALS);
+        assert!(!view.to_tracks.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_page_not_served_internally_runs_the_web_api_search_after_the_move_to_tracks() {
+        let cases: [(bool, &[&str]); 2] =
+            [(true, &["trigger", "web, flag set"]), (false, &["web"])];
+        for (with_top, expected) in cases {
+            let view = view(with_top);
+            let calls = finish(&view, FirstPage::NotInUse, |_| panic!("no stray fetch"));
+            assert_eq!(calls, expected, "with_top {with_top}");
+            assert_eq!(view.to_tracks.load(Ordering::Relaxed), with_top);
+            assert_eq!(totals(&view), [None; 6]);
+        }
+    }
+
+    #[test]
+    fn a_failed_page_runs_nothing_and_leaves_the_flag_alone() {
+        for with_top in [true, false] {
+            let view = view(with_top);
+            let calls = finish(&view, FirstPage::Failed, |_| panic!("no stray fetch"));
+            assert!(calls.is_empty(), "with_top {with_top}");
+            assert!(!view.to_tracks.load(Ordering::Relaxed));
+            assert_eq!(totals(&view), [None; 6]);
+            let notes = view
+                .events
+                .msg_iter()
+                .filter(|event| matches!(event, Event::StatusNote(_)))
+                .count();
+            assert_eq!(notes, 1, "with_top {with_top}");
+        }
     }
 
     #[test]
