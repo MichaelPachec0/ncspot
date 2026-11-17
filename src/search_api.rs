@@ -1582,6 +1582,29 @@ mod tests {
     }
 
     #[test]
+    fn an_in_section_top_result_the_fetched_rows_leave_out_is_dropped() {
+        // The tracks section holds t1 and t2; the fetch answers t2 only.
+        let fake = Fake::new(
+            |_, _| Ok(Outcome::Answer(top_fixture())),
+            |kind, uris| {
+                let kept: Vec<String> = uris.iter().filter(|uri| *uri != T1).cloned().collect();
+                rows_for(kind, &kept)
+            },
+        );
+        let (tabs, mut top) = first_top(&fake);
+        assert_eq!(tabs[&Kind::Track].rows.len(), 1);
+        assert_eq!(uris(&top.rows()), [P1]);
+        fetch_strays_with(&fake, &mut top);
+        assert_eq!(uris(&top.rows()), [T9, P1, S9]);
+        let strays = fake.stray_fetches.lock().clone();
+        assert!(
+            !strays
+                .iter()
+                .any(|(_, uris)| uris.iter().any(|uri| uri == T1))
+        );
+    }
+
+    #[test]
     fn a_failed_kind_batch_leaves_that_kinds_top_results_out_and_fetches_no_stray_of_it() {
         let fake = Fake::new(
             |_, _| Ok(Outcome::Answer(top_fixture())),
