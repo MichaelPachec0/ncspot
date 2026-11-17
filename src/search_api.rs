@@ -587,16 +587,6 @@ pub(crate) fn fetch_strays_with(b: &(impl SearchBackend + Sync), draft: &mut Top
     }
 }
 
-/// The remembered "last text search was served by the Web API" after `page`.
-/// `Internal` clears it, `NotInUse` sets it, `Failed` keeps `before`.
-pub(crate) fn served_by_web_after(before: bool, page: &FirstPage) -> bool {
-    match page {
-        FirstPage::Internal { .. } => false,
-        FirstPage::NotInUse => true,
-        FirstPage::Failed => before,
-    }
-}
-
 /// The section of `kind` from one rotated query of `op`, and whether it came from a plain
 /// answer (one without errors). A `searchDesktop` answer must have all six sections even
 /// when one is wanted.
@@ -1675,19 +1665,6 @@ mod tests {
         ));
         for fake in [not_in_use, failed, latched] {
             assert!(fake.stray_fetches.lock().is_empty());
-        }
-    }
-
-    #[test]
-    fn served_by_web_after_follows_the_last_outcome() {
-        let internal = || FirstPage::Internal {
-            tabs: HashMap::new(),
-            top: TopDraft::default(),
-        };
-        for before in [false, true] {
-            assert!(!served_by_web_after(before, &internal()));
-            assert!(served_by_web_after(before, &FirstPage::NotInUse));
-            assert_eq!(served_by_web_after(before, &FirstPage::Failed), before);
         }
     }
 }

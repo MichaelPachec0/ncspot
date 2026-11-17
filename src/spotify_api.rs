@@ -282,23 +282,28 @@ impl WebApi {
     pub fn search_first_page(&self, term: &str) -> FirstPage {
         let page = search_api::first_page_with(self, self.search_hashes(), term);
         if !term.trim().is_empty() {
-            let before = self.search_served_by_web.load(Ordering::Relaxed);
-            self.search_served_by_web.store(
-                search_api::served_by_web_after(before, &page),
-                Ordering::Relaxed,
-            );
+            self.remember_first_page(&page);
         }
         page
+    }
+
+    /// Remember whether the last text search was served by the Web API: `Internal` clears it,
+    /// `NotInUse` sets it, `Failed` leaves it alone. One store and no read, so a search that
+    /// ends while another one writes cannot put back a stale value.
+    fn remember_first_page(&self, page: &FirstPage) {
+        let served_by_web = match page {
+            FirstPage::Internal { .. } => false,
+            FirstPage::NotInUse => true,
+            FirstPage::Failed => return,
+        };
+        self.search_served_by_web
+            .store(served_by_web, Ordering::Relaxed);
     }
 
     /// Remember `page` as `search_first_page` does after a non-blank term, without searching.
     #[cfg(test)]
     pub(crate) fn remember_first_page_for_test(&self, page: &FirstPage) {
-        let before = self.search_served_by_web.load(Ordering::Relaxed);
-        self.search_served_by_web.store(
-            search_api::served_by_web_after(before, page),
-            Ordering::Relaxed,
-        );
+        self.remember_first_page(page);
     }
 
     /// See [search_api::fetch_strays_with]. Blocks on the network: never on the UI thread.
@@ -1952,6 +1957,35 @@ mod test {
         let fresh = WebApi::new(&Config::new_for_test());
         assert!(matches!(fresh.search_first_page("  "), FirstPage::NotInUse));
         assert!(fresh.internal_search_in_use());
+    }
+
+    #[test]
+    fn the_remembered_outcome_follows_the_last_first_page() {
+        let internal = || FirstPage::Internal {
+            tabs: HashMap::new(),
+            top: TopDraft::default(),
+        };
+        // `internal_search_in_use` is true exactly when the remembered flag is clear here:
+        // both areas are on and not latched.
+        for before in [false, true] {
+            let set = |api: &WebApi| {
+                if before {
+                    api.remember_first_page_for_test(&FirstPage::NotInUse);
+                } else {
+                    api.remember_first_page_for_test(&internal());
+                }
+            };
+            let api = WebApi::new(&Config::new_for_test());
+            set(&api);
+            api.remember_first_page_for_test(&internal());
+            assert!(api.internal_search_in_use(), "before {before}");
+            set(&api);
+            api.remember_first_page_for_test(&FirstPage::NotInUse);
+            assert!(!api.internal_search_in_use(), "before {before}");
+            set(&api);
+            api.remember_first_page_for_test(&FirstPage::Failed);
+            assert_eq!(api.internal_search_in_use(), !before, "before {before}");
+        }
     }
 
     #[test]
