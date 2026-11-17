@@ -224,7 +224,9 @@ pub fn read_top(search_v2: &Value) -> TopResults {
         let Some(kind) = kind_of_uri(uri) else {
             continue;
         };
-        if !seen.insert(uri.to_string()) {
+        // A uri counts as seen only once its entry is accepted, so an unbuildable playlist
+        // entry hides neither a later repeat nor its copy among the featured.
+        if seen.contains(uri) {
             continue;
         }
         let playlist = if kind == Kind::Playlist {
@@ -238,6 +240,7 @@ pub fn read_top(search_v2: &Value) -> TopResults {
         } else {
             None
         };
+        seen.insert(uri.to_string());
         top.items.push(TopEntry {
             kind,
             uri: uri.to_string(),
@@ -373,6 +376,49 @@ mod tests {
         let ids: Vec<&str> = top.featured.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["pf1", "pf2"]);
         assert_eq!(top.unbuildable, 2); // p7 and pf8; repeats are not counted
+    }
+
+    #[test]
+    fn an_unbuildable_item_playlist_leaves_its_complete_featured_copy() {
+        let v = json!({ "topResultsV2": {
+            "itemsV2": [ { "item": { "data": { "uri": "spotify:playlist:p1", "name": "p1",
+                "ownerV2": { "data": {} } } } } ],
+            "featured": [ { "data": { "uri": "spotify:playlist:p1", "name": "p1",
+                "ownerV2": { "data": { "name": "Owner", "username": "owner1" } } } } ],
+        } });
+        let top = read_top(&v);
+        assert!(top.items.is_empty());
+        let ids: Vec<&str> = top.featured.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["p1"]);
+        assert_eq!(top.unbuildable, 1);
+    }
+
+    #[test]
+    fn an_unbuildable_first_copy_does_not_hide_a_buildable_repeat() {
+        let entry = |data: Value| json!({ "item": { "data": data } });
+        let ownerless = json!({ "uri": "spotify:playlist:p1", "name": "p1",
+            "ownerV2": { "data": {} } });
+        let owned = json!({ "uri": "spotify:playlist:p1", "name": "p1",
+            "ownerV2": { "data": { "name": "Owner", "username": "owner1" } } });
+        let v = json!({ "topResultsV2": { "itemsV2": [
+            entry(ownerless.clone()),
+            entry(json!({ "uri": "spotify:track:t1" })),
+            entry(owned.clone()),
+            entry(ownerless),
+            entry(owned),
+        ] } });
+        let top = read_top(&v);
+        let got: Vec<(Kind, &str)> = top.items.iter().map(|e| (e.kind, e.uri.as_str())).collect();
+        assert_eq!(
+            got,
+            [
+                (Kind::Track, "spotify:track:t1"),
+                (Kind::Playlist, "spotify:playlist:p1"),
+            ]
+        );
+        assert!(top.items[1].playlist.is_some());
+        // The unbuildable first copy; the later repeats are repeats of an accepted entry.
+        assert_eq!(top.unbuildable, 1);
     }
 
     #[test]
