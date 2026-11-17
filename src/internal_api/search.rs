@@ -258,13 +258,20 @@ pub fn read_top(search_v2: &Value) -> TopResults {
         .filter_map(|entry| entry.get("data"))
     {
         let uri = data.get("uri").and_then(Value::as_str);
+        // A uri counts as seen only once its row is built, so an unbuildable entry does not
+        // hide a later, complete copy of the same playlist.
         if let Some(uri) = uri
-            && (seen.contains(uri) || !seen_featured.insert(uri.to_string()))
+            && (seen.contains(uri) || seen_featured.contains(uri))
         {
             continue;
         }
         match playlist_row(data) {
-            Some(row) => top.featured.push(row),
+            Some(row) => {
+                if let Some(uri) = uri {
+                    seen_featured.insert(uri.to_string());
+                }
+                top.featured.push(row);
+            }
             None if uri.is_some_and(|u| kind_of_uri(u) == Some(Kind::Playlist)) => {
                 top.unbuildable += 1;
             }
@@ -388,6 +395,20 @@ mod tests {
         } });
         let top = read_top(&v);
         assert!(top.items.is_empty());
+        let ids: Vec<&str> = top.featured.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["p1"]);
+        assert_eq!(top.unbuildable, 1);
+    }
+
+    #[test]
+    fn an_unbuildable_featured_copy_does_not_hide_its_complete_repeat() {
+        let v = json!({ "topResultsV2": { "featured": [
+            { "data": { "uri": "spotify:playlist:p1", "name": "p1",
+                "ownerV2": { "data": {} } } },
+            { "data": { "uri": "spotify:playlist:p1", "name": "p1",
+                "ownerV2": { "data": { "name": "Owner", "username": "owner1" } } } },
+        ] } });
+        let top = read_top(&v);
         let ids: Vec<&str> = top.featured.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["p1"]);
         assert_eq!(top.unbuildable, 1);
