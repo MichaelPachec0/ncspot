@@ -36,7 +36,7 @@ use crate::ui::pagination::Pagination;
 /// Columns of the tag column of a row with a tag.
 pub const TAG_WIDTH: usize = 8;
 /// Columns kept clear right of the tag column, so tags line up whatever the right text is.
-pub const TAG_RIGHT_RESERVE: usize = 18;
+pub const TAG_RIGHT_RESERVE: usize = 20;
 
 pub enum MouseHandleResult {
     Handled(EventResult),
@@ -1421,23 +1421,30 @@ mod draw_test {
         assert_eq!(lines[0], "--- Featured playlists -------");
     }
 
+    /// The column a tag starts in on a row `width` columns wide whose right text fits the
+    /// reserve.
+    fn tag_column(width: usize) -> usize {
+        width - (TAG_RIGHT_RESERVE + 1 + TAG_WIDTH)
+    }
+
     #[test]
     fn a_tag_row_keeps_the_left_text_up_to_the_tag_column() {
         let tagged = |left: String| Probe {
             tag: Some("Artist".into()),
             ..row(&left)
         };
-        let whole = "w".repeat(42);
+        let tag_x = tag_column(70);
+        let whole = "w".repeat(tag_x - 1);
         let long = "x".repeat(50);
         let (mut list, _content) = list_of(vec![tagged(whole.clone()), tagged(long)]);
         let lines = draw_rows(&mut list, 70);
-        assert_eq!(&lines[0][..42], whole);
-        assert_eq!(&lines[0][42..43], " ");
-        assert_eq!(&lines[0][43..49], "Artist");
-        assert_eq!(&lines[1][..40], "x".repeat(40));
-        assert_eq!(&lines[1][40..42], "..");
-        assert_eq!(&lines[1][42..43], " ");
-        assert_eq!(&lines[1][43..49], "Artist");
+        assert_eq!(&lines[0][..tag_x - 1], whole);
+        assert_eq!(&lines[0][tag_x - 1..tag_x], " ");
+        assert_eq!(&lines[0][tag_x..tag_x + 6], "Artist");
+        assert_eq!(&lines[1][..tag_x - 3], "x".repeat(tag_x - 3));
+        assert_eq!(&lines[1][tag_x - 3..tag_x - 1], "..");
+        assert_eq!(&lines[1][tag_x - 1..tag_x], " ");
+        assert_eq!(&lines[1][tag_x..tag_x + 6], "Artist");
     }
 
     #[test]
@@ -1447,6 +1454,7 @@ mod draw_test {
             "2019".into(),
             String::new(),
             "r".repeat(18),
+            "1:02:03 [2024-05-01]".into(),
         ];
         let rows = rights
             .iter()
@@ -1460,7 +1468,8 @@ mod draw_test {
         let (mut list, _content) = list_of(rows);
         let lines = draw_rows(&mut list, 70);
         let columns: Vec<Option<usize>> = lines.iter().map(|l| l.find("Track")).collect();
-        assert_eq!(columns, vec![Some(43); 4]);
+        assert_eq!(rights[4].len(), 20);
+        assert_eq!(columns, vec![Some(tag_column(70)); rights.len()]);
     }
 
     #[test]
