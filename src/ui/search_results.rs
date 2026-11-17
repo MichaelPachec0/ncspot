@@ -14,6 +14,7 @@ use crate::model::track::Track;
 use crate::queue::Queue;
 use crate::search_api::{FirstPage, NextPage, Rows, TabPage, TopDraft};
 use crate::spotify::{Spotify, UriType};
+use crate::spotify_api::WebApi;
 use crate::spotify_url::SpotifyUrl;
 use crate::traits::{ListItem, ViewExt};
 use crate::ui::listview::ListView;
@@ -73,6 +74,14 @@ pub(crate) fn term_kind(term: &str) -> TermKind {
 /// while the internal search is in use.
 fn with_top(term: &str, kind: &TermKind, internal_search_in_use: bool) -> bool {
     matches!(kind, TermKind::Text) && !term.trim().is_empty() && internal_search_in_use
+}
+
+/// What `term` is, and whether its search view gets a Top tab with `api` as it stands now.
+/// Sends nothing.
+fn term_and_top(term: &str, api: &WebApi) -> (TermKind, bool) {
+    let kind = term_kind(term);
+    let top = with_top(term, &kind, api.internal_search_in_use());
+    (kind, top)
 }
 
 /// The tab a lookup of `uri_type` shows its item in, in a view without a Top tab.
@@ -392,12 +401,7 @@ impl SearchResultsView {
         queue: Arc<Queue>,
         library: Arc<Library>,
     ) -> Self {
-        let term = term_kind(&search_term);
-        let top = with_top(
-            &search_term,
-            &term,
-            queue.get_spotify().api.internal_search_in_use(),
-        );
+        let (term, top) = term_and_top(&search_term, &queue.get_spotify().api);
         let mut view = Self::build(search_term, events, queue, library, top);
         view.run_search(term);
         view
@@ -967,7 +971,6 @@ mod tests {
     use crate::model::playable::Playable;
     use crate::save_log::test_items;
     use crate::search_api::TopRow;
-    use crate::spotify_api::WebApi;
     use crate::ui::pagination::Position;
     use rspotify::model::{AlbumId, SimplifiedAlbum};
     use std::collections::HashMap;
@@ -1487,6 +1490,21 @@ mod tests {
                 .count();
             assert_eq!(notes, 1, "with_top {with_top}");
         }
+    }
+
+    #[test]
+    fn a_new_view_decides_its_tabs_from_the_term_and_the_web_api() {
+        let top = |term: &str, api: &WebApi| term_and_top(term, api).1;
+        let api = WebApi::new(&Config::new_for_test());
+        assert!(matches!(term_and_top("x", &api), (TermKind::Text, true)));
+        assert!(!top("spotify:track:t1", &api));
+        assert!(!top("https://open.spotify.com/album/b1", &api));
+        for blank in ["", "   ", "\t"] {
+            assert!(!top(blank, &api), "{blank:?}");
+        }
+        // No session: the first page goes to the Web API, and the next view has six tabs.
+        assert!(matches!(api.search_first_page("x"), FirstPage::NotInUse));
+        assert!(!top("x", &api));
     }
 
     #[test]
