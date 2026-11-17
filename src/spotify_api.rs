@@ -178,6 +178,21 @@ fn retry_stray(first: &InternalError) -> bool {
     matches!(first, InternalError::Transient(_))
 }
 
+/// The sends of one stray fetch: `attempt` once, and once more after `sleep(STRAY_RETRY_PAUSE)`
+/// when that failed transiently (see [retry_stray]); any other outcome is returned at once.
+fn stray_attempts<T>(
+    mut attempt: impl FnMut() -> Result<T, InternalError>,
+    sleep: impl FnOnce(Duration),
+) -> Result<T, InternalError> {
+    match attempt() {
+        Err(err) if retry_stray(&err) => {
+            sleep(STRAY_RETRY_PAUSE);
+            attempt()
+        }
+        result => result,
+    }
+}
+
 /// `call` once per `size` items of `items`, in order, with the results concatenated; the first
 /// failed call fails the whole.
 fn in_batches<T: Clone, U, E>(
@@ -423,17 +438,16 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        match self.run_internal_with(area, false, 0, true, &internal) {
-            Err(err) if retry_stray(&err) => {
+        stray_attempts(
+            || self.run_internal_with(area, false, 0, true, &internal),
+            |pause| {
                 debug!(
                     "internal API {} call failed (transient), one retry",
                     area.name()
                 );
-                thread::sleep(STRAY_RETRY_PAUSE);
-                self.run_internal_with(area, false, 0, true, internal)
-            }
-            result => result,
-        }
+                thread::sleep(pause);
+            },
+        )
     }
 
     fn run_internal_with<T, F, Fut>(
@@ -2000,6 +2014,81 @@ mod test {
         ] {
             assert_eq!(retry_stray(&err), retry, "{}", err.class());
         }
+    }
+
+    /// What `stray_attempts` did with `answers` (one per attempt, in order): the result, the
+    /// number of attempts, and the pauses it slept.
+    fn stray_run(
+        answers: Vec<Result<u8, InternalError>>,
+    ) -> (Result<u8, InternalError>, usize, Vec<Duration>) {
+        let mut answers = answers.into_iter();
+        let mut attempts = 0;
+        let mut sleeps = Vec::new();
+        let result = stray_attempts(
+            || {
+                attempts += 1;
+                answers.next().expect("no more attempts than answers")
+            },
+            |pause| sleeps.push(pause),
+        );
+        (result, attempts, sleeps)
+    }
+
+    #[test]
+    fn a_stray_fetch_is_sent_once_more_only_after_a_transient_failure() {
+        let transient = |text: &str| InternalError::Transient(text.into());
+        assert_eq!(stray_run(vec![Ok(1)]), (Ok(1), 1, Vec::new()));
+        assert_eq!(
+            stray_run(vec![Err(InternalError::RateLimited)]),
+            (Err(InternalError::RateLimited), 1, Vec::new())
+        );
+        assert_eq!(
+            stray_run(vec![Err(transient("a")), Ok(2)]),
+            (Ok(2), 2, vec![STRAY_RETRY_PAUSE])
+        );
+        assert_eq!(
+            stray_run(vec![Err(transient("a")), Err(transient("b"))]),
+            (Err(transient("b")), 2, vec![STRAY_RETRY_PAUSE])
+        );
+        for err in [
+            InternalError::ProtocolChanged("x".into()),
+            InternalError::NoSession,
+            InternalError::NotFound,
+            InternalError::Denied,
+        ] {
+            assert_eq!(
+                stray_run(vec![Err(err.clone())]),
+                (Err(err.clone()), 1, Vec::new()),
+                "{}",
+                err.class()
+            );
+        }
+    }
+
+    #[test]
+    fn a_stray_fetch_on_a_real_web_api_latches_nothing_and_counts_no_fallback() {
+        use crate::search_api::SearchBackend;
+        let uris = vec!["spotify:track:0000000000000000000001".to_string()];
+        let api = WebApi::new(&Config::new_for_test());
+        let before = [Area::Search, Area::Metadata].map(|area| api.area_counts(area));
+        assert!(matches!(
+            api.fetch_stray(Kind::Track, &uris),
+            Err(InternalError::NoSession)
+        ));
+        assert_eq!(
+            [Area::Search, Area::Metadata].map(|area| api.area_counts(area)),
+            before
+        );
+        assert!(!before.iter().any(|counts| counts.latched));
+
+        api.latch_area(Area::Metadata, &InternalError::ProtocolChanged("x".into()));
+        let search = api.area_counts(Area::Search);
+        // The latch check answers before the session is looked up: nothing is sent.
+        assert_eq!(
+            api.fetch_stray(Kind::Track, &uris).map(|rows| rows.len()),
+            Err(InternalError::ProtocolChanged("area off or latched".into()))
+        );
+        assert_eq!(api.area_counts(Area::Search), search);
     }
 
     #[test]
