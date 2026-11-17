@@ -774,11 +774,14 @@ mod tests {
             Operation::Desktop.builtin().len()
         );
         // Per page: the one `searchTracks` hash, then every `searchDesktop` hash.
-        let per_page = 1 + Operation::Desktop.builtin().len();
-        let ops = sent_ops(&fake);
-        assert_eq!(ops.len(), 2 * per_page);
-        assert_eq!(ops[0], Operation::Tracks);
-        assert!(ops[1..per_page].iter().all(|op| *op == Operation::Desktop));
+        let mut per_page = vec![Operation::Tracks];
+        per_page.extend(
+            Operation::Desktop
+                .builtin()
+                .iter()
+                .map(|_| Operation::Desktop),
+        );
+        assert_eq!(sent_ops(&fake), [per_page.clone(), per_page].concat());
         assert!(fake.latched_areas().is_empty());
         assert_eq!(fake.counts(), (0, 0));
     }
@@ -820,10 +823,44 @@ mod tests {
         assert!(fake.latched_areas().is_empty());
         assert_eq!(fake.counts(), (0, 1));
         // Nothing was marked: the next search asks every hash again.
-        assert_eq!(
-            store.candidates(Operation::Desktop).len(),
-            Operation::Desktop.builtin().len()
+        let hashes = Operation::Desktop.builtin().len();
+        assert_eq!(store.candidates(Operation::Desktop).len(), hashes);
+        assert_eq!(fake.sends.lock().len(), hashes);
+        assert!(matches!(
+            first_page_with(&fake, &store, "y"),
+            FirstPage::NotInUse
+        ));
+        assert_eq!(fake.sends.lock().len(), 2 * hashes);
+        assert_eq!(fake.counts(), (0, 2));
+    }
+
+    #[test]
+    fn only_the_search_desktop_hash_that_answered_decides_whether_the_answer_was_plain() {
+        // Per page `searchDesktop` gives a plain answer that cannot be read (that hash is
+        // marked bad), then a readable answer with errors from the next hash.
+        let desktop_sends = Mutex::new(0);
+        let fake = Fake::new(
+            move |op, _| {
+                if op == Operation::Tracks {
+                    return Ok(Outcome::BadRequest);
+                }
+                let mut sends = desktop_sends.lock();
+                *sends += 1;
+                Ok(if *sends == 1 {
+                    Outcome::Answer(json!({}))
+                } else {
+                    Outcome::Partial(search::test_answer())
+                })
+            },
+            |kind| Ok(Rows::empty(kind)),
         );
+        let store = store();
+        for offset in [50, 100, 150] {
+            let page = next_page_with(&fake, &store, Kind::Track, "x", offset);
+            assert!(matches!(page, NextPage::Page(_)));
+        }
+        // An answer with errors is no witness, whatever an earlier hash sent.
+        assert!(!store.is_retired(Operation::Tracks));
     }
 
     #[test]

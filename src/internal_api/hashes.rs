@@ -301,6 +301,10 @@ impl HashStore {
     fn witness_suspect(&self, op: Operation, suspect: &Suspect, request: u64) -> bool {
         let mut state = self.shared.state.lock();
         let entry = state.entry(op).or_default();
+        // Already marked (an HTTP 412 on another thread): nothing to count.
+        if entry.bad.contains(&suspect.hash) {
+            return false;
+        }
         if entry.answers.get(&suspect.hash).copied().unwrap_or(0) != suspect.answered {
             return false;
         }
@@ -786,6 +790,21 @@ mod tests {
         assert!(!s.is_bad(op, b));
         witness(&s, op, &[suspect(&s, op, b)], 2);
         assert!(s.is_bad(op, b) && s.is_retired(op));
+    }
+
+    #[test]
+    fn a_suspect_that_is_already_bad_is_not_counted_or_marked_again() {
+        let (s, _) = store([], []);
+        let op = Operation::Tracks;
+        let b = op.builtin()[0];
+        let before = suspect(&s, op, b);
+        s.mark_bad(op, b);
+        assert!(!s.witness_suspect(op, &before, 1));
+        assert!(!s.witness_suspect(op, &before, 2));
+        // Nothing was counted: after an answer the hash needs two witnesses again.
+        s.mark_working(op, b);
+        assert!(!s.witness_suspect(op, &suspect(&s, op, b), 3));
+        assert!(!s.is_bad(op, b));
     }
 
     #[test]
