@@ -42,17 +42,17 @@ pub(crate) struct Bar {
     pub first: usize,
 }
 
-/// Whether every title fits its equal share of `width` with a blank on each side, so the
-/// bar gives every tab that share, as it did before it could scroll.
+/// Whether every title is at most as wide as its equal share of `width`, so the bar gives
+/// every tab that share, as it did before it could scroll.
 fn fits(titles: &[usize], width: usize) -> bool {
-    !titles.is_empty() && titles.iter().all(|title| title + 2 <= width / titles.len())
+    !titles.is_empty() && titles.iter().all(|title| *title <= width / titles.len())
 }
 
 /// Pure. `titles` are the display widths of the tab titles, `first` the first tab shown
 /// by the previous layout.
 ///
-/// When every title fits its equal share of `width` with a blank on each side, every tab
-/// gets that share. Otherwise each tab is its title padded by `TAB_PAD` on each side, the
+/// When every title is at most as wide as its equal share of `width`, every tab gets that
+/// share. Otherwise each tab is its title padded by `TAB_PAD` on each side, the
 /// bar shows as many tabs from `first` on as fit, scrolls just far enough to show
 /// `selected`, and marks hidden tabs with an arrow on that side.
 pub(crate) fn bar(titles: &[usize], width: usize, selected: usize, first: usize) -> Bar {
@@ -662,6 +662,40 @@ mod tests {
     }
 
     #[test]
+    fn titles_as_wide_as_their_share_or_narrower_fit() {
+        let titles = [12, 6, 6, 7, 15];
+        let fit = bar(&titles, 80, 0, 0);
+        assert_eq!(
+            fit,
+            Bar {
+                slots: (0..5).map(|i| slot(i, i * 16, 16)).collect(),
+                left_arrow: false,
+                right_arrow: false,
+                first: 0,
+            }
+        );
+
+        let scroll = bar(&titles, 74, 0, 0);
+        assert_eq!(
+            scroll.slots,
+            vec![
+                slot(0, 0, 16),
+                slot(1, 16, 10),
+                slot(2, 26, 10),
+                slot(3, 36, 11),
+                slot(4, 47, 19),
+            ],
+            "scroll mode: each tab is its title padded on both sides"
+        );
+        assert!(!scroll.left_arrow && !scroll.right_arrow);
+
+        let exact = bar(&[12, 6, 6, 7, 16], 80, 0, 0);
+        assert_eq!(exact.slots.len(), 5, "a title as wide as its share fits");
+        assert!(exact.slots.iter().all(|slot| slot.width == 16));
+        assert!(!exact.left_arrow && !exact.right_arrow);
+    }
+
+    #[test]
     fn the_bar_scrolls_when_a_title_does_not_fit_its_share() {
         let bar = bar(&WIDTHS, 56, 0, 0);
         assert_eq!(bar.first, 0);
@@ -709,9 +743,9 @@ mod tests {
     fn a_wider_terminal_shows_as_many_tabs_as_fit_again() {
         let narrow = bar(&WIDTHS, 56, 6, 3);
         assert_eq!(narrow.first, 3);
-        let wider = bar(&WIDTHS, 70, 6, narrow.first);
-        assert_eq!(wider.first, 1, "first 0 would hide tab 6");
-        assert_eq!(shown(&wider), vec![1, 2, 3, 4, 5, 6]);
+        let wider = bar(&WIDTHS, 62, 6, narrow.first);
+        assert_eq!(wider.first, 2, "first 1 would hide tab 6");
+        assert_eq!(shown(&wider), vec![2, 3, 4, 5, 6]);
         assert!(wider.left_arrow);
         assert!(!wider.right_arrow);
         let wide = bar(&WIDTHS, 100, 6, wider.first);
