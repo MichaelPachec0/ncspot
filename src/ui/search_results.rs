@@ -134,13 +134,20 @@ impl FirstPageClass {
 
 /// What the background thread does with the first page, apart from filling the six tabs.
 /// Returns whether the Web API search must run. A Top tab the internal search did not serve
-/// asks for the move to Tracks.
-fn after_first_page(page_is: FirstPageClass, has_top: bool, to_tracks: &AtomicBool) -> bool {
+/// asks for the move to Tracks and calls `trigger` right after, so the move does not wait
+/// for the Web API search; `trigger` is not called otherwise.
+fn after_first_page(
+    page_is: FirstPageClass,
+    has_top: bool,
+    to_tracks: &AtomicBool,
+    trigger: impl FnOnce(),
+) -> bool {
     match page_is {
         FirstPageClass::Internal | FirstPageClass::Failed => false,
         FirstPageClass::NotInUse => {
             if has_top {
                 to_tracks.store(true, Ordering::Relaxed);
+                trigger();
             }
             true
         }
@@ -780,7 +787,7 @@ impl SearchResultsView {
                 FirstPage::NotInUse => {}
                 FirstPage::Failed => report_failed_search(&events),
             }
-            if after_first_page(page_is, top_rows.is_some(), &to_tracks) {
+            if after_first_page(page_is, top_rows.is_some(), &to_tracks, || events.trigger()) {
                 Self::refresh_web_token(&spotify);
                 Self::search_web_api(&spotify, &events, tabs, &term);
             }
@@ -1218,8 +1225,21 @@ mod tests {
             (FirstPageClass::Failed, false, false, false),
         ] {
             let to_tracks = AtomicBool::new(false);
-            assert_eq!(after_first_page(class, has_top, &to_tracks), web);
+            let triggers = std::cell::Cell::new(0);
+            let trigger = || {
+                assert!(
+                    to_tracks.load(Ordering::Relaxed),
+                    "triggered before the flag"
+                );
+                triggers.set(triggers.get() + 1);
+            };
+            assert_eq!(after_first_page(class, has_top, &to_tracks, trigger), web);
             assert_eq!(to_tracks.load(Ordering::Relaxed), flag);
+            assert_eq!(
+                triggers.get(),
+                usize::from(flag),
+                "a trigger exactly when asked"
+            );
         }
     }
 
