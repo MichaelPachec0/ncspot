@@ -131,6 +131,8 @@ pub struct InternalApiAreas {
     pub library: Option<bool>,
     /// The playlist list and playlist contents.
     pub playlists: Option<bool>,
+    /// Text search.
+    pub search: Option<bool>,
 }
 
 /// Configuration for the lyrics feature.
@@ -286,6 +288,9 @@ pub struct UserState {
     /// Collection v2 sync token per set ("collection", "artist", "show", "listenlater"), valid only together with that set's cache file.
     #[serde(default)]
     pub collection_sync: HashMap<String, String>,
+    /// Last working Pathfinder hash per search operation name.
+    #[serde(default)]
+    pub search_hashes: HashMap<String, String>,
 }
 
 impl Default for UserState {
@@ -303,6 +308,7 @@ impl Default for UserState {
             jukebox_override_per_song: false,
             library_full_fetch: HashMap::new(),
             collection_sync: HashMap::new(),
+            search_hashes: HashMap::new(),
         }
     }
 }
@@ -719,6 +725,17 @@ mod test {
         )
         .unwrap();
         assert!(state.collection_sync.is_empty());
+    }
+
+    #[test]
+    fn old_user_state_loads_with_no_search_hashes() {
+        let state: UserState = serde_json::from_str(
+            &serde_json::to_string(&UserState::default())
+                .unwrap()
+                .replace(",\"search_hashes\":{}", ""),
+        )
+        .unwrap();
+        assert!(state.search_hashes.is_empty());
     }
 
     #[test]

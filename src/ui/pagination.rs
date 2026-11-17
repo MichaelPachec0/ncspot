@@ -141,11 +141,50 @@ pub fn fill_in_background<I, F, R>(
 
 pub type Paginator<I> = Box<dyn Fn(Arc<RwLock<Vec<I>>>) + Send + Sync>;
 
+/// Where a list that pages by position stands. Cloning shares the state.
+///
+/// The state is `Some((next_offset, total))` while the list pages by position and `None`
+/// while it pages by row count. A paging callback captures a `Position` (never the
+/// `Pagination`) and calls `set` while it runs: `Pagination::call` holds the callback lock for
+/// reading meanwhile, so these methods take only this handle's own lock.
+#[derive(Clone, Default)]
+pub struct Position {
+    state: Arc<RwLock<PositionState>>,
+}
+
+/// `Some((next_offset, total))` for a positioned list, `None` for row-count paging.
+type PositionState = Option<(Option<usize>, usize)>;
+
+impl Position {
+    /// The offset of the next page, `None` when there is no more or the list does not page by
+    /// position.
+    pub fn next_offset(&self) -> Option<usize> {
+        self.state.read().and_then(|(next_offset, _)| next_offset)
+    }
+
+    /// Set the next offset and the latest total. Takes only this handle's own lock.
+    pub fn set(&self, next_offset: Option<usize>, total: usize) {
+        *self.state.write() = Some((next_offset, total));
+    }
+
+    fn get(&self) -> PositionState {
+        *self.state.read()
+    }
+
+    fn reset(&self) {
+        *self.state.write() = None;
+    }
+}
+
 /// Manages the loading of ListItems, to increase performance and decrease
 /// memory usage.
 ///
+/// A list pages either by row count (`set`: more while `loaded_content < max_content`) or by
+/// position (`set_positioned`: more while the shared `position` has a next offset).
+///
 /// `loaded_content`: The amount of currently loaded items
-/// `max_content`: The maximum amount of items
+/// `max_content`: The maximum amount of items, for row-count paging
+/// `position`: Where a positioned list stands, shared by every clone
 /// `callback`: TODO: document
 /// `busy`: TODO: document
 #[derive(Clone)]
@@ -154,6 +193,7 @@ pub struct Pagination<I: ListItem> {
     max_content: Arc<RwLock<Option<usize>>>,
     callback: Arc<RwLock<Option<Paginator<I>>>>,
     busy: Arc<AtomicBool>,
+    position: Position,
 }
 
 impl<I: ListItem> Default for Pagination<I> {
@@ -163,6 +203,7 @@ impl<I: ListItem> Default for Pagination<I> {
             max_content: Arc::new(RwLock::new(None)),
             callback: Arc::new(RwLock::new(None)),
             busy: Arc::new(AtomicBool::new(false)),
+            position: Position::default(),
         }
     }
 }
@@ -170,20 +211,58 @@ impl<I: ListItem> Default for Pagination<I> {
 impl<I: ListItem + Clone> Pagination<I> {
     pub fn clear(&mut self) {
         *self.max_content.write() = None;
+        self.position.reset();
         *self.callback.write() = None;
     }
     pub fn set(&self, loaded_content: usize, max_content: usize, callback: Paginator<I>) {
         *self.loaded_content.write() = loaded_content;
         *self.max_content.write() = Some(max_content);
+        self.position.reset();
         *self.callback.write() = Some(callback);
+    }
+
+    /// Page by position: more can be loaded while `next_offset` is `Some`.
+    pub fn set_positioned(&self, next_offset: Option<usize>, total: usize, callback: Paginator<I>) {
+        *self.max_content.write() = None;
+        self.position.set(next_offset, total);
+        *self.callback.write() = Some(callback);
+    }
+
+    /// The handle a paging callback uses to move or end paging.
+    pub fn position(&self) -> Position {
+        self.position.clone()
+    }
+
+    /// True while another page can be asked for.
+    pub fn can_load_more(&self) -> bool {
+        match self.position.get() {
+            Some((next_offset, _)) => next_offset.is_some(),
+            None => self.max_content().unwrap_or(0) > self.loaded_content(),
+        }
+    }
+
+    /// Rows still to come, for the "more items" row.
+    pub fn remaining(&self) -> usize {
+        match self.position.get() {
+            Some((Some(next_offset), total)) => total.saturating_sub(next_offset),
+            Some((None, _)) => 0,
+            None => self
+                .max_content()
+                .unwrap_or(0)
+                .saturating_sub(self.loaded_content()),
+        }
     }
 
     pub fn loaded_content(&self) -> usize {
         *self.loaded_content.read()
     }
 
+    /// The total for a positioned list, the row count to reach otherwise.
     pub fn max_content(&self) -> Option<usize> {
-        *self.max_content.read()
+        match self.position.get() {
+            Some((_, total)) => Some(total),
+            None => *self.max_content.read(),
+        }
     }
 
     #[cfg(any(test, feature = "harness"))]
@@ -236,6 +315,8 @@ mod test {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
+            web_loaded: false,
         }
     }
 
@@ -403,5 +484,57 @@ mod test {
         release.send(()).unwrap();
         wait_not_busy(&pagination);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn row_count_paging_is_unchanged() {
+        let p = Pagination::<Playlist>::default();
+        assert!(!p.can_load_more());
+        p.set(10, 25, Box::new(|_| {}));
+        assert!(p.can_load_more());
+        assert_eq!(p.remaining(), 15);
+        assert_eq!(p.position().next_offset(), None);
+    }
+
+    #[test]
+    fn positioned_paging_follows_the_next_offset_not_the_rows() {
+        let p = Pagination::<Playlist>::default();
+        p.set_positioned(Some(50), 180, Box::new(|_| {}));
+        assert!(p.can_load_more());
+        assert_eq!((p.remaining(), p.max_content()), (130, Some(180)));
+        p.position().set(None, 171);
+        assert!(!p.can_load_more());
+        assert_eq!(p.remaining(), 0);
+        p.set_positioned(Some(0), 40, Box::new(|_| {}));
+        assert!(
+            p.can_load_more(),
+            "zero rows with a next offset still pages"
+        );
+    }
+
+    #[test]
+    fn a_callback_can_end_paging_without_deadlock() {
+        let p = Pagination::<Playlist>::default();
+        let pos = p.position(); // taken before set_positioned: the handle is shared, not replaced
+        p.set_positioned(Some(50), 100, Box::new(move |_| pos.set(None, 100)));
+        let content = Arc::new(RwLock::new(Vec::new()));
+        p.call(&content, test_library());
+        wait_not_busy(&p);
+        assert!(!p.can_load_more());
+        // The paginator still works afterwards.
+        p.set(0, 1, Box::new(|_| {}));
+        assert!(p.can_load_more());
+    }
+
+    #[test]
+    fn clear_resets_the_position() {
+        let mut p = Pagination::<Playlist>::default();
+        let other = p.clone();
+        let pos = p.position();
+        p.set_positioned(Some(50), 100, Box::new(|_| {}));
+        assert!(other.can_load_more(), "clones share the position");
+        p.clear();
+        assert!(!other.can_load_more());
+        assert_eq!(pos.next_offset(), None);
     }
 }

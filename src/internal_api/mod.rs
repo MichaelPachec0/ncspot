@@ -7,9 +7,12 @@ pub mod collection;
 pub mod convert;
 pub mod error;
 pub mod fallback;
+pub mod hashes;
 pub mod metadata;
+pub mod pathfinder;
 pub mod playlist;
 pub mod playlist_write;
+pub mod search;
 
 #[cfg(test)]
 mod live_tests;
@@ -25,8 +28,7 @@ use log::warn;
 
 use crate::config::ConfigValues;
 use crate::rate_limit::{
-    Attempt, ClientLabel, MAX_RATE_LIMIT_RETRIES, ThrottleState, backoff, random_jitter,
-    run_rate_limited,
+    Attempt, ClientLabel, ThrottleState, backoff, random_jitter, run_rate_limited,
 };
 use error::InternalError;
 
@@ -46,6 +48,8 @@ pub struct Settings {
     pub library: bool,
     /// `[internal_api_areas] playlists`.
     pub playlists: bool,
+    /// `[internal_api_areas] search`.
+    pub search: bool,
 }
 
 impl Settings {
@@ -57,6 +61,7 @@ impl Settings {
             metadata: areas.metadata.unwrap_or(true),
             library: areas.library.unwrap_or(true),
             playlists: areas.playlists.unwrap_or(true),
+            search: areas.search.unwrap_or(true),
         }
     }
 
@@ -67,6 +72,7 @@ impl Settings {
                 Area::Metadata => self.metadata,
                 Area::Library => self.library,
                 Area::Playlists => self.playlists,
+                Area::Search => self.search,
             }
     }
 
@@ -91,6 +97,8 @@ pub enum Area {
     Library,
     /// The playlist list (rootlist) and playlist contents.
     Playlists,
+    /// Text search.
+    Search,
 }
 
 impl Area {
@@ -100,6 +108,7 @@ impl Area {
             Self::Metadata => "metadata",
             Self::Library => "library",
             Self::Playlists => "playlists",
+            Self::Search => "search",
         }
     }
 }
@@ -134,6 +143,9 @@ pub struct InternalApi {
     library_stats: Arc<AreaStats>,
     latched_playlists: Arc<AtomicBool>,
     playlists_stats: Arc<AreaStats>,
+    latched_search: Arc<AtomicBool>,
+    search_stats: Arc<AreaStats>,
+    hashes: hashes::HashStore,
 }
 
 impl InternalApi {
@@ -148,12 +160,25 @@ impl InternalApi {
             library_stats: Arc::new(AreaStats::default()),
             latched_playlists: Arc::new(AtomicBool::new(false)),
             playlists_stats: Arc::new(AreaStats::default()),
+            latched_search: Arc::new(AtomicBool::new(false)),
+            search_stats: Arc::new(AreaStats::default()),
+            hashes: hashes::HashStore::default(),
         }
     }
 
     /// Use the session handle that [crate::spotify::Spotify] fills when its worker connects.
     pub fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
         self.session = session;
+    }
+
+    /// Use `store` for the Pathfinder hashes.
+    pub fn set_hashes(&mut self, store: hashes::HashStore) {
+        self.hashes = store;
+    }
+
+    /// The Pathfinder hashes.
+    pub fn hashes(&self) -> &hashes::HashStore {
+        &self.hashes
     }
 
     /// The resolved switches.
@@ -174,6 +199,7 @@ impl InternalApi {
             Area::Metadata => &self.latched_metadata,
             Area::Library => &self.latched_library,
             Area::Playlists => &self.latched_playlists,
+            Area::Search => &self.latched_search,
         }
     }
 
@@ -187,6 +213,7 @@ impl InternalApi {
             Area::Metadata => &self.metadata_stats,
             Area::Library => &self.library_stats,
             Area::Playlists => &self.playlists_stats,
+            Area::Search => &self.search_stats,
         }
     }
 
@@ -218,10 +245,11 @@ impl InternalApi {
 }
 
 /// Run `attempt` with the rate-limit gate of `throttle` (see [run_rate_limited]) and retry
-/// transient failures on background threads, at most [MAX_RATE_LIMIT_RETRIES] times with
+/// transient failures on background threads, at most `max_transient_retries` times with
 /// [backoff] delays (`sleep` is injected for tests). Other errors return at once.
 pub fn run_attempts<T>(
     on_ui_thread: bool,
+    max_transient_retries: u32,
     throttle: &RwLock<ThrottleState>,
     mut attempt: impl FnMut() -> Result<T, InternalError>,
     mut on_429: impl FnMut(Duration),
@@ -251,7 +279,7 @@ pub fn run_attempts<T>(
                 // run_rate_limited gave up on (or refused to send because of) a 429.
                 None => return Err(InternalError::RateLimited),
                 Some(InternalError::Transient(why))
-                    if !on_ui_thread && transient_retries < MAX_RATE_LIMIT_RETRIES =>
+                    if !on_ui_thread && transient_retries < max_transient_retries =>
                 {
                     warn!(
                         "internal API call failed ({why}), retry {}",
@@ -270,7 +298,7 @@ pub fn run_attempts<T>(
 mod tests {
     use super::*;
     use crate::config::ConfigValues;
-    use crate::rate_limit::ThrottleState;
+    use crate::rate_limit::{MAX_RATE_LIMIT_RETRIES, ThrottleState};
     use parking_lot::RwLock;
     use std::cell::RefCell;
 
@@ -332,6 +360,14 @@ mod tests {
         on_ui: bool,
         script: Vec<Result<u8, InternalError>>,
     ) -> (Result<u8, InternalError>, usize, usize, usize) {
+        attempts_with(on_ui, MAX_RATE_LIMIT_RETRIES, script)
+    }
+
+    fn attempts_with(
+        on_ui: bool,
+        max_transient_retries: u32,
+        script: Vec<Result<u8, InternalError>>,
+    ) -> (Result<u8, InternalError>, usize, usize, usize) {
         let throttle = RwLock::new(ThrottleState::default());
         let script = RefCell::new(script.into_iter());
         let calls = RefCell::new(0);
@@ -339,6 +375,7 @@ mod tests {
         let sleeps = RefCell::new(0);
         let out = run_attempts(
             on_ui,
+            max_transient_retries,
             &throttle,
             || {
                 *calls.borrow_mut() += 1;
@@ -365,6 +402,14 @@ mod tests {
         let t = || Err(InternalError::Transient("x".into()));
         let (out, calls, _, sleeps) = attempts(false, vec![t(), t(), Ok(4)]);
         assert_eq!((out, calls, sleeps), (Ok(4), 3, 2));
+    }
+
+    #[test]
+    fn a_lower_retry_limit_gives_up_sooner() {
+        let t = || Err(InternalError::Transient("x".into()));
+        let (out, calls, _, sleeps) = attempts_with(false, 1, vec![t(), t()]);
+        assert!(matches!(out, Err(InternalError::Transient(_))));
+        assert_eq!((calls, sleeps), (2, 1));
     }
 
     #[test]
@@ -411,6 +456,7 @@ mod tests {
             metadata: true,
             library: true,
             playlists: true,
+            search: true,
         };
         let api = InternalApi::new(on);
         assert!(!api.skip(Area::Metadata));
@@ -476,6 +522,28 @@ mod tests {
     }
 
     #[test]
+    fn search_area_defaults_on_and_can_be_turned_off() {
+        assert!(settings("internal_api = true").area_enabled(Area::Search));
+        let off = settings("internal_api = true\n[internal_api_areas]\nsearch = false\n");
+        assert!(!off.area_enabled(Area::Search));
+        assert!(off.area_enabled(Area::Metadata));
+        assert!(!settings("internal_api = false").area_enabled(Area::Search));
+    }
+
+    #[test]
+    fn search_area_latches_and_counts_on_its_own() {
+        let api = InternalApi::new(settings("internal_api = true"));
+        assert!(!api.skip(Area::Search));
+        api.count_ok(Area::Search);
+        assert!(api.latch(Area::Search));
+        assert!(api.skip(Area::Search));
+        assert!(!api.skip(Area::Metadata));
+        let c = api.area_counts(Area::Search);
+        assert_eq!((c.internal_ok, c.fallback, c.latched), (1, 0, true));
+        assert_eq!(Area::Search.name(), "search");
+    }
+
+    #[test]
     fn no_session_handle_means_no_session() {
         let api = InternalApi::new(Settings {
             enabled: true,
@@ -483,6 +551,7 @@ mod tests {
             metadata: true,
             library: true,
             playlists: true,
+            search: true,
         });
         assert!(api.session().is_none());
     }

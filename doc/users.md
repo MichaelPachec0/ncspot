@@ -376,6 +376,7 @@ Possible configuration values are:
 | `internal_api_areas.library`    | Your saved tracks, albums, artists, shows and episodes         | `true`, `false`                                                                       | `true`              |
 | `internal_api_areas.metadata`   | Tracks, albums, artists, shows, episodes and your profile      | `true`, `false`                                                                       | `true`              |
 | `internal_api_areas.playlists`  | Your playlist list and playlist contents                       | `true`, `false`                                                                       | `true`              |
+| `internal_api_areas.search`     | Text search                                                    | `true`, `false`                                                                       | `true`              |
 
 1. If built with the `cover` feature.
 2. By default the statusbar will show a play icon when a track is playing and
@@ -494,7 +495,8 @@ count against the Web API client ID's rate limit.
 - `internal_api = false` turns it off: every request uses the Web API as
   before.
 - `[internal_api_areas]` turns single areas off, for example
-  `metadata = false`.
+  `metadata = false`. The areas are `metadata`, `library`, `playlists` and
+  `search`.
 - Changes to `internal_api` or `[internal_api_areas]` take effect after a
   restart; `:reload` does not apply them.
 - If Spotify changes the internal API, ncspot shows "Spotify internal API
@@ -506,6 +508,23 @@ The internal API is undocumented and not covered by Spotify's developer
 terms. Using it goes against the wording of Spotify's user terms, and the
 risk lands on your Spotify account, not on ncspot. Use it at your own risk.
 It needs Spotify Premium, like playback.
+
+#### Pathfinder hash overrides
+
+Text search uses Spotify's persisted queries, which are selected by a hash that
+Spotify retires without notice. ncspot knows several hashes per operation and
+moves on to the next one when Spotify refuses a hash. If all of them are
+retired, you can supply newer ones in `pathfinder_hashes.json` in the
+configuration folder, next to `config.toml`:
+
+```json
+{ "searchDesktop": ["<64 lowercase hex characters>"] }
+```
+
+The keys are `searchDesktop`, `searchTracks`, `searchArtists`,
+`searchAlbums`, `searchPlaylists` and `searchPodcasts`; each holds a list of at
+most 8 hashes, tried before the built-in ones. Invalid entries are skipped with
+a warning in the log. ncspot never writes this file.
 
 ### Proxy
 

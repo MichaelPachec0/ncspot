@@ -112,7 +112,7 @@ impl<I: ListItem + Clone> ListView<I> {
     /// `true` if there are unloaded items
     /// `false` if all items are loaded
     fn can_paginate(&self) -> bool {
-        self.get_pagination().max_content().unwrap_or(0) > self.get_pagination().loaded_content()
+        self.get_pagination().can_load_more()
     }
 
     /// Try to load more items into the list if neccessary.
@@ -239,6 +239,7 @@ impl<I: ListItem + Clone> ListView<I> {
 
     /// The view the selected item opens, if any. No list guard is held while opening.
     fn open_selected(&self) -> Option<Box<dyn ViewExt>> {
+        self.with_selected_item(|item| item.prepare_open(&self.queue));
         let target = self
             .content
             .read()
@@ -387,8 +388,7 @@ impl<I: ListItem + Clone> View for ListView<I> {
             if i == len && self.can_paginate() {
                 let style = ColorStyle::secondary();
 
-                let max = self.pagination.max_content().unwrap();
-                let buf = format!("{} more items, scroll to load", max - i);
+                let buf = format!("{} more items, scroll to load", self.pagination.remaining());
                 printer.with_color(style, |printer| {
                     printer.print((0, 0), &buf);
                 });
@@ -734,6 +734,7 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
                 let target: Option<Box<dyn ListItem>> = match mode {
                     TargetMode::Current => self.queue.get_current().map(|t| t.as_listitem()),
                     TargetMode::Selected => {
+                        self.with_selected_item(|item| item.prepare_open(&self.queue));
                         let content = self.content.read();
                         content.get(self.selected).map(|t| t.as_listitem())
                     }
@@ -1038,6 +1039,10 @@ mod draw_test {
         fn id(&self) -> Option<String> {
             Some(self.id.clone())
         }
+        fn prepare_open(&mut self, _queue: &Queue) {
+            self.assert_unlocked();
+            self.plays += 1;
+        }
         fn merge_loaded(&mut self, loaded: Self) {
             self.plays = loaded.plays;
         }
@@ -1107,6 +1112,18 @@ mod draw_test {
         let (mut list, _content) = probe_list(3);
         list.selected = 2;
         assert!(list.open_selected().is_none());
+    }
+
+    #[test]
+    fn opening_a_row_keeps_what_the_open_loaded_in_the_row() {
+        let (mut list, content) = probe_list(3);
+        list.selected = 2;
+        assert!(list.open_selected().is_none());
+        assert_eq!(content.read()[2].plays, 1);
+        let mut siv = cursive::Cursive::new();
+        list.on_command(&mut siv, &Command::Open(TargetMode::Selected))
+            .unwrap();
+        assert_eq!(content.read()[2].plays, 2);
     }
 
     #[test]

@@ -199,6 +199,8 @@ impl PlaylistRow {
             tracks: None,
             collaborative: p.collaborative,
             cover_url: p.cover_url.clone(),
+            tracks_unknown: p.tracks_unknown && p.tracks.is_none(),
+            web_loaded: false,
         })?;
         Some(f(&summary))
     }
@@ -421,6 +423,8 @@ mod tests {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
+            web_loaded: false,
         }
     }
 
@@ -489,6 +493,29 @@ mod tests {
             p.snapshot_id = "reload".into();
         });
         assert_eq!(store.read()[0].snapshot_id, "sync");
+    }
+
+    #[test]
+    fn the_row_summary_keeps_an_unknown_count_until_the_tracks_load() {
+        let found = Playlist {
+            tracks_unknown: true,
+            web_loaded: false,
+            ..p("a")
+        };
+        let store: PlaylistStore = Arc::new(RwLock::new(vec![found.clone()]));
+        assert_eq!(
+            row("a", &store).outside_store(|s| s.tracks_unknown),
+            Some(true)
+        );
+
+        store.write()[0] = Playlist {
+            tracks: Some(Vec::new()),
+            ..found
+        };
+        assert_eq!(
+            row("a", &store).outside_store(|s| s.tracks_unknown),
+            Some(false)
+        );
     }
 
     fn describe(rows: &[PlaylistRow]) -> Vec<String> {

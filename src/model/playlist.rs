@@ -36,6 +36,15 @@ pub struct Playlist {
     /// Cover image URL (Spotify mosaic/custom), if the playlist has one.
     #[serde(default)]
     pub cover_url: Option<String>,
+    /// The track count is not known: a search answer does not carry it. The row shows no
+    /// count until the tracks are loaded.
+    #[serde(default)]
+    pub tracks_unknown: bool,
+    /// The tracks came from the Web API, which gives no snapshot, onto a copy that had none
+    /// (a search row). Such a copy is not read again on every use; a write that clears the
+    /// snapshot ends this. Never saved.
+    #[serde(skip)]
+    pub web_loaded: bool,
 }
 
 impl Playlist {
@@ -48,19 +57,53 @@ impl Playlist {
             return true;
         }
 
-        self.tracks = self.load_all_tracks(spotify);
-        self.tracks.is_some()
+        let loaded = self.load_all_tracks(spotify);
+        self.store_loaded(loaded)
+    }
+
+    /// Forget the snapshot, so the copy is read again when the internal API can (see
+    /// [playlist_edit::reload_cleared]).
+    pub fn clear_snapshot(&mut self) {
+        self.set_snapshot(String::new());
+    }
+
+    /// Set the snapshot the copy is at. Whatever a Web API load left behind (`web_loaded`)
+    /// ends here: the copy is at a snapshot again, or was cleared to be read again.
+    pub fn set_snapshot(&mut self, snapshot_id: String) {
+        self.snapshot_id = snapshot_id;
+        self.web_loaded = false;
+    }
+
+    /// Keep the tracks of a load (`None` = it failed, nothing changes) and the snapshot they
+    /// were read at. A copy without a snapshot (a search row, a cleared copy) takes the load's,
+    /// so it is not reloaded on every later use; a copy with one keeps it. Returns true if the
+    /// tracks are loaded.
+    fn store_loaded(&mut self, loaded: Option<(Vec<Playable>, String)>) -> bool {
+        let Some((tracks, snapshot_id)) = loaded else {
+            return false;
+        };
+        if self.snapshot_id.is_empty() {
+            let from_web = snapshot_id.is_empty();
+            self.set_snapshot(snapshot_id);
+            self.web_loaded = from_web;
+        }
+        self.tracks = Some(tracks);
+        self.tracks_unknown = false;
+        true
     }
 
     /// The internal API first when the playlists area is usable, then the Web API per the
-    /// fallback classes (rate limits and transient errors fail without a Web call).
-    fn load_all_tracks(&self, spotify: &Spotify) -> Option<Vec<Playable>> {
+    /// fallback classes (rate limits and transient errors fail without a Web call). With the
+    /// tracks comes the snapshot they were read at: the internal read gives the revision of its
+    /// head (empty when the head carried none), the Web read gives none (empty).
+    fn load_all_tracks(&self, spotify: &Spotify) -> Option<(Vec<Playable>, String)> {
         let api = &spotify.api;
         let skip = !api.internal_usable(Area::Playlists);
         run_with_fallback(
             skip,
             || {
-                api.playlist_playables(&self.id, &HashMap::new())
+                api.playlist_playables_at(&self.id, &HashMap::new())
+                    .map(|(head, tracks)| (tracks, head.snapshot_id))
                     .inspect_err(|err| {
                         if decide_after(err) == Action::Fail {
                             warn!("Could not load a playlist ({})", err.class());
@@ -72,6 +115,7 @@ impl Playlist {
                     api.count_fallback(Area::Playlists);
                 }
                 self.get_all_tracks(spotify)
+                    .map(|tracks| (tracks, String::new()))
             },
             |err| api.latch_area(Area::Playlists, err),
         )
@@ -86,6 +130,16 @@ impl Playlist {
         }
         let tracks = tracks_result.items.read();
         Some(tracks.clone())
+    }
+
+    /// The count column of the row: blank, as wide as "1234 tracks", while the count is
+    /// unknown, so the rows stay aligned.
+    fn count_text(&self) -> String {
+        if self.tracks_unknown && self.tracks.is_none() {
+            return " ".repeat(11);
+        }
+        let num_tracks = self.tracks.as_ref().map_or(self.num_tracks, Vec::len);
+        format!("{num_tracks:>4} tracks")
     }
 
     pub fn has_track(&self, track_id: &str) -> bool {
@@ -276,6 +330,7 @@ impl Playlist {
                             },
                         ));
                         self.num_tracks = tracks.len();
+                        self.tracks_unknown = false;
                     }
                     None => return true,
                 }
@@ -349,6 +404,8 @@ impl From<&SimplifiedPlaylist> for Playlist {
             tracks: None,
             collaborative: list.collaborative,
             cover_url: list.images.first().map(|i| i.url.clone()),
+            tracks_unknown: false,
+            web_loaded: false,
         }
     }
 }
@@ -365,14 +422,21 @@ impl From<&FullPlaylist> for Playlist {
             tracks: None,
             collaborative: list.collaborative,
             cover_url: list.images.first().map(|i| i.url.clone()),
+            tracks_unknown: false,
+            web_loaded: false,
         }
     }
 }
 
 impl ListItem for Playlist {
     fn merge_loaded(&mut self, loaded: Self) {
-        if self.tracks.is_none() && self.snapshot_id == loaded.snapshot_id {
+        // A row without a snapshot (a search row) takes the one its tracks were read at.
+        let same_version = self.snapshot_id.is_empty() || self.snapshot_id == loaded.snapshot_id;
+        if self.tracks.is_none() && same_version && loaded.tracks.is_some() {
             self.tracks = loaded.tracks;
+            self.set_snapshot(loaded.snapshot_id);
+            self.web_loaded = loaded.web_loaded;
+            self.tracks_unknown = false;
         }
     }
 
@@ -405,13 +469,7 @@ impl ListItem for Playlist {
             ""
         };
 
-        let num_tracks = self
-            .tracks
-            .as_ref()
-            .map(|t| t.len())
-            .unwrap_or(self.num_tracks);
-
-        format!("{saved}{num_tracks:>4} tracks")
+        format!("{saved}{}", self.count_text())
     }
 
     fn play(&mut self, queue: &Queue) {
@@ -453,6 +511,14 @@ impl ListItem for Playlist {
             library.queue_unfollow(&self.id);
         } else {
             library.queue_follow(self.clone());
+        }
+    }
+
+    fn prepare_open(&mut self, queue: &Queue) {
+        // A search row: load here, so the list row keeps what the open loads and the next
+        // open or play does not read the playlist again.
+        if self.tracks.is_none() && self.snapshot_id.is_empty() {
+            self.load_tracks(&queue.get_spotify());
         }
     }
 
@@ -544,5 +610,143 @@ impl ListItem for Playlist {
 
     fn as_listitem(&self) -> Box<dyn ListItem> {
         Box::new(self.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unknown() -> Playlist {
+        Playlist {
+            id: "p1".into(),
+            name: "Mix".into(),
+            owner_id: "o".into(),
+            owner_name: None,
+            snapshot_id: String::new(),
+            num_tracks: 0,
+            tracks: None,
+            collaborative: false,
+            cover_url: None,
+            tracks_unknown: true,
+            web_loaded: false,
+        }
+    }
+
+    #[test]
+    fn unknown_count_is_blank_until_tracks_are_loaded() {
+        let mut p = unknown();
+        assert_eq!(p.count_text().trim(), "");
+        assert_eq!(p.count_text().len(), "   3 tracks".len());
+
+        let loaded = Playlist {
+            tracks: Some(Vec::new()),
+            tracks_unknown: false,
+            web_loaded: false,
+            ..unknown()
+        };
+        p.merge_loaded(loaded);
+        assert!(!p.tracks_unknown);
+        assert_eq!(p.count_text(), "   0 tracks");
+    }
+
+    #[test]
+    fn a_failed_load_written_back_keeps_the_count_unknown() {
+        let mut p = unknown();
+        p.merge_loaded(unknown());
+        assert!(p.tracks_unknown && p.tracks.is_none());
+        assert_eq!(p.count_text().trim(), "");
+    }
+
+    #[test]
+    fn a_search_row_takes_the_snapshot_of_its_loaded_tracks() {
+        let mut p = unknown();
+        let loaded = Playlist {
+            snapshot_id: "s1".into(),
+            tracks: Some(Vec::new()),
+            tracks_unknown: false,
+            web_loaded: false,
+            ..unknown()
+        };
+        p.merge_loaded(loaded);
+        assert_eq!(p.snapshot_id, "s1");
+        assert!(p.tracks.is_some() && !p.tracks_unknown);
+    }
+
+    #[test]
+    fn a_row_refreshed_to_another_snapshot_drops_the_load() {
+        let mut p = Playlist {
+            snapshot_id: "s2".into(),
+            ..unknown()
+        };
+        let loaded = Playlist {
+            snapshot_id: "s1".into(),
+            tracks: Some(Vec::new()),
+            ..unknown()
+        };
+        p.merge_loaded(loaded);
+        assert_eq!(p.snapshot_id, "s2");
+        assert!(p.tracks.is_none());
+    }
+
+    #[test]
+    fn a_load_clears_the_unknown_count_and_sets_a_missing_snapshot() {
+        let mut p = unknown();
+        assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
+        assert!(!p.tracks_unknown && p.tracks.is_some());
+        assert_eq!(p.snapshot_id, "s1");
+        assert_eq!(p.count_text(), "   0 tracks");
+    }
+
+    #[test]
+    fn a_load_keeps_a_known_snapshot() {
+        let mut p = Playlist {
+            snapshot_id: "s0".into(),
+            ..unknown()
+        };
+        assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
+        assert_eq!(p.snapshot_id, "s0");
+    }
+
+    #[test]
+    fn a_web_load_onto_a_copy_without_a_snapshot_is_remembered_until_a_write_clears_it() {
+        // The Web read gives no snapshot.
+        let mut p = unknown();
+        assert!(p.store_loaded(Some((Vec::new(), String::new()))));
+        assert!(p.web_loaded && p.snapshot_id.is_empty());
+        p.clear_snapshot();
+        assert!(!p.web_loaded);
+
+        // An internal load (it has a snapshot) and a copy that already had one are not marked.
+        let mut p = unknown();
+        assert!(p.store_loaded(Some((Vec::new(), "s1".into()))));
+        assert!(!p.web_loaded);
+        let mut p = Playlist {
+            snapshot_id: "s0".into(),
+            ..unknown()
+        };
+        assert!(p.store_loaded(Some((Vec::new(), String::new()))));
+        assert!(!p.web_loaded);
+    }
+
+    #[test]
+    fn a_row_keeps_the_web_load_mark_of_the_copy_that_loaded() {
+        // What the list does: the action runs on a clone, the row takes what it loaded.
+        let mut row = unknown();
+        let mut copy = row.clone();
+        assert!(copy.store_loaded(Some((Vec::new(), String::new()))));
+        row.merge_loaded(copy);
+        assert!(row.tracks.is_some() && row.web_loaded);
+
+        // A snapshot set later ends it.
+        row.set_snapshot("s1".into());
+        assert!(!row.web_loaded);
+    }
+
+    #[test]
+    fn a_failed_load_leaves_the_row_unknown() {
+        let mut p = unknown();
+        assert!(!p.store_loaded(None));
+        assert!(p.tracks_unknown && p.tracks.is_none() && p.snapshot_id.is_empty());
     }
 }

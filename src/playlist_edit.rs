@@ -444,14 +444,19 @@ fn reload(
 /// Reload a loaded copy whose snapshot was cleared (a write that could not be confirmed, a
 /// mismatch whose reload failed, a Web create, which has no revision) with one full read,
 /// when the playlists area is usable; true when it was reloaded. The copy's own items are the
-/// known metadata, so only items added elsewhere are looked up. A failed read keeps the copy
+/// known metadata, so only items added elsewhere are looked up. A copy that never had a
+/// snapshot and was loaded from the Web API (`web_loaded`) is left alone: the internal read
+/// already failed for it once. A failed read keeps the copy
 /// and its cleared snapshot (the next open or write tries again); a protocol change latches
 /// the area.
 pub fn reload_cleared(api: &impl PlaylistServer, playlist: &mut Playlist) -> bool {
     let Some(tracks) = &playlist.tracks else {
         return false;
     };
-    if !playlist.snapshot_id.is_empty() || !api.internal_usable(Area::Playlists) {
+    if !playlist.snapshot_id.is_empty()
+        || playlist.web_loaded
+        || !api.internal_usable(Area::Playlists)
+    {
         return false;
     }
     let own: HashMap<String, Playable> = tracks.iter().map(|p| (p.uri(), p.clone())).collect();
@@ -473,8 +478,9 @@ fn set_tracks(playlist: &mut Playlist, mut tracks: Vec<Playable>, snapshot_id: &
         playable.set_list_index(index);
     }
     playlist.num_tracks = tracks.len();
+    playlist.tracks_unknown = false;
     playlist.tracks = Some(tracks);
-    playlist.snapshot_id = snapshot_id.to_string();
+    playlist.set_snapshot(snapshot_id.to_string());
 }
 
 /// The position of a POST in its action.
@@ -542,7 +548,7 @@ fn send_post(
 /// next write (stale copy) or open ([reload_cleared]) reloads the copy (the caller stores it,
 /// see [EditError::stores_copy]).
 fn unconfirmed(playlist: &mut Playlist, err: InternalError) -> EditError {
-    playlist.snapshot_id.clear();
+    playlist.clear_snapshot();
     EditError::Unverified(err)
 }
 
@@ -590,7 +596,7 @@ fn mismatch(api: &impl PlaylistServer, playlist: &mut Playlist, known: Known<'_>
             "Could not reload the playlist after a write that did not verify ({})",
             err.class()
         );
-        playlist.snapshot_id.clear();
+        playlist.clear_snapshot();
     }
     EditError::Mismatch
 }
@@ -689,9 +695,12 @@ pub fn remove_after_web(playlist: &mut Playlist, index: usize, uri: &str) {
         .as_mut()
         .is_some_and(|tracks| remove_server_item(tracks, index, uri));
     playlist.num_tracks = playlist.tracks.as_ref().map_or(0, Vec::len);
+    if playlist.tracks.is_some() {
+        playlist.tracks_unknown = false;
+    }
     let ordered = playlist.tracks.as_deref().is_some_and(in_server_order);
     if !removed || !ordered {
-        playlist.snapshot_id.clear();
+        playlist.clear_snapshot();
     }
 }
 
@@ -723,8 +732,9 @@ pub fn remove_track(
     if let Some(tracks) = playlist.tracks.as_mut() {
         remove_server_item(tracks, index, uri);
         playlist.num_tracks = tracks.len();
+        playlist.tracks_unknown = false;
     }
-    playlist.snapshot_id = after.snapshot_id;
+    playlist.set_snapshot(after.snapshot_id);
     Ok(())
 }
 
@@ -821,7 +831,7 @@ pub fn move_track(
             if let Some(tracks) = playlist.tracks.as_mut() {
                 move_server_item(tracks, index, at);
             }
-            playlist.snapshot_id = after.snapshot_id;
+            playlist.set_snapshot(after.snapshot_id);
             Ok(at)
         }
         // Not latched: the POST went through and may have applied (see send_verified).
@@ -870,9 +880,9 @@ pub fn move_after_web(
                 && server_item(tracks, from, uri) == Some(from) =>
         {
             move_server_item(tracks, from, at);
-            playlist.snapshot_id = reply_snapshot.to_string();
+            playlist.set_snapshot(reply_snapshot.to_string());
         }
-        _ => playlist.snapshot_id.clear(),
+        _ => playlist.clear_snapshot(),
     }
 }
 
@@ -901,7 +911,7 @@ pub fn rename(
         Some(applied) if applied == name.trim() => {
             playlist.name = name.to_string();
             if current && !after.revision.is_empty() {
-                playlist.snapshot_id = after.snapshot_id;
+                playlist.set_snapshot(after.snapshot_id);
             }
             Ok(())
         }
@@ -1108,6 +1118,8 @@ pub fn created_playlist(created: &Created, name: &str, owner: Option<&str>) -> P
         tracks: Some(vec![]),
         collaborative: false,
         cover_url: None,
+        tracks_unknown: false,
+        web_loaded: false,
     }
 }
 
@@ -1279,6 +1291,8 @@ mod tests {
             tracks: None,
             collaborative: false,
             cover_url: None,
+            tracks_unknown: false,
+            web_loaded: false,
         }
     }
 
@@ -2334,6 +2348,18 @@ mod tests {
     }
 
     #[test]
+    fn a_web_remove_on_an_unloaded_copy_keeps_its_count_unknown() {
+        let mut found = Playlist {
+            tracks: None,
+            tracks_unknown: true,
+            web_loaded: false,
+            ..local("", 0)
+        };
+        remove_after_web(&mut found, 0, "spotify:track:0");
+        assert!(found.tracks_unknown);
+    }
+
+    #[test]
     fn a_web_remove_on_a_duplicate_index_copy_clears_its_snapshot() {
         // Cached by an older build: position 1 twice.
         let mut cached = Playlist {
@@ -2374,6 +2400,23 @@ mod tests {
         assert!(reload_cleared(&api, &mut stale));
         assert_eq!(uri_list(&stale), ["spotify:track:0", "spotify:track:new"]);
         assert_eq!((stale.snapshot_id.as_str(), stale.num_tracks), ("s2", 2));
+    }
+
+    #[test]
+    fn an_open_does_not_reload_a_web_loaded_copy_until_a_write_clears_it() {
+        // No queued reads: any read would panic.
+        let api = Fake::default();
+        let mut row = Playlist {
+            web_loaded: true,
+            ..local("", 2)
+        };
+        assert!(!reload_cleared(&api, &mut row));
+        assert_eq!(api.contents_reads.get(), 0);
+
+        row.clear_snapshot();
+        let api = Fake::default().contents(Ok((head("s1", 0), vec![])));
+        assert!(reload_cleared(&api, &mut row));
+        assert_eq!(api.contents_reads.get(), 1);
     }
 
     #[test]

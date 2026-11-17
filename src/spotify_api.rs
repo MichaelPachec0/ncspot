@@ -29,9 +29,11 @@ use crate::events::{Event, EventManager};
 use crate::internal_api::AreaCounts;
 use crate::internal_api::collection::{self, Delta, Listing};
 use crate::internal_api::error::InternalError;
+use crate::internal_api::hashes::HashStore;
 use crate::internal_api::metadata::Missing;
 use crate::internal_api::playlist::{self, Head, PlaylistItem, RootHead, Rootlist};
 use crate::internal_api::playlist_write::{self, Created};
+use crate::internal_api::search::Kind;
 use crate::internal_api::{Area, InternalApi, Settings, bridge, fallback, metadata, run_attempts};
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -45,6 +47,7 @@ use crate::rate_limit::{
     Attempt, ClientLabel, Stamp, ThrottleState, is_ui_thread, parse_retry_after, random_jitter,
     run_rate_limited,
 };
+use crate::search_api::{self, FirstPage, NextPage};
 use crate::spotify_worker::WorkerCommand;
 use crate::ui::pagination::{ApiPage, ApiResult};
 use crate::utils::OnDrop;
@@ -253,6 +256,28 @@ impl WebApi {
         self.internal.area_counts(area)
     }
 
+    /// Use `store` for the Pathfinder search hashes.
+    pub fn set_search_hashes(&mut self, store: HashStore) {
+        self.internal.set_hashes(store);
+    }
+
+    /// The Pathfinder search hashes.
+    pub(crate) fn search_hashes(&self) -> &HashStore {
+        self.internal.hashes()
+    }
+
+    /// The first page of all six search tabs from the internal API (see
+    /// [search_api::first_page_with]). Blocks on the network: never call it on the UI thread.
+    pub fn search_first_page(&self, term: &str) -> FirstPage {
+        search_api::first_page_with(self, self.search_hashes(), term)
+    }
+
+    /// The search page of `kind` at `offset` from the internal API (see
+    /// [search_api::next_page_with]). Blocks on the network: never call it on the UI thread.
+    pub fn search_next_page(&self, kind: Kind, term: &str, offset: usize) -> NextPage {
+        search_api::next_page_with(self, self.search_hashes(), kind, term, offset)
+    }
+
     /// Use `session` (filled by the Spotify worker when it connects) for internal API calls.
     pub(crate) fn set_session(&mut self, session: Arc<RwLock<Option<Session>>>) {
         self.internal.set_session(session);
@@ -294,7 +319,35 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, true, internal)
+        self.run_internal_with(
+            area,
+            true,
+            crate::rate_limit::MAX_RATE_LIMIT_RETRIES,
+            true,
+            internal,
+        )
+    }
+
+    /// Like [Self::run_internal] but a success is not counted as `internal_ok`: for callers
+    /// that count once they know the answer was usable (see [Self::count_internal_ok]). A
+    /// transient failure is retried at most `transient_retries` times.
+    pub(crate) fn run_internal_uncounted<T, F, Fut>(
+        &self,
+        area: Area,
+        transient_retries: u32,
+        internal: F,
+    ) -> Result<T, InternalError>
+    where
+        F: Fn(Session) -> Fut,
+        Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_internal_with(area, true, transient_retries, false, internal)
+    }
+
+    /// Count a call in `area` answered by the internal API.
+    pub(crate) fn count_internal_ok(&self, area: Area) {
+        self.internal.count_ok(area);
     }
 
     /// Like [Self::run_internal] but the request is sent at most once on our side: no transient
@@ -305,13 +358,15 @@ impl WebApi {
         Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
         T: Send + 'static,
     {
-        self.run_internal_with(area, false, internal)
+        self.run_internal_with(area, false, 0, true, internal)
     }
 
     fn run_internal_with<T, F, Fut>(
         &self,
         area: Area,
         may_retry: bool,
+        transient_retries: u32,
+        count_ok: bool,
         internal: F,
     ) -> Result<T, InternalError>
     where
@@ -331,12 +386,13 @@ impl WebApi {
         let _call = ACTIVITY.begin();
         let result = run_attempts(
             no_waits,
+            transient_retries,
             &self.internal.throttle,
             || bridge::run(internal(session.clone()), bridge::BRIDGE_TIMEOUT),
             |window| self.on_rate_limited(ClientLabel::Internal, &self.internal.throttle, window),
             thread::sleep,
         );
-        if result.is_ok() {
+        if count_ok && result.is_ok() {
             self.internal.count_ok(area);
         }
         result

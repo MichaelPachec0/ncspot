@@ -576,3 +576,124 @@ fn playlist_move_rename_round_trip() {
         );
     });
 }
+
+/// One search query for `term`, sent with the first built-in hash of `op`.
+fn search_once(
+    rt: &tokio::runtime::Runtime,
+    session: &Session,
+    op: super::hashes::Operation,
+    term: &str,
+    offset: usize,
+) -> Result<super::pathfinder::Outcome, super::error::InternalError> {
+    use super::pathfinder;
+    rt.block_on(pathfinder::query(
+        session.clone(),
+        op.name(),
+        op.builtin()[0].to_string(),
+        pathfinder::search_variables(term, offset, super::search::PAGE),
+    ))
+}
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn search_first_page_fills_six_kinds() {
+    use super::hashes::Operation;
+    use super::pathfinder::Outcome;
+    use super::search::{Kind, read_all};
+    with_session(|rt, s| {
+        let outcome = search_once(rt, &s, Operation::Desktop, "bonobo", 0)
+            .map_err(|e| e.class())
+            .expect("query");
+        let (Outcome::Answer(answer) | Outcome::Partial(answer)) = outcome else {
+            panic!("searchDesktop: no answer (bad hash or refused request)");
+        };
+        let sections = read_all(&answer).expect("all six sections readable");
+        for kind in Kind::ALL {
+            let section = &sections[&kind];
+            println!("{kind:?}: {}, {}", section.item_count, section.total);
+            assert!(section.item_count > 0, "{kind:?}: no items");
+        }
+    });
+}
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn search_paging_returns_new_rows() {
+    use super::hashes::Operation;
+    use super::pathfinder::Outcome;
+    use super::search::{Kind, PAGE, read_section};
+    with_session(|rt, s| {
+        let mut pages = Vec::new();
+        for offset in [0, PAGE] {
+            let outcome = search_once(rt, &s, Operation::Tracks, "bonobo", offset)
+                .map_err(|e| e.class())
+                .expect("query");
+            let (Outcome::Answer(answer) | Outcome::Partial(answer)) = outcome else {
+                panic!("searchTracks at {offset}: no answer");
+            };
+            pages.push(read_section(&answer, Kind::Track).expect("readable tracks section"));
+        }
+        // Neighbouring pages share some uris on the server's side, so only new rows are required.
+        let shared = pages[1]
+            .uris
+            .iter()
+            .filter(|u| pages[0].uris.contains(u))
+            .count();
+        println!(
+            "page 1: {} uris, page 2: {} uris, shared: {shared}, last_page on page 2: {:?}",
+            pages[0].uris.len(),
+            pages[1].uris.len(),
+            pages[1].last_page
+        );
+        assert!(!pages[1].uris.is_empty(), "page 2 is empty");
+        assert!(
+            shared < pages[1].uris.len(),
+            "page 2 holds no uri that page 1 lacks"
+        );
+    });
+}
+
+#[test]
+#[ignore = "needs cached librespot credentials and network"]
+fn search_bogus_override_hash_is_skipped() {
+    use super::hashes::{HashStore, Operation, Overrides, Persist, rotate};
+    use super::search::read_all;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    let bogus = "0".repeat(64);
+    let mut overrides = Overrides::new();
+    overrides.insert(Operation::Desktop, vec![bogus.clone()]);
+    let persist: Persist = Arc::new(|_, _| {});
+    let store = HashStore::new(overrides, &HashMap::new(), persist);
+    assert_eq!(
+        store.candidates(Operation::Desktop).first(),
+        Some(&bogus),
+        "the bogus override is tried first"
+    );
+
+    with_session(|rt, s| {
+        let mut sent = 0;
+        let result = rotate(
+            &store,
+            Operation::Desktop,
+            |hash| {
+                sent += 1;
+                rt.block_on(super::pathfinder::query(
+                    s.clone(),
+                    Operation::Desktop.name(),
+                    hash.to_string(),
+                    super::pathfinder::search_variables("bonobo", 0, super::search::PAGE),
+                ))
+            },
+            read_all,
+        );
+        println!("hashes sent: {sent}, result ok: {}", result.is_ok());
+        assert!(result.is_ok(), "rotation should reach a working hash");
+        assert!(sent >= 2, "the bogus hash and at least one more were sent");
+        assert!(
+            !store.candidates(Operation::Desktop).contains(&bogus),
+            "the bogus hash is no longer a candidate"
+        );
+    });
+}
