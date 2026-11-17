@@ -680,7 +680,7 @@ class SearchScenarioTest(unittest.TestCase):
     NAMES = drive.SEARCH_TABS
 
     @classmethod
-    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False, tab="Tracks"):
+    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False, tab="Tracks", throttled=None):
         rows = rows or {}
         tabs = [{"name": n, "rows": rows.get(n, tracks if n == "Tracks" else 5)} for n in cls.NAMES]
         return {
@@ -688,7 +688,7 @@ class SearchScenarioTest(unittest.TestCase):
             "title": title,
             "tab": tab,
             "tabs": tabs,
-            "throttled": {},
+            "throttled": {} if base else (throttled or {}),
             "areas": {
                 "search": {"internal_ok": 0 if base else internal_ok, "fallback": 0 if base else fallback, "latched": latched},
                 "metadata": {"internal_ok": 0, "fallback": 0, "latched": False},
@@ -790,6 +790,24 @@ class SearchScenarioTest(unittest.TestCase):
     def test_area_off_fails_with_too_few_web_calls(self):
         with self.assertRaises(drive.Fail):
             self.run_with(drive.sc_search_area_off, internal_ok=0, web=5)
+
+    def test_area_off_with_a_rate_limited_web_client_is_blocked(self):
+        for client in ("shared", "personal"):
+            with self.assertRaises(drive.Blocked):
+                self.run_with(
+                    drive.sc_search_area_off,
+                    internal_ok=0,
+                    web=3,
+                    rows={"Playlists": 0},
+                    throttled={client: True},
+                )
+
+    def test_a_rate_limited_web_client_does_not_block_the_internal_search(self):
+        self.run_with(throttled={"shared": True})
+
+    def test_a_rate_limited_internal_client_blocks_the_search(self):
+        with self.assertRaises(drive.Blocked):
+            self.run_with(throttled={"internal": True})
 
 
 if __name__ == "__main__":

@@ -1001,14 +1001,16 @@ SEARCH_TERM = "bonobo"
 SEARCH_TABS = ["Tracks", "Albums", "Artists", "Playlists", "Shows", "Episodes"]
 
 
-def _search(inst, args):
-    """Run the fixed search from a settled baseline; returns the settled dump. Counts only."""
+def _search(inst, args, answered_by=("internal",)):
+    """Run the fixed search from a settled baseline; returns the settled dump. Counts only.
+    `answered_by` names the clients the search itself goes through: when one of them is rate
+    limited after the search, the run is BLOCKED, not FAIL."""
     d = inst.wait_library(args.settle_timeout * 4, blocked_on=["internal"])
     blocked_if_throttled(d, ["internal"])
     inst.base_dump = d
     inst.send(f"search {SEARCH_TERM}")
     d = inst.wait_settled(args.settle_timeout)
-    blocked_if_throttled(d, ["internal"])
+    blocked_if_throttled(d, list(answered_by))
     expect(d["view"] == "search", "a search view", d["view"])
     expect(d["title"] == "Search", "the title without the term", d["title"])
     for name in SEARCH_TABS:
@@ -1049,7 +1051,7 @@ def sc_search(inst, args):
 
 def sc_search_area_off(inst, args):
     """With the search area off, the six tabs fill from the Web API only."""
-    d = _search(inst, args)
+    d = _search(inst, args, answered_by=("internal", "shared", "personal"))
     m = area_delta(inst, d, "search")
     expect(m["internal_ok"] == 0, "no search calls on the internal API", m)
     expect(m["web"] >= 6, "at least 6 Web API calls", m)
