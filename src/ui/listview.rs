@@ -34,9 +34,9 @@ use crate::ui::contextmenu::ContextMenu;
 use crate::ui::pagination::Pagination;
 
 /// Columns of the tag column of a row with a tag.
-pub const TAG_WIDTH: usize = 8;
+const TAG_WIDTH: usize = 8;
 /// Columns kept clear right of the tag column, so tags line up whatever the right text is.
-pub const TAG_RIGHT_RESERVE: usize = 20;
+const TAG_RIGHT_RESERVE: usize = 20;
 
 pub enum MouseHandleResult {
     Handled(EventResult),

@@ -877,7 +877,7 @@ impl SearchResultsView {
         self.tabs.set_selected(uri_tab(uri_type));
     }
 
-    pub fn run_search(&mut self, term: TermKind) {
+    fn run_search(&mut self, term: TermKind) {
         match term {
             TermKind::Uri(uri_type) => {
                 Self::refresh_web_token(&self.spotify);
