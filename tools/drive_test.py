@@ -680,9 +680,11 @@ class SearchScenarioTest(unittest.TestCase):
     NAMES = drive.SEARCH_TABS
 
     @classmethod
-    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False, tab="Tracks", throttled=None):
+    def d(cls, base=False, rows=None, tracks=20, internal_ok=3, fallback=0, web=0, title="Search", latched=False, tab="Tracks", throttled=None, top=False, top_rows=5, top_at=0):
         rows = rows or {}
         tabs = [{"name": n, "rows": rows.get(n, tracks if n == "Tracks" else 5)} for n in cls.NAMES]
+        if top:
+            tabs.insert(top_at, {"name": "Top", "rows": top_rows})
         return {
             "view": "search",
             "title": title,
@@ -696,17 +698,23 @@ class SearchScenarioTest(unittest.TestCase):
             "web": {"shared": 0, "personal": 0 if base else web},
         }
 
-    def run_with(self, func=None, grown=40, paged=None, selected="Episodes", episodes=5, last=None, **kw):
-        """Dumps in order: after the search, after paging Tracks, after selecting the last tab,
-        after paging Episodes. `paged` and `last` override the counters of the later dumps."""
+    def run_with(self, func=None, grown=40, paged=None, selected="Episodes", episodes=5, last=None, first_tab=None, moved_tab="Tracks", **kw):
+        """Dumps in order: after the search, after moving to Tracks, after paging Tracks, after
+        selecting the last tab, after paging Episodes. `paged` and `last` override the counters
+        of the later dumps. The Top tab is present (and selected first) except for the area-off
+        scenario; pass `top` to override."""
+        kw.setdefault("top", func is not drive.sc_search_area_off)
+        if first_tab is None:
+            first_tab = "Top" if kw["top"] else "Tracks"
         base = self.d(base=True)
-        first = self.d(**kw)
+        first = self.d(**kw, tab=first_tab)
+        moved = self.d(**kw, tab=moved_tab)
         paged_kw = {**kw, "tracks": grown, **(paged or {})}
         second = self.d(**paged_kw)
         third = self.d(**paged_kw, tab=selected)
         last_kw = {**paged_kw, "rows": {"Episodes": episodes}, **(last or {})}
         fourth = self.d(**last_kw, tab=selected)
-        settled = [first, second, third, fourth]
+        settled = [first, moved, second, third, fourth]
         sent = []
 
         class Inst:
@@ -730,8 +738,42 @@ class SearchScenarioTest(unittest.TestCase):
     def test_a_filled_search_passes(self):
         sent = self.run_with()
         self.assertEqual(
-            sent, [f"search {drive.SEARCH_TERM}", "move bottom", "move rightmost", "move bottom"]
+            sent,
+            [
+                f"search {drive.SEARCH_TERM}",
+                "move right",
+                "move bottom",
+                "move rightmost",
+                "move bottom",
+            ],
         )
+
+    def test_a_top_tab_first_and_selected_passes(self):
+        self.run_with()
+
+    def test_a_missing_top_tab_fails_with_top(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(top=False, first_tab="Tracks")
+
+    def test_a_top_tab_that_is_not_first_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(top_at=1)
+
+    def test_a_top_tab_that_is_not_selected_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(first_tab="Tracks")
+
+    def test_an_empty_top_tab_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(top_rows=0)
+
+    def test_a_search_that_stays_on_top_after_move_right_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(moved_tab="Top")
+
+    def test_area_off_with_a_top_tab_fails(self):
+        with self.assertRaises(drive.Fail):
+            self.run_with(drive.sc_search_area_off, internal_ok=0, web=6, top=True, first_tab="Top")
 
     def test_a_web_call_after_paging_tracks_fails(self):
         with self.assertRaises(drive.Fail):

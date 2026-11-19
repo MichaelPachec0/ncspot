@@ -33,6 +33,11 @@ use crate::ui::artist::ArtistView;
 use crate::ui::contextmenu::ContextMenu;
 use crate::ui::pagination::Pagination;
 
+/// Columns of the tag column of a row with a tag.
+const TAG_WIDTH: usize = 8;
+/// Columns kept clear right of the tag column, so tags line up whatever the right text is.
+const TAG_RIGHT_RESERVE: usize = 20;
+
 pub enum MouseHandleResult {
     Handled(EventResult),
     Unhandled(Command),
@@ -147,9 +152,10 @@ impl<I: ListItem + Clone> ListView<I> {
             .iter()
             .enumerate()
             .filter(|(_, i)| {
-                i.display_left(&self.library)
-                    .to_lowercase()
-                    .contains(&query[..].to_lowercase())
+                i.rule_label().is_none()
+                    && i.display_left(&self.library)
+                        .to_lowercase()
+                        .contains(&query[..].to_lowercase())
             })
             .map(|(i, _)| i)
             .collect()
@@ -160,6 +166,9 @@ impl<I: ListItem + Clone> ListView<I> {
     pub fn content_replaced(&mut self) {
         let last = self.content_len(false).saturating_sub(1);
         self.selected = min(self.selected, last);
+        if self.is_rule_row(self.selected) {
+            self.move_focus_to(self.selected);
+        }
         if !self.search_query.is_empty() {
             self.search_indexes = self.get_indexes_of(&self.search_query);
             self.search_selected_index = min(
@@ -180,9 +189,39 @@ impl<I: ListItem + Clone> ListView<I> {
         (self.search_query.clone(), self.search_indexes.clone())
     }
 
+    /// Whether the row at `index` is a rule line.
+    fn is_rule_row(&self, index: usize) -> bool {
+        self.content
+            .read()
+            .get(index)
+            .is_some_and(|row| row.rule_label().is_some())
+    }
+
+    /// Select the row at `target` (clamped to the list). A rule row is never selected: the
+    /// nearest other row in the direction of travel is taken instead, else the nearest one the
+    /// other way, else the selection stays.
     pub fn move_focus_to(&mut self, target: usize) {
-        let len = self.content_len(false).saturating_sub(1);
-        self.selected = min(target, len);
+        let down = target >= self.selected;
+        let chosen = {
+            // Only `rule_label` runs under the guard; it never asks the library.
+            let content = self.content.read();
+            let target = min(target, content.len().saturating_sub(1));
+            let is_rule = |i: usize| content.get(i).is_some_and(|row| row.rule_label().is_some());
+            if is_rule(target) {
+                let below = (target + 1..content.len()).find(|&i| !is_rule(i));
+                let above = (0..target).rev().find(|&i| !is_rule(i));
+                if down {
+                    below.or(above)
+                } else {
+                    above.or(below)
+                }
+            } else {
+                Some(target)
+            }
+        };
+        if let Some(index) = chosen {
+            self.selected = index;
+        }
         self.scroller.scroll_to_y(self.selected);
     }
 
@@ -302,7 +341,9 @@ impl<I: ListItem + Clone> ListView<I> {
 
                 if drag_started {
                     log::debug!("grabbing scroller");
-                } else if let Some(clicked_row_index) = self.get_selected_row(position, offset) {
+                } else if let Some(clicked_row_index) = self.get_selected_row(position, offset)
+                    && !self.is_rule_row(clicked_row_index)
+                {
                     let currently_selected_listitem = self
                         .content
                         .read()
@@ -332,7 +373,9 @@ impl<I: ListItem + Clone> ListView<I> {
                 position,
                 offset,
             } => {
-                if let Some(y) = self.get_selected_row(position, offset) {
+                if let Some(y) = self.get_selected_row(position, offset)
+                    && !self.is_rule_row(y)
+                {
                     self.move_focus_to(y);
 
                     let queue = self.queue.clone();
@@ -392,6 +435,12 @@ impl<I: ListItem + Clone> View for ListView<I> {
                 printer.with_color(style, |printer| {
                     printer.print((0, 0), &buf);
                 });
+            } else if let Some(label) = item.as_ref().and_then(ListItem::rule_label) {
+                let text = format!("--- {label} ");
+                printer.with_color(ColorStyle::secondary(), |printer| {
+                    printer.print_hline((0, 0), printer.size.x, "-");
+                    printer.print((0, 0), &text);
+                });
             } else if let Some(item) = item {
                 let currently_playing =
                     item.is_playing(&self.queue) && self.queue.get_current_index() == Some(i);
@@ -426,7 +475,14 @@ impl<I: ListItem + Clone> View for ListView<I> {
                 let left = item.display_left(&self.library);
                 let center = item.display_center(&self.library);
                 let right = item.display_right(&self.library);
-                let draw_center = !center.is_empty();
+                let tag = item.display_tag(&self.library);
+                // A row with a tag draws no center; the tag needs room for a left text too.
+                let draw_center = tag.is_none() && !center.is_empty();
+                let tag = tag.and_then(|tag| {
+                    let reserve = max(right.width(), TAG_RIGHT_RESERVE) + 1 + TAG_WIDTH;
+                    let tag_x = printer.size.x.saturating_sub(reserve);
+                    (tag_x >= 4).then_some((tag_x, tag))
+                });
 
                 // draw left string
                 printer.with_color(style, |printer| {
@@ -455,14 +511,20 @@ impl<I: ListItem + Clone> View for ListView<I> {
 
                 // left string cut off indicator
                 let center_offset = printer.size.x / 2;
-                let left_max_length = if draw_center {
+                let left_max_length = if let Some((tag_x, _)) = tag {
+                    tag_x - 1
+                } else if draw_center {
                     center_offset.saturating_sub(1)
                 } else {
                     printer.size.x.saturating_sub(right.width() + 1)
                 };
 
                 if left_max_length < left.width() {
-                    let offset = left_max_length.saturating_sub(1);
+                    // Before a tag, one blank column stays between the mark and the tag.
+                    let offset = match tag {
+                        Some((tag_x, _)) => tag_x - 3,
+                        None => left_max_length.saturating_sub(1),
+                    };
                     printer.with_color(style, |printer| {
                         printer.print_hline((offset, 0), printer.size.x, " ");
                         printer.print((offset, 0), "..");
@@ -483,6 +545,12 @@ impl<I: ListItem + Clone> View for ListView<I> {
                             printer.print((offset, 0), "..");
                         });
                     }
+                }
+
+                if let Some((tag_x, tag)) = &tag {
+                    printer.with_color(style, |printer| {
+                        printer.print((*tag_x, 0), tag);
+                    });
                 }
 
                 // draw right string
@@ -508,6 +576,10 @@ impl<I: ListItem + Clone> View for ListView<I> {
             |_, _| {},
             |s, c| Vec2::new(c.x, s.content_len(true)),
         );
+
+        if relayout_scroller && self.is_rule_row(self.selected) {
+            self.move_focus_to(self.selected);
+        }
     }
 
     fn needs_relayout(&self) -> bool {
@@ -549,10 +621,30 @@ fn tab_state<I: ListItem>(
 ) -> crate::harness::TabState {
     crate::harness::TabState {
         name: name.to_string(),
-        rows: items.len(),
+        rows: items.iter().filter(|i| i.rule_label().is_none()).count(),
         playable: items.iter().filter(|i| i.is_playable()).count(),
         max,
         busy,
+    }
+}
+
+/// Whether `cmd` acts on the selected row (as opposed to the queue's current track or
+/// nothing in the list).
+fn acts_on_selected_row(cmd: &Command) -> bool {
+    match cmd {
+        Command::Play
+        | Command::PlayNext
+        | Command::Queue
+        | Command::Save
+        | Command::Add
+        | Command::Delete
+        | Command::Goto(_) => true,
+        Command::Open(mode) | Command::ShowRecommendations(mode) => {
+            matches!(mode, TargetMode::Selected)
+        }
+        #[cfg(feature = "share_clipboard")]
+        Command::Share(mode) => matches!(mode, TargetMode::Selected),
+        _ => false,
     }
 }
 
@@ -577,6 +669,11 @@ impl<I: ListItem + Clone> ViewExt for ListView<I> {
     }
 
     fn on_command(&mut self, _s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
+        // A rule row takes no row action; every other command goes its usual way.
+        if acts_on_selected_row(cmd) && self.is_rule_row(self.selected) {
+            return Ok(CommandResult::Consumed(None));
+        }
+
         match cmd {
             Command::Play => {
                 self.run_play_command();
@@ -895,6 +992,53 @@ mod harness_tests {
         let done = tab_state("Artists", &items, None, false);
         assert_eq!((done.max, done.busy), (None, false));
     }
+
+    /// A row that is a rule line when `rule` is set.
+    #[derive(Clone)]
+    struct Row {
+        rule: bool,
+    }
+
+    impl ListItem for Row {
+        fn is_playing(&self, _queue: &Queue) -> bool {
+            false
+        }
+        fn display_left(&self, _library: &Library) -> String {
+            String::new()
+        }
+        fn display_right(&self, _library: &Library) -> String {
+            String::new()
+        }
+        fn play(&mut self, _queue: &Queue) {}
+        fn play_next(&mut self, _queue: &Queue) {}
+        fn queue(&mut self, _queue: &Queue) {}
+        fn toggle_saved(&mut self, _library: &Library) {}
+        fn save(&mut self, _library: &Library) {}
+        fn unsave(&mut self, _library: &Library) {}
+        fn open(&self, _queue: Arc<Queue>, _library: Arc<Library>) -> Option<Box<dyn ViewExt>> {
+            None
+        }
+        fn share_url(&self) -> Option<String> {
+            None
+        }
+        fn rule_label(&self) -> Option<String> {
+            self.rule.then(|| "Rule".to_string())
+        }
+        fn as_listitem(&self) -> Box<dyn ListItem> {
+            Box::new(self.clone())
+        }
+    }
+
+    #[test]
+    fn tab_state_does_not_count_rule_rows() {
+        let items = vec![
+            Row { rule: true },
+            Row { rule: false },
+            Row { rule: true },
+            Row { rule: false },
+        ];
+        assert_eq!(tab_state("Top", &items, None, false).rows, 2);
+    }
 }
 
 #[cfg(test)]
@@ -989,6 +1133,10 @@ mod draw_test {
         /// Stands for data a sync refreshes; no action changes it.
         revision: u32,
         list: Arc<std::sync::OnceLock<Arc<RwLock<Vec<Self>>>>>,
+        rule: Option<String>,
+        tag: Option<String>,
+        center: String,
+        right: String,
     }
 
     impl Probe {
@@ -1007,8 +1155,18 @@ mod draw_test {
         fn display_left(&self, _library: &Library) -> String {
             self.id.clone()
         }
+        fn display_center(&self, _library: &Library) -> String {
+            self.center.clone()
+        }
         fn display_right(&self, _library: &Library) -> String {
-            String::new()
+            self.right.clone()
+        }
+        fn rule_label(&self) -> Option<String> {
+            self.rule.clone()
+        }
+        fn display_tag(&self, _library: &Library) -> Option<String> {
+            self.assert_unlocked();
+            self.tag.clone()
         }
         fn play(&mut self, _queue: &Queue) {
             self.assert_unlocked();
@@ -1066,6 +1224,10 @@ mod draw_test {
                     plays: 0,
                     revision: 0,
                     list: cell.clone(),
+                    rule: None,
+                    tag: None,
+                    center: String::new(),
+                    right: String::new(),
                 })
                 .collect::<Vec<_>>(),
         ));
@@ -1176,5 +1338,294 @@ mod draw_test {
         let copy = list.playable_copy().expect("a Vec<Track> list copies");
         assert_eq!(copy.len(), 30);
         assert!(!library.tracks.is_locked());
+    }
+
+    /// A plain row whose left text is `left`.
+    fn row(left: &str) -> Probe {
+        Probe {
+            id: left.to_string(),
+            plays: 0,
+            revision: 0,
+            list: Arc::new(std::sync::OnceLock::new()),
+            rule: None,
+            tag: None,
+            center: String::new(),
+            right: String::new(),
+        }
+    }
+
+    /// A rule row; its left text holds a dash and the label, so only the rule check keeps it
+    /// out of a search.
+    fn rule(label: &str) -> Probe {
+        Probe {
+            rule: Some(label.to_string()),
+            ..row(&format!("rule-{label}"))
+        }
+    }
+
+    /// A list over `rows` with row 0 selected, and its content handle.
+    fn list_of(rows: Vec<Probe>) -> (ListView<Probe>, Arc<RwLock<Vec<Probe>>>) {
+        let (mut list, _) = probe_list(0);
+        let cell = Arc::new(std::sync::OnceLock::new());
+        let rows = rows
+            .into_iter()
+            .map(|p| Probe {
+                list: cell.clone(),
+                ..p
+            })
+            .collect();
+        let content = Arc::new(RwLock::new(rows));
+        cell.set(content.clone()).ok().unwrap();
+        list.content = content.clone();
+        list.selected = 0;
+        (list, content)
+    }
+
+    /// The text of each row of `list` drawn `width` columns wide, one cell per column.
+    fn draw_rows(list: &mut ListView<Probe>, width: usize) -> Vec<String> {
+        let height = list.content_len(true).max(1);
+        let size = Vec2::new(width, height);
+        list.layout(size);
+        let theme = Theme::default();
+        let mut buffer = PrintBuffer::new();
+        buffer.resize(size);
+        let buffer = parking_lot::RwLock::new(buffer);
+        let printer = Printer::new(size, &theme, &buffer);
+        list.draw(&printer);
+        let buffer = buffer.read();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell_text(Vec2::new(x, y)).unwrap_or(" ").to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn down(list: &mut ListView<Probe>, amount: MoveAmount) {
+        let mut siv = cursive::Cursive::new();
+        list.on_command(&mut siv, &Command::Move(MoveMode::Down, amount))
+            .unwrap();
+    }
+
+    fn up(list: &mut ListView<Probe>, amount: MoveAmount) {
+        let mut siv = cursive::Cursive::new();
+        list.on_command(&mut siv, &Command::Move(MoveMode::Up, amount))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_rule_row_is_drawn_across_the_width_without_a_cut_off_mark() {
+        let (mut list, _content) = list_of(vec![rule("Featured playlists")]);
+        let lines = draw_rows(&mut list, 30);
+        assert_eq!(lines[0], "--- Featured playlists -------");
+    }
+
+    /// The column a tag starts in on a row `width` columns wide whose right text fits the
+    /// reserve.
+    fn tag_column(width: usize) -> usize {
+        width - (TAG_RIGHT_RESERVE + 1 + TAG_WIDTH)
+    }
+
+    #[test]
+    fn a_tag_row_keeps_the_left_text_up_to_the_tag_column() {
+        let tagged = |left: String| Probe {
+            tag: Some("Artist".into()),
+            ..row(&left)
+        };
+        let tag_x = tag_column(70);
+        let whole = "w".repeat(tag_x - 1);
+        let long = "x".repeat(50);
+        let (mut list, _content) = list_of(vec![tagged(whole.clone()), tagged(long)]);
+        let lines = draw_rows(&mut list, 70);
+        assert_eq!(&lines[0][..tag_x - 1], whole);
+        assert_eq!(&lines[0][tag_x - 1..tag_x], " ");
+        assert_eq!(&lines[0][tag_x..tag_x + 6], "Artist");
+        assert_eq!(&lines[1][..tag_x - 3], "x".repeat(tag_x - 3));
+        assert_eq!(&lines[1][tag_x - 3..tag_x - 1], "..");
+        assert_eq!(&lines[1][tag_x - 1..tag_x], " ");
+        assert_eq!(&lines[1][tag_x..tag_x + 6], "Artist");
+    }
+
+    #[test]
+    fn tags_start_in_the_same_column_for_every_right_text() {
+        let rights = [
+            "3:41".to_string(),
+            "2019".into(),
+            String::new(),
+            "r".repeat(18),
+            "1:02:03 [2024-05-01]".into(),
+        ];
+        let rows = rights
+            .iter()
+            .enumerate()
+            .map(|(i, right)| Probe {
+                tag: Some("Track".into()),
+                right: right.clone(),
+                ..row(&format!("r{i}"))
+            })
+            .collect();
+        let (mut list, _content) = list_of(rows);
+        let lines = draw_rows(&mut list, 70);
+        let columns: Vec<Option<usize>> = lines.iter().map(|l| l.find("Track")).collect();
+        assert_eq!(rights[4].len(), 20);
+        assert_eq!(columns, vec![Some(tag_column(70)); rights.len()]);
+    }
+
+    #[test]
+    fn a_tag_row_ignores_the_center_text() {
+        let (mut list, _content) = list_of(vec![Probe {
+            tag: Some("Track".into()),
+            center: "Album X".into(),
+            ..row("left")
+        }]);
+        let lines = draw_rows(&mut list, 70);
+        assert!(!lines[0].contains("Album X"));
+        assert!(lines[0].contains("Track"));
+    }
+
+    #[test]
+    fn a_terminal_too_narrow_for_the_tag_draws_no_tag_and_does_not_panic() {
+        for width in [0, 1, 5, 12, 30] {
+            let (mut list, _content) = list_of(vec![Probe {
+                tag: Some("Tag".into()),
+                right: "3:41".into(),
+                ..row("left text")
+            }]);
+            let lines = draw_rows(&mut list, width);
+            assert!(!lines[0].contains("Tag"), "width {width}");
+        }
+    }
+
+    #[test]
+    fn rows_without_tag_or_rule_draw_as_before() {
+        let (mut list, _content) = list_of(vec![Probe {
+            center: "C".into(),
+            right: "R".into(),
+            ..row("L")
+        }]);
+        let lines = draw_rows(&mut list, 40);
+        assert_eq!(&lines[0][0..1], "L");
+        assert_eq!(&lines[0][20..21], "C");
+        assert_eq!(&lines[0][39..40], "R");
+        assert_eq!(lines[0].matches(|c: char| c != ' ').count(), 3);
+    }
+
+    #[test]
+    fn moving_down_and_up_steps_over_a_rule_row() {
+        let (mut list, _content) = list_of(vec![row("a"), rule("R"), row("b")]);
+        down(&mut list, MoveAmount::Integer(1));
+        assert_eq!(list.get_selected_index(), 2);
+        up(&mut list, MoveAmount::Integer(1));
+        assert_eq!(list.get_selected_index(), 0);
+    }
+
+    #[test]
+    fn page_and_extreme_moves_never_land_on_a_rule_row() {
+        let (mut list, _content) = list_of(vec![row("a"), row("b"), rule("R")]);
+        down(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 1);
+
+        let (mut list, _content) = list_of(vec![rule("R"), row("a")]);
+        list.layout(Vec2::new(40, 10));
+        assert_eq!(list.get_selected_index(), 1);
+        up(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 1);
+
+        let rows = vec![row("a"), row("b"), row("c"), rule("R"), row("d"), row("e")];
+        let (mut list, _content) = list_of(rows);
+        list.layout(Vec2::new(40, 3));
+        down(&mut list, MoveAmount::Float(1.0));
+        assert_eq!(list.get_selected_index(), 4);
+        list.selected = 5;
+        list.last_size = Vec2::new(40, 2);
+        up(&mut list, MoveAmount::Float(1.0));
+        assert_eq!(list.get_selected_index(), 2);
+    }
+
+    #[test]
+    fn a_list_filled_later_with_a_rule_first_selects_the_row_below() {
+        let (mut list, content) = list_of(vec![rule("R"), row("a")]);
+        let rows = std::mem::take(&mut *content.write());
+        list.layout(Vec2::new(40, 10));
+        *content.write() = rows;
+        list.layout(Vec2::new(40, 10));
+        assert_eq!(list.get_selected_index(), 1);
+    }
+
+    #[test]
+    fn content_replaced_moves_off_a_rule_row() {
+        let (mut list, content) = list_of(vec![row("a"), row("b"), row("c")]);
+        list.selected = 1;
+        {
+            let mut rows = content.write();
+            rows[1].rule = Some("R".into());
+        }
+        list.content_replaced();
+        assert_eq!(list.get_selected_index(), 2);
+    }
+
+    #[test]
+    fn a_content_replace_without_rule_rows_keeps_the_scroll_position() {
+        let rows = (0..30).map(|i| row(&format!("p{i}"))).collect();
+        let (mut list, _content) = list_of(rows);
+        list.layout(Vec2::new(40, 5));
+        list.scroller.set_offset((0, 20));
+        list.content_replaced();
+        assert_eq!(list.get_selected_index(), 0);
+        assert_eq!(list.scroller.content_viewport().top_left().y, 20);
+    }
+
+    #[test]
+    fn a_list_of_only_rule_rows_keeps_its_selection_and_takes_no_command() {
+        let (mut list, _content) = list_of(vec![rule("A"), rule("B")]);
+        list.layout(Vec2::new(40, 10));
+        down(&mut list, MoveAmount::Integer(1));
+        assert_eq!(list.get_selected_index(), 0);
+        up(&mut list, MoveAmount::Integer(1));
+        assert_eq!(list.get_selected_index(), 0);
+        down(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 0);
+
+        list.queue.append(Playable::Track(track("t1", &[])));
+        let mut siv = cursive::Cursive::new();
+        let played = list.on_command(&mut siv, &Command::Play);
+        assert!(matches!(played, Ok(CommandResult::Consumed(None))));
+        assert_eq!(list.queue.len(), 1);
+
+        let opened = list.on_command(&mut siv, &Command::Open(TargetMode::Selected));
+        assert!(matches!(opened, Ok(CommandResult::Consumed(None))));
+
+        for cmd in [Command::Quit, Command::TogglePlay] {
+            let result = list.on_command(&mut siv, &cmd);
+            assert!(matches!(result, Ok(CommandResult::Ignored)));
+        }
+        assert_eq!(list.queue.len(), 1);
+    }
+
+    #[test]
+    fn the_in_list_search_does_not_match_a_rule_row() {
+        let (list, _content) = list_of(vec![row("a"), rule("Featured playlists")]);
+        assert!(list.get_indexes_of("featured").is_empty());
+        assert!(!list.get_indexes_of("-").contains(&1));
+    }
+
+    #[test]
+    fn a_left_or_right_click_on_a_rule_row_changes_nothing() {
+        let (mut list, content) = list_of(vec![row("a"), rule("R"), row("b")]);
+        list.layout(Vec2::new(40, 10));
+        for button in [MouseButton::Left, MouseButton::Right] {
+            let result = list.handle_mouse_event(Event::Mouse {
+                offset: Vec2::new(0, 0),
+                position: Vec2::new(1, 1),
+                event: MouseEvent::Press(button),
+            });
+            assert!(matches!(
+                result,
+                MouseHandleResult::Handled(EventResult::Consumed(None))
+            ));
+            assert_eq!(list.get_selected_index(), 0);
+        }
+        assert!(content.read().iter().all(|p| p.plays == 0));
     }
 }

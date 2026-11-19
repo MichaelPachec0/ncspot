@@ -53,6 +53,18 @@ pub trait ListItem: Sync + Send + 'static {
         None
     }
 
+    /// `Some(label)`: this row is a rule line with `label` inside, drawn across the whole
+    /// width. Such a row is never selected and takes no command.
+    fn rule_label(&self) -> Option<String> {
+        None
+    }
+
+    /// Text for a narrow column just left of the right column. A row with a tag draws no
+    /// center column and its left column runs up to the tag.
+    fn display_tag(&self, _library: &Library) -> Option<String> {
+        None
+    }
+
     #[allow(unused_variables)]
     #[inline]
     fn is_saved(&self, library: &Library) -> Option<bool> {

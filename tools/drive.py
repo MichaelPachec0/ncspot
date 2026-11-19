@@ -1001,10 +1001,11 @@ SEARCH_TERM = "bonobo"
 SEARCH_TABS = ["Tracks", "Albums", "Artists", "Playlists", "Shows", "Episodes"]
 
 
-def _search(inst, args, answered_by=("internal",)):
+def _search(inst, args, answered_by=("internal",), *, top):
     """Run the fixed search from a settled baseline; returns the settled dump. Counts only.
     `answered_by` names the clients the search itself goes through: when one of them is rate
-    limited after the search, the run is BLOCKED, not FAIL."""
+    limited after the search, the run is BLOCKED, not FAIL. With `top` the first tab is a
+    filled Top tab and selected; without it there is no Top tab and Tracks is selected."""
     d = inst.wait_library(args.settle_timeout * 4, blocked_on=["internal"])
     blocked_if_throttled(d, ["internal"])
     inst.base_dump = d
@@ -1013,6 +1014,15 @@ def _search(inst, args, answered_by=("internal",)):
     blocked_if_throttled(d, list(answered_by))
     expect(d["view"] == "search", "a search view", d["view"])
     expect(d["title"] == "Search", "the title without the term", d["title"])
+    names = [t["name"] for t in d["tabs"]]
+    if top:
+        expect(names[:1] == ["Top"], "the Top tab first", names)
+        expect(d.get("tab") == "Top", "the Top tab selected", d.get("tab"))
+        rows = tab(d, "Top")["rows"]
+        expect(rows > 0, "rows in the Top tab", rows)
+    else:
+        expect("Top" not in names, "no Top tab", names)
+        expect(d.get("tab") == "Tracks", "the Tracks tab selected", d.get("tab"))
     for name in SEARCH_TABS:
         rows = tab(d, name)["rows"]
         expect(rows > 0, f"rows in the {name} tab", rows)
@@ -1021,12 +1031,15 @@ def _search(inst, args, answered_by=("internal",)):
 
 def sc_search(inst, args):
     """A text search fills the six tabs from the internal API, with no fallback and no Web call."""
-    d = _search(inst, args)
+    d = _search(inst, args, top=True)
     m = area_delta(inst, d, "search")
     expect(m["internal_ok"] >= 1, "internal search calls", m)
     expect(m["fallback"] == 0 and m["web"] == 0, "no fallback and no Web API call", m)
     expect(not d["areas"]["search"]["latched"], "the search area not latched", d["areas"]["search"])
     expect(not d["areas"]["metadata"]["latched"], "the metadata area not latched", d["areas"]["metadata"])
+    inst.send("move right")
+    d = inst.wait_settled(args.settle_timeout)
+    expect(d.get("tab") == "Tracks", "the Tracks tab selected after move right", d.get("tab"))
     before = tab(d, "Tracks")["rows"]
     inst.send("move bottom")
     d = inst.wait_settled(args.settle_timeout)
@@ -1051,7 +1064,7 @@ def sc_search(inst, args):
 
 def sc_search_area_off(inst, args):
     """With the search area off, the six tabs fill from the Web API only."""
-    d = _search(inst, args, answered_by=("internal", "shared", "personal"))
+    d = _search(inst, args, answered_by=("internal", "shared", "personal"), top=False)
     m = area_delta(inst, d, "search")
     expect(m["internal_ok"] == 0, "no search calls on the internal API", m)
     expect(m["web"] >= 6, "at least 6 Web API calls", m)

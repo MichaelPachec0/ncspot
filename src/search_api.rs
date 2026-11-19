@@ -3,20 +3,24 @@
 //! decide when the internal path is not used, has failed, or is over for the session.
 
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::thread;
 
-use librespot_core::SpotifyUri;
+use librespot_core::{Session, SpotifyUri};
 use log::{debug, warn};
 use rspotify::model::{FullArtist, FullTrack, SimplifiedAlbum, SimplifiedEpisode, SimplifiedShow};
+use rspotify::prelude::Id;
 
 use crate::internal_api::Area;
 use crate::internal_api::error::InternalError;
 use crate::internal_api::hashes::{HashStore, Operation, RotateError, rotate, witness};
 use crate::internal_api::metadata::{self, Missing};
 use crate::internal_api::pathfinder::{self, Outcome, search_variables};
-use crate::internal_api::search::{Kind, PAGE, Section, next_offset, read_all, read_section};
+use crate::internal_api::search::{
+    Kind, PAGE, Section, TopResults, next_offset, read_all, read_section, read_top,
+};
 use crate::model::playlist::Playlist;
 use crate::spotify_api::WebApi;
 
@@ -71,8 +75,192 @@ pub struct TabPage {
     pub total: usize,
 }
 
+/// One row of the Top tab, as fetched.
+#[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a Top tab holds a handful of rows; boxing would save nothing worth an allocation"
+)]
+pub enum TopRow {
+    Track(FullTrack),
+    Album(SimplifiedAlbum),
+    Artist(FullArtist),
+    Playlist(Playlist),
+    Show(SimplifiedShow),
+    Episode(SimplifiedEpisode),
+}
+
+impl TopRow {
+    /// `spotify:<kind>:<id>` of the row; `None` when the model carries no id.
+    pub fn uri(&self) -> Option<String> {
+        match self {
+            Self::Track(t) => t.id.as_ref().map(|id| id.uri()),
+            Self::Album(a) => a.id.as_ref().map(|id| id.uri()),
+            Self::Artist(a) => Some(a.id.uri()),
+            Self::Playlist(p) => Some(format!("spotify:playlist:{}", p.id)),
+            Self::Show(s) => Some(s.id.uri()),
+            Self::Episode(e) => Some(e.id.uri()),
+        }
+    }
+}
+
+/// The rows of `rows` one by one, in order.
+fn into_top_rows(rows: Rows) -> Vec<TopRow> {
+    match rows {
+        Rows::Tracks(rows) => rows.into_iter().map(TopRow::Track).collect(),
+        Rows::Albums(rows) => rows.into_iter().map(TopRow::Album).collect(),
+        Rows::Artists(rows) => rows.into_iter().map(TopRow::Artist).collect(),
+        Rows::Playlists(rows) => rows.into_iter().map(TopRow::Playlist).collect(),
+        Rows::Shows(rows) => rows.into_iter().map(TopRow::Show).collect(),
+        Rows::Episodes(rows) => rows.into_iter().map(TopRow::Episode).collect(),
+    }
+}
+
+/// One place of the Top tab, in the answer's order.
+#[derive(Debug, Clone)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a Top tab holds a handful of slots; boxing would save nothing worth an allocation"
+)]
+enum Slot {
+    Row(TopRow),
+    /// Not among its kind's first page: waits for its own fetch.
+    Stray(Kind, String),
+    /// Left out for good.
+    Dropped,
+}
+
+/// The Top tab while it is being put together.
+#[derive(Debug, Clone, Default)]
+pub struct TopDraft {
+    slots: Vec<Slot>,
+    featured: Vec<Playlist>,
+}
+
+impl TopDraft {
+    /// The rows known so far, in the answer's order.
+    pub fn rows(&self) -> Vec<TopRow> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Row(row) => Some(row.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn featured(&self) -> &[Playlist] {
+        &self.featured
+    }
+
+    /// Whether a stray is still waiting for its fetch.
+    pub fn has_strays(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|slot| matches!(slot, Slot::Stray(..)))
+    }
+
+    /// For tests in other modules: `slots` in order, `Ok(row)` a row at hand, `Err((kind,
+    /// uri))` a stray.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        slots: Vec<Result<TopRow, (Kind, String)>>,
+        featured: Vec<Playlist>,
+    ) -> Self {
+        let slots = slots
+            .into_iter()
+            .map(|slot| match slot {
+                Ok(row) => Slot::Row(row),
+                Err((kind, uri)) => Slot::Stray(kind, uri),
+            })
+            .collect();
+        Self { slots, featured }
+    }
+
+    /// The uris of the strays of `kind`, in order.
+    fn strays_of(&self, kind: Kind) -> Vec<String> {
+        self.slots
+            .iter()
+            .filter_map(|slot| match slot {
+                Slot::Stray(k, uri) if *k == kind => Some(uri.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Fill the strays of `kind` from `rows` (matched by uri) and drop those not in it.
+    pub(crate) fn settle(&mut self, kind: Kind, rows: Option<Rows>) {
+        let answered = rows.is_some();
+        let mut fetched: HashMap<String, TopRow> = rows
+            .map(into_top_rows)
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| Some((row.uri()?, row)))
+            .collect();
+        let mut missing = 0;
+        for slot in &mut self.slots {
+            let Slot::Stray(k, uri) = slot else {
+                continue;
+            };
+            if *k != kind {
+                continue;
+            }
+            *slot = match fetched.remove(uri.as_str()) {
+                Some(row) => Slot::Row(row),
+                None => {
+                    missing += 1;
+                    Slot::Dropped
+                }
+            };
+        }
+        // A failed fetch is logged by the caller.
+        if answered && missing > 0 {
+            debug!("internal search: {missing} {kind:?} top results not returned, dropped");
+        }
+    }
+}
+
+/// The Top tab of a first page: `top`'s entries in order, rows taken from the built `tabs`
+/// where the entry is among its kind's section, strays otherwise. Entries of a kind in
+/// `failed` (its batch failed) are dropped.
+fn top_draft(
+    top: TopResults,
+    sections: &HashMap<Kind, Section>,
+    tabs: &HashMap<Kind, TabPage>,
+    failed: &HashSet<Kind>,
+) -> TopDraft {
+    let slots = top
+        .items
+        .into_iter()
+        .map(|entry| {
+            if entry.kind == Kind::Playlist {
+                return entry
+                    .playlist
+                    .map_or(Slot::Dropped, |p| Slot::Row(TopRow::Playlist(p)));
+            }
+            if failed.contains(&entry.kind) {
+                return Slot::Dropped;
+            }
+            if sections[&entry.kind].uris.contains(&entry.uri) {
+                return into_top_rows(tabs[&entry.kind].rows.clone())
+                    .into_iter()
+                    .find(|row| row.uri().as_deref() == Some(entry.uri.as_str()))
+                    .map_or(Slot::Dropped, Slot::Row);
+            }
+            Slot::Stray(entry.kind, entry.uri)
+        })
+        .collect();
+    TopDraft {
+        slots,
+        featured: top.featured,
+    }
+}
+
 pub enum FirstPage {
-    Internal(HashMap<Kind, TabPage>),
+    Internal {
+        tabs: HashMap<Kind, TabPage>,
+        top: TopDraft,
+    },
     /// Run today's six Web API searches instead.
     NotInUse,
     /// Leave the tabs empty.
@@ -130,6 +318,10 @@ pub(crate) trait SearchBackend {
     /// The rows of `uris` for `kind` (one `run_internal(Area::Metadata, ..)` call).
     /// Never called for `Kind::Playlist` or with no uris.
     fn fetch(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError>;
+    /// Like [Self::fetch], for rows only the Top tab needs: at most one retry on a transient
+    /// failure, and no waiting for a rate-limit window (a rate-limit answer or an open window
+    /// fails at once with `RateLimited`). Never called for `Kind::Playlist` or with no uris.
+    fn fetch_stray(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError>;
     fn latch(&self, area: Area, err: &InternalError);
     fn count_ok(&self, area: Area);
     fn count_fallback(&self, area: Area);
@@ -154,37 +346,11 @@ impl SearchBackend for WebApi {
     }
 
     fn fetch(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError> {
-        let uris: Vec<SpotifyUri> = uris
-            .iter()
-            .filter_map(|uri| SpotifyUri::from_uri(uri).ok())
-            .collect();
-        if uris.is_empty() {
-            return Ok(Rows::empty(kind));
-        }
-        let area = Area::Metadata;
-        match kind {
-            Kind::Track => self
-                .run_internal(area, |s| metadata::tracks_by_uri(s, uris.clone()))
-                .map(Rows::Tracks),
-            Kind::Album => self
-                .run_internal(area, |s| {
-                    metadata::albums_by_uri(s, uris.clone(), Missing::Skip)
-                })
-                .map(Rows::Albums),
-            Kind::Artist => self
-                .run_internal(area, |s| metadata::artists_by_uri(s, uris.clone()))
-                .map(Rows::Artists),
-            Kind::Show => self
-                .run_internal(area, |s| metadata::shows_by_uri(s, uris.clone()))
-                .map(Rows::Shows),
-            Kind::Episode => self
-                .run_internal(area, |s| {
-                    metadata::episodes_by_uri(s, uris.clone(), Missing::Skip)
-                })
-                .map(Rows::Episodes),
-            // Playlist rows come from the answer itself.
-            Kind::Playlist => Ok(Rows::empty(kind)),
-        }
+        metadata_rows(self, kind, uris, false)
+    }
+
+    fn fetch_stray(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError> {
+        metadata_rows(self, kind, uris, true)
     }
 
     fn latch(&self, area: Area, err: &InternalError) {
@@ -197,6 +363,57 @@ impl SearchBackend for WebApi {
 
     fn count_fallback(&self, area: Area) {
         Self::count_fallback(self, area);
+    }
+}
+
+/// One call in `Area::Metadata`: through [WebApi::run_internal_stray] when `stray`, else
+/// through [WebApi::run_internal].
+fn run_metadata<T, F, Fut>(api: &WebApi, stray: bool, internal: F) -> Result<T, InternalError>
+where
+    F: Fn(Session) -> Fut,
+    Fut: Future<Output = Result<T, InternalError>> + Send + 'static,
+    T: Send + 'static,
+{
+    if stray {
+        api.run_internal_stray(Area::Metadata, internal)
+    } else {
+        api.run_internal(Area::Metadata, internal)
+    }
+}
+
+/// The rows of `uris` for `kind` from one metadata call (see [run_metadata] for `stray`).
+fn metadata_rows(
+    api: &WebApi,
+    kind: Kind,
+    uris: &[String],
+    stray: bool,
+) -> Result<Rows, InternalError> {
+    let uris: Vec<SpotifyUri> = uris
+        .iter()
+        .filter_map(|uri| SpotifyUri::from_uri(uri).ok())
+        .collect();
+    if uris.is_empty() {
+        return Ok(Rows::empty(kind));
+    }
+    match kind {
+        Kind::Track => {
+            run_metadata(api, stray, |s| metadata::tracks_by_uri(s, uris.clone())).map(Rows::Tracks)
+        }
+        Kind::Album => run_metadata(api, stray, |s| {
+            metadata::albums_by_uri(s, uris.clone(), Missing::Skip)
+        })
+        .map(Rows::Albums),
+        Kind::Artist => run_metadata(api, stray, |s| metadata::artists_by_uri(s, uris.clone()))
+            .map(Rows::Artists),
+        Kind::Show => {
+            run_metadata(api, stray, |s| metadata::shows_by_uri(s, uris.clone())).map(Rows::Shows)
+        }
+        Kind::Episode => run_metadata(api, stray, |s| {
+            metadata::episodes_by_uri(s, uris.clone(), Missing::Skip)
+        })
+        .map(Rows::Episodes),
+        // Playlist rows come from the answer itself.
+        Kind::Playlist => Ok(Rows::empty(kind)),
     }
 }
 
@@ -253,15 +470,15 @@ pub(crate) fn first_page_with(
 
     let op = Operation::Desktop;
     let variables = search_variables(term, 0, PAGE);
-    let sections = match rotate(
+    let (sections, top) = match rotate(
         store,
         op,
         |hash| b.send(op, hash, &variables, QUERY_RETRIES),
-        read_all,
+        |answer| read_all(answer).map(|sections| (sections, read_top(answer))),
     ) {
-        Ok(sections) => {
+        Ok(read) => {
             b.count_ok(Area::Search);
-            sections
+            read
         }
         Err(err) => {
             let (failure, latch) = first_page_failure(&err);
@@ -307,9 +524,11 @@ pub(crate) fn first_page_with(
     });
 
     let mut tabs = HashMap::new();
+    let mut failed = HashSet::new();
     for (kind, result) in built {
         let tab = result.unwrap_or_else(|err| {
             rows_failed(b, kind, &err);
+            failed.insert(kind);
             TabPage {
                 rows: Rows::empty(kind),
                 next_offset: Some(0),
@@ -320,10 +539,51 @@ pub(crate) fn first_page_with(
     }
 
     if b.usable(Area::Metadata) {
-        FirstPage::Internal(tabs)
+        let top = top_draft(top, &sections, &tabs, &failed);
+        FirstPage::Internal { tabs, top }
     } else {
         b.count_fallback(Area::Search);
         FirstPage::NotInUse
+    }
+}
+
+/// Fetch the strays of `draft`: one `fetch_stray` per kind that has any, all kinds at the
+/// same time. A failed fetch drops that kind's strays and is logged at `warn` with kind
+/// and error class; it never latches and never counts a fallback. Afterwards
+/// `has_strays()` is false.
+pub(crate) fn fetch_strays_with(b: &(impl SearchBackend + Sync), draft: &mut TopDraft) {
+    let wanted: Vec<(Kind, Vec<String>)> = Kind::ALL
+        .into_iter()
+        .filter(|kind| *kind != Kind::Playlist)
+        .map(|kind| (kind, draft.strays_of(kind)))
+        .filter(|(_, uris)| !uris.is_empty())
+        .collect();
+    let fetched: Vec<(Kind, Result<Rows, InternalError>)> = thread::scope(|scope| {
+        let running: Vec<_> = wanted
+            .iter()
+            .map(|(kind, uris)| (*kind, scope.spawn(move || b.fetch_stray(*kind, uris))))
+            .collect();
+        running
+            .into_iter()
+            .map(|(kind, handle)| {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                (kind, result)
+            })
+            .collect()
+    });
+    for (kind, result) in fetched {
+        match result {
+            Ok(rows) => draft.settle(kind, Some(rows)),
+            Err(err) => {
+                warn!(
+                    "internal search: {kind:?} top results could not be fetched ({})",
+                    err.class()
+                );
+                draft.settle(kind, None);
+            }
+        }
     }
 }
 
@@ -451,18 +711,24 @@ mod tests {
     use crate::config::{Config, ConfigValues};
     use crate::internal_api::search;
     use parking_lot::Mutex;
+    use rspotify::model::{ShowId, TrackId, Type};
     use serde_json::json;
+    use std::sync::Arc;
 
     type SendFn =
         dyn Fn(Operation, &serde_json::Value) -> Result<Outcome, InternalError> + Send + Sync;
-    type FetchFn = dyn Fn(Kind) -> Result<Rows, InternalError> + Send + Sync;
+    type FetchFn = dyn Fn(Kind, &[String]) -> Result<Rows, InternalError> + Send + Sync;
 
-    /// A stand-in for the session: records sends (operation, offset, term), latches, counted
-    /// answers and fallbacks.
+    /// A stand-in for the session: records sends (operation, offset, term), fetches, stray
+    /// fetches, latches, counted answers and fallbacks.
     struct Fake {
         send: Box<SendFn>,
-        fetch: Box<FetchFn>,
+        fetch: Arc<FetchFn>,
+        /// Answers `fetch_stray`; the same closure as `fetch` unless set apart.
+        stray: Arc<FetchFn>,
         sends: Mutex<Vec<(Operation, u64, String)>>,
+        fetches: Mutex<Vec<(Kind, Vec<String>)>>,
+        stray_fetches: Mutex<Vec<(Kind, Vec<String>)>>,
         retries: Mutex<Vec<u32>>,
         latched: Mutex<Vec<(Area, InternalError)>>,
         oks: Mutex<usize>,
@@ -475,17 +741,35 @@ mod tests {
             + Send
             + Sync
             + 'static,
-            fetch: impl Fn(Kind) -> Result<Rows, InternalError> + Send + Sync + 'static,
+            fetch: impl Fn(Kind, &[String]) -> Result<Rows, InternalError> + Send + Sync + 'static,
         ) -> Self {
+            let fetch: Arc<FetchFn> = Arc::new(fetch);
             Self {
                 send: Box::new(send),
-                fetch: Box::new(fetch),
+                stray: Arc::clone(&fetch),
+                fetch,
                 sends: Mutex::new(Vec::new()),
+                fetches: Mutex::new(Vec::new()),
+                stray_fetches: Mutex::new(Vec::new()),
                 retries: Mutex::new(Vec::new()),
                 latched: Mutex::new(Vec::new()),
                 oks: Mutex::new(0),
                 fallbacks: Mutex::new(0),
             }
+        }
+
+        /// Answer `fetch_stray` with `stray` instead of the `fetch` closure.
+        fn with_stray(
+            mut self,
+            stray: impl Fn(Kind, &[String]) -> Result<Rows, InternalError> + Send + Sync + 'static,
+        ) -> Self {
+            self.stray = Arc::new(stray);
+            self
+        }
+
+        fn fetched_uris(&self) -> Vec<String> {
+            let fetches = self.fetches.lock();
+            fetches.iter().flat_map(|(_, uris)| uris.clone()).collect()
         }
 
         fn latched_areas(&self) -> Vec<Area> {
@@ -519,7 +803,14 @@ mod tests {
 
         fn fetch(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError> {
             assert!(kind != Kind::Playlist && !uris.is_empty());
-            (self.fetch)(kind)
+            self.fetches.lock().push((kind, uris.to_vec()));
+            (self.fetch)(kind, uris)
+        }
+
+        fn fetch_stray(&self, kind: Kind, uris: &[String]) -> Result<Rows, InternalError> {
+            assert!(kind != Kind::Playlist && !uris.is_empty());
+            self.stray_fetches.lock().push((kind, uris.to_vec()));
+            (self.stray)(kind, uris)
         }
 
         fn latch(&self, area: Area, err: &InternalError) {
@@ -682,7 +973,7 @@ mod tests {
                     desktop_answer()
                 })
             },
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         );
         let page = next_page_with(&fake, &store(), Kind::Track, "x", 50);
         assert!(matches!(page, NextPage::Page(_)));
@@ -709,7 +1000,7 @@ mod tests {
                     desktop()
                 }
             },
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         )
     }
 
@@ -760,7 +1051,10 @@ mod tests {
 
     #[test]
     fn a_400_from_the_type_operation_and_search_desktop_ends_paging_and_marks_nothing() {
-        let fake = Fake::new(|_, _| Ok(Outcome::BadRequest), |kind| Ok(Rows::empty(kind)));
+        let fake = Fake::new(
+            |_, _| Ok(Outcome::BadRequest),
+            |kind, _| Ok(Rows::empty(kind)),
+        );
         let store = store();
         for offset in [50, 100] {
             assert!(matches!(
@@ -814,7 +1108,10 @@ mod tests {
 
     #[test]
     fn a_400_from_every_search_desktop_hash_sends_that_search_to_the_web_api_without_a_latch() {
-        let fake = Fake::new(|_, _| Ok(Outcome::BadRequest), |kind| Ok(Rows::empty(kind)));
+        let fake = Fake::new(
+            |_, _| Ok(Outcome::BadRequest),
+            |kind, _| Ok(Rows::empty(kind)),
+        );
         let store = store();
         assert!(matches!(
             first_page_with(&fake, &store, "x"),
@@ -852,7 +1149,7 @@ mod tests {
                     Outcome::Partial(search::test_answer())
                 })
             },
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         );
         let store = store();
         for offset in [50, 100, 150] {
@@ -865,7 +1162,7 @@ mod tests {
 
     #[test]
     fn retired_search_desktop_latches_search() {
-        let fake = Fake::new(|_, _| Ok(Outcome::BadHash), |kind| Ok(Rows::empty(kind)));
+        let fake = Fake::new(|_, _| Ok(Outcome::BadHash), |kind, _| Ok(Rows::empty(kind)));
         assert!(matches!(
             first_page_with(&fake, &store(), "x"),
             FirstPage::NotInUse
@@ -873,7 +1170,7 @@ mod tests {
         assert_eq!(fake.latched_areas(), [Area::Search]);
         assert_eq!(fake.counts(), (0, 1), "bad hashes are not answers");
         // Per-type retired, then desktop retired: paging ends.
-        let fake = Fake::new(|_, _| Ok(Outcome::BadHash), |kind| Ok(Rows::empty(kind)));
+        let fake = Fake::new(|_, _| Ok(Outcome::BadHash), |kind, _| Ok(Rows::empty(kind)));
         assert!(matches!(
             next_page_with(&fake, &store(), Kind::Album, "x", 50),
             NextPage::Ended
@@ -885,7 +1182,7 @@ mod tests {
     fn a_desktop_answer_missing_a_section_is_a_bad_hash_even_for_one_kind() {
         let fake = Fake::new(
             |_, _| Ok(Outcome::Answer(json!({ "episodes": { "items": [] } }))),
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         );
         assert!(matches!(
             next_page_with(&fake, &store(), Kind::Episode, "x", 50),
@@ -903,7 +1200,7 @@ mod tests {
             Err(InternalError::Transient("x".into())),
         ] {
             let o = outcome.clone();
-            let fake = Fake::new(move |_, _| o.clone(), |kind| Ok(Rows::empty(kind)));
+            let fake = Fake::new(move |_, _| o.clone(), |kind, _| Ok(Rows::empty(kind)));
             assert!(matches!(
                 first_page_with(&fake, &store(), "x"),
                 FirstPage::Failed
@@ -918,7 +1215,7 @@ mod tests {
     fn a_refused_next_page_ends_paging_without_web_or_latch() {
         for outcome in [Outcome::NoResult, Outcome::Partial(json!({}))] {
             let o = outcome.clone();
-            let fake = Fake::new(move |_, _| Ok(o.clone()), |kind| Ok(Rows::empty(kind)));
+            let fake = Fake::new(move |_, _| Ok(o.clone()), |kind, _| Ok(Rows::empty(kind)));
             assert!(matches!(
                 next_page_with(&fake, &store(), Kind::Track, "x", 50),
                 NextPage::Ended
@@ -936,7 +1233,7 @@ mod tests {
             Err(InternalError::Transient("x".into())),
         ] {
             let o = outcome.clone();
-            let fake = Fake::new(move |_, _| o.clone(), |kind| Ok(Rows::empty(kind)));
+            let fake = Fake::new(move |_, _| o.clone(), |kind, _| Ok(Rows::empty(kind)));
             assert!(matches!(
                 next_page_with(&fake, &store(), Kind::Track, "x", 50),
                 NextPage::Failed
@@ -951,7 +1248,7 @@ mod tests {
     fn every_search_query_asks_for_one_transient_retry() {
         let fake = Fake::new(
             |_, _| Err(InternalError::Transient("x".into())),
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         );
         assert!(matches!(
             first_page_with(&fake, &store(), "x"),
@@ -972,7 +1269,7 @@ mod tests {
     fn a_protocol_change_on_the_first_page_latches_search() {
         let fake = Fake::new(
             |_, _| Err(InternalError::ProtocolChanged("x".into())),
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         );
         assert!(matches!(
             first_page_with(&fake, &store(), "x"),
@@ -990,7 +1287,7 @@ mod tests {
         let s = store();
         let fake = Fake::new(
             |_, _| Ok(Outcome::Partial(json!({ "tracksV2": null }))),
-            |kind| Ok(Rows::empty(kind)),
+            |kind, _| Ok(Rows::empty(kind)),
         );
         assert!(matches!(first_page_with(&fake, &s, "x"), FirstPage::Failed));
         assert!(fake.latched_areas().is_empty());
@@ -1003,10 +1300,10 @@ mod tests {
     #[test]
     fn the_term_is_sent_verbatim() {
         let term = "artist:x year:2017  y";
-        let fake = Fake::new(|_, _| Ok(desktop_answer()), |kind| Ok(Rows::empty(kind)));
+        let fake = Fake::new(|_, _| Ok(desktop_answer()), |kind, _| Ok(Rows::empty(kind)));
         assert!(matches!(
             first_page_with(&fake, &store(), term),
-            FirstPage::Internal(_)
+            FirstPage::Internal { .. }
         ));
         assert!(matches!(
             next_page_with(&fake, &store(), Kind::Album, term, 50),
@@ -1025,7 +1322,7 @@ mod tests {
     fn a_failed_batch_keeps_the_other_tabs_and_retries_from_zero() {
         let fake = Fake::new(
             |_, _| Ok(desktop_answer()),
-            |kind| {
+            |kind, _| {
                 if kind == Kind::Album {
                     Err(InternalError::RateLimited)
                 } else {
@@ -1033,7 +1330,7 @@ mod tests {
                 }
             },
         );
-        let FirstPage::Internal(tabs) = first_page_with(&fake, &store(), "x") else {
+        let FirstPage::Internal { tabs, .. } = first_page_with(&fake, &store(), "x") else {
             panic!()
         };
         assert_eq!(tabs.len(), 6);
@@ -1048,7 +1345,7 @@ mod tests {
     fn a_protocol_change_in_a_batch_latches_metadata() {
         let fake = Fake::new(
             |_, _| Ok(desktop_answer()),
-            |kind| {
+            |kind, _| {
                 if kind == Kind::Track {
                     Err(InternalError::ProtocolChanged("x".into()))
                 } else {
@@ -1065,7 +1362,7 @@ mod tests {
         assert_eq!(fake.counts(), (1, 1));
         let fake = Fake::new(
             |_, _| Ok(desktop_answer()),
-            |_| Err(InternalError::ProtocolChanged("x".into())),
+            |_, _| Err(InternalError::ProtocolChanged("x".into())),
         );
         assert!(matches!(
             next_page_with(&fake, &store(), Kind::Track, "x", 50),
@@ -1078,12 +1375,319 @@ mod tests {
     fn a_session_problem_sends_one_search_to_the_web_api() {
         for err in [InternalError::NoSession, InternalError::Denied] {
             let e = err.clone();
-            let fake = Fake::new(move |_, _| Err(e.clone()), |kind| Ok(Rows::empty(kind)));
+            let fake = Fake::new(move |_, _| Err(e.clone()), |kind, _| Ok(Rows::empty(kind)));
             assert!(matches!(
                 first_page_with(&fake, &store(), "x"),
                 FirstPage::NotInUse
             ));
             assert_eq!((*fake.fallbacks.lock(), fake.latched_areas().len()), (1, 0));
+        }
+    }
+
+    /// A track row with nothing set but the id and name, as `internal_api::convert` builds one.
+    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    fn full_track(id: &str) -> FullTrack {
+        FullTrack {
+            album: SimplifiedAlbum::default(),
+            artists: Vec::new(),
+            available_markets: Vec::new(),
+            disc_number: 0,
+            duration: chrono::Duration::zero(),
+            explicit: false,
+            external_ids: HashMap::new(),
+            external_urls: HashMap::new(),
+            href: None,
+            id: Some(TrackId::from_id(id.to_string()).unwrap()),
+            is_local: false,
+            is_playable: None,
+            linked_from: None,
+            restrictions: None,
+            name: id.to_string(),
+            popularity: 0,
+            preview_url: None,
+            track_number: 0,
+            r#type: Type::Track,
+        }
+    }
+
+    /// A show row with nothing set but the id and name, as `internal_api::convert` builds one.
+    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    fn show_row(id: &str) -> SimplifiedShow {
+        SimplifiedShow {
+            available_markets: Vec::new(),
+            copyrights: Vec::new(),
+            description: String::new(),
+            explicit: false,
+            external_urls: HashMap::new(),
+            href: String::new(),
+            id: ShowId::from_id(id.to_string()).unwrap(),
+            images: Vec::new(),
+            is_externally_hosted: None,
+            languages: Vec::new(),
+            media_type: String::new(),
+            name: id.to_string(),
+            publisher: String::new(),
+        }
+    }
+
+    /// A fetch that answers with exactly the track and show rows of the uris it was asked;
+    /// the fixtures need no rows of the other kinds.
+    fn rows_for(kind: Kind, uris: &[String]) -> Result<Rows, InternalError> {
+        let ids = uris.iter().map(|uri| uri.rsplit(':').next().unwrap());
+        Ok(match kind {
+            Kind::Track => Rows::Tracks(ids.map(full_track).collect()),
+            Kind::Show => Rows::Shows(ids.map(show_row).collect()),
+            _ => Rows::empty(kind),
+        })
+    }
+
+    /// `desktop_answer()` with no shows, and a top section of `t1` (in the tracks section),
+    /// `t9` (not in it), `p1`, `s9`, and one featured playlist.
+    fn top_fixture() -> serde_json::Value {
+        let mut v = search::test_answer();
+        v["podcasts"] = json!({ "totalCount": 0, "items": [] });
+        let playlist = |id: &str| {
+            json!({ "uri": format!("spotify:playlist:{id}"), "name": id,
+                "ownerV2": { "data": { "name": "Owner", "username": "owner1" } } })
+        };
+        let entry = |data: serde_json::Value| json!({ "item": { "data": data } });
+        let uri = |uri: &str| entry(json!({ "uri": uri }));
+        v["topResultsV2"] = json!({
+            "itemsV2": [
+                uri("spotify:track:t1"),
+                uri("spotify:track:t9"),
+                entry(playlist("p1")),
+                uri("spotify:show:s9"),
+            ],
+            "featured": [ { "data": playlist("pf1") } ],
+        });
+        v
+    }
+
+    fn top_fake() -> Fake {
+        Fake::new(|_, _| Ok(Outcome::Answer(top_fixture())), rows_for)
+    }
+
+    fn uris(rows: &[TopRow]) -> Vec<String> {
+        rows.iter().map(|row| row.uri().unwrap()).collect()
+    }
+
+    fn first_top(fake: &Fake) -> (HashMap<Kind, TabPage>, TopDraft) {
+        match first_page_with(fake, &store(), "x") {
+            FirstPage::Internal { tabs, top } => (tabs, top),
+            _ => panic!("not an internal first page"),
+        }
+    }
+
+    const T1: &str = "spotify:track:t1";
+    const T8: &str = "spotify:track:t8";
+    const T9: &str = "spotify:track:t9";
+    const P1: &str = "spotify:playlist:p1";
+    const S9: &str = "spotify:show:s9";
+
+    #[test]
+    fn the_first_page_carries_top_rows_taken_from_the_tabs() {
+        let fake = top_fake();
+        let (_, top) = first_top(&fake);
+        assert_eq!(uris(&top.rows()), [T1, P1]);
+        assert!(top.has_strays());
+        assert_eq!(top.featured().len(), 1);
+        let fetched = fake.fetched_uris();
+        assert!(!fetched.iter().any(|uri| uri == T9 || uri == S9));
+        assert!(fake.stray_fetches.lock().is_empty());
+    }
+
+    #[test]
+    fn kind_tabs_hold_only_their_sections_uris_in_order() {
+        let fake = top_fake();
+        let (tabs, _) = first_top(&fake);
+        let section = &read_all(&top_fixture()).unwrap()[&Kind::Track];
+        let tracks = uris(&into_top_rows(tabs[&Kind::Track].rows.clone()));
+        assert_eq!(tracks, section.uris);
+        assert!(!tracks.iter().any(|uri| uri == T9));
+    }
+
+    #[test]
+    fn strays_are_fetched_per_kind_and_land_in_the_answers_order() {
+        let fake = top_fake();
+        let (_, mut top) = first_top(&fake);
+        let fetches = fake.fetches.lock().len();
+        fetch_strays_with(&fake, &mut top);
+        assert_eq!(uris(&top.rows()), [T1, T9, P1, S9]);
+        let strays = fake.stray_fetches.lock().clone();
+        assert_eq!(strays.len(), 2);
+        assert!(strays.contains(&(Kind::Track, vec![T9.to_string()])));
+        assert!(strays.contains(&(Kind::Show, vec![S9.to_string()])));
+        assert_eq!(fake.fetches.lock().len(), fetches);
+        assert!(!top.has_strays());
+    }
+
+    #[test]
+    fn a_failed_stray_fetch_drops_only_strays_and_latches_nothing() {
+        let fake = top_fake().with_stray(|kind, _| {
+            Err(if kind == Kind::Track {
+                InternalError::ProtocolChanged("x".into())
+            } else {
+                InternalError::RateLimited
+            })
+        });
+        let (_, mut top) = first_top(&fake);
+        let counts = fake.counts();
+        fetch_strays_with(&fake, &mut top);
+        assert_eq!(uris(&top.rows()), [T1, P1]);
+        assert!(!top.has_strays());
+        assert!(fake.latched_areas().is_empty());
+        assert_eq!(fake.counts(), counts);
+    }
+
+    #[test]
+    fn a_stray_fetch_that_returns_fewer_or_reordered_rows_is_matched_by_uri() {
+        let draft = || {
+            TopDraft::for_test(
+                vec![
+                    Err((Kind::Track, T8.to_string())),
+                    Ok(TopRow::Track(full_track("t1"))),
+                    Err((Kind::Track, T9.to_string())),
+                ],
+                Vec::new(),
+            )
+        };
+        let unused = |_: Operation, _: &serde_json::Value| Err(InternalError::NoSession);
+        let cases: [(&[&str], &[&str]); 2] = [(&["t9"], &[T1, T9]), (&["t9", "t8"], &[T8, T1, T9])];
+        for (returned, expected) in cases {
+            let ids: Vec<String> = returned.iter().map(|id| id.to_string()).collect();
+            let fake = Fake::new(unused, rows_for).with_stray(move |_, _| {
+                Ok(Rows::Tracks(ids.iter().map(|id| full_track(id)).collect()))
+            });
+            let mut top = draft();
+            fetch_strays_with(&fake, &mut top);
+            assert_eq!(uris(&top.rows()), expected);
+            assert_eq!(
+                *fake.stray_fetches.lock(),
+                [(Kind::Track, vec![T8.to_string(), T9.to_string()])]
+            );
+            assert!(!top.has_strays());
+        }
+    }
+
+    #[test]
+    fn a_stray_row_under_another_id_is_dropped() {
+        let unused = |_: Operation, _: &serde_json::Value| Err(InternalError::NoSession);
+        let fake =
+            Fake::new(unused, rows_for).with_stray(|_, _| Ok(Rows::Tracks(vec![full_track("tx")])));
+        let mut top = TopDraft::for_test(vec![Err((Kind::Track, T9.to_string()))], Vec::new());
+        fetch_strays_with(&fake, &mut top);
+        assert!(top.rows().is_empty());
+        assert!(!top.has_strays());
+    }
+
+    #[test]
+    fn an_in_section_top_result_the_fetched_rows_leave_out_is_dropped() {
+        // The tracks section holds t1 and t2; the fetch answers t2 only.
+        let fake = Fake::new(
+            |_, _| Ok(Outcome::Answer(top_fixture())),
+            |kind, uris| {
+                let kept: Vec<String> = uris.iter().filter(|uri| *uri != T1).cloned().collect();
+                rows_for(kind, &kept)
+            },
+        );
+        let (tabs, mut top) = first_top(&fake);
+        assert_eq!(tabs[&Kind::Track].rows.len(), 1);
+        assert_eq!(uris(&top.rows()), [P1]);
+        fetch_strays_with(&fake, &mut top);
+        assert_eq!(uris(&top.rows()), [T9, P1, S9]);
+        let strays = fake.stray_fetches.lock().clone();
+        assert!(
+            !strays
+                .iter()
+                .any(|(_, uris)| uris.iter().any(|uri| uri == T1))
+        );
+    }
+
+    #[test]
+    fn a_failed_kind_batch_leaves_that_kinds_top_results_out_and_fetches_no_stray_of_it() {
+        let fake = Fake::new(
+            |_, _| Ok(Outcome::Answer(top_fixture())),
+            |kind, uris| {
+                if kind == Kind::Track {
+                    Err(InternalError::RateLimited)
+                } else {
+                    rows_for(kind, uris)
+                }
+            },
+        );
+        let (_, mut top) = first_top(&fake);
+        assert_eq!(uris(&top.rows()), [P1]);
+        assert!(top.has_strays());
+        fetch_strays_with(&fake, &mut top);
+        assert_eq!(
+            *fake.stray_fetches.lock(),
+            [(Kind::Show, vec![S9.to_string()])]
+        );
+        assert_eq!(uris(&top.rows()), [P1, S9]);
+    }
+
+    #[test]
+    fn a_missing_or_broken_top_section_changes_nothing_else() {
+        let run = |answer: serde_json::Value| {
+            let fake = Fake::new(move |_, _| Ok(Outcome::Answer(answer.clone())), rows_for);
+            let s = store();
+            let FirstPage::Internal { tabs, top } = first_page_with(&fake, &s, "x") else {
+                panic!("not an internal first page")
+            };
+            let bad_hashes = (
+                s.is_retired(Operation::Desktop),
+                s.candidates(Operation::Desktop).len(),
+            );
+            (tabs, top, bad_hashes, fake.counts())
+        };
+        let (plain_tabs, plain_top, plain_hashes, _) = run(search::test_answer());
+        assert!(plain_top.rows().is_empty() && !plain_top.has_strays());
+        let mut broken = search::test_answer();
+        broken["topResultsV2"] = json!("broken");
+        let (tabs, top, hashes, counts) = run(broken);
+        assert_eq!(tabs.len(), 6);
+        for kind in Kind::ALL {
+            let (a, b) = (&tabs[&kind], &plain_tabs[&kind]);
+            assert_eq!(
+                (a.rows.len(), a.next_offset, a.total),
+                (b.rows.len(), b.next_offset, b.total),
+                "{kind:?}"
+            );
+        }
+        assert!(top.rows().is_empty() && !top.has_strays() && top.featured().is_empty());
+        assert_eq!(hashes, plain_hashes);
+        assert_eq!(counts, (1, 0));
+    }
+
+    #[test]
+    fn no_draft_is_built_when_the_first_page_falls_back_or_fails() {
+        let not_in_use = Fake::new(|_, _| Ok(Outcome::BadRequest), rows_for);
+        assert!(matches!(
+            first_page_with(&not_in_use, &store(), "x"),
+            FirstPage::NotInUse
+        ));
+        let failed = Fake::new(|_, _| Err(InternalError::RateLimited), rows_for);
+        assert!(matches!(
+            first_page_with(&failed, &store(), "x"),
+            FirstPage::Failed
+        ));
+        let latched = Fake::new(
+            |_, _| Ok(Outcome::Answer(top_fixture())),
+            |kind, uris| {
+                if kind == Kind::Track {
+                    Err(InternalError::ProtocolChanged("x".into()))
+                } else {
+                    rows_for(kind, uris)
+                }
+            },
+        );
+        assert!(matches!(
+            first_page_with(&latched, &store(), "x"),
+            FirstPage::NotInUse
+        ));
+        for fake in [not_in_use, failed, latched] {
+            assert!(fake.stray_fetches.lock().is_empty());
         }
     }
 }
