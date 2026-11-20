@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn a_section_row_saves_opens_and_shares_like_its_plain_row() {
+    fn a_section_row_opens_and_shares_like_its_plain_row() {
         let (queue, library) = setup();
         for (plain, inner) in six().into_iter().zip(six()) {
             let section = TopItem::Section(Box::new(inner));
@@ -598,6 +598,88 @@ mod tests {
                 plain.open(queue.clone(), library.clone()).is_some()
             );
         }
+    }
+
+    /// What `op` does to `item` on a fresh test library, as far as it shows without the network:
+    /// the status notes it posted, and whether it left a playlist write that the writer then ran.
+    /// The test library has no loaded store (a save posts the loading note and stops) and is not
+    /// done loading (a playlist follow or unfollow posts the loading note and stops), so no
+    /// request leaves the process.
+    fn effect_of(item: TopItem, op: impl FnOnce(&mut TopItem, &Library)) -> (Vec<String>, bool) {
+        let ev = EventManager::new_for_test();
+        let cfg = Config::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev.clone(), spotify, cfg);
+        let mut item = item;
+        op(&mut item, &library);
+        let wrote = library.run_next_write();
+        let notes = ev
+            .msg_iter()
+            .filter_map(|event| match event {
+                crate::events::Event::StatusNote(note) => Some(note),
+                _ => None,
+            })
+            .collect();
+        (notes, wrote)
+    }
+
+    /// Check `op` on a section row of each kind in `kinds` (an index into `six`) against the
+    /// plain row, and that the plain row did something visible, so a pair of empty effects
+    /// cannot pass.
+    fn assert_section_matches_plain(kinds: &[usize], op: fn(&mut TopItem, &Library)) {
+        for &k in kinds {
+            let plain = effect_of(six().swap_remove(k), op);
+            assert_ne!(plain, (Vec::new(), false), "kind {k} shows no effect");
+            let section = effect_of(TopItem::Section(Box::new(six().swap_remove(k))), op);
+            assert_eq!(section, plain, "kind {k}");
+        }
+    }
+
+    // Kinds by index in `six`: 0 track, 1 album, 2 artist, 3 playlist, 4 show, 5 episode.
+    // The episode saves nothing while Your Episodes is off (the test library), and
+    // `toggle_saved` of a playlist does nothing for a playlist the user does not follow (the
+    // test library has no user), so those have no visible effect offline and are not checked.
+
+    #[test]
+    fn a_section_row_forwards_save_like_its_plain_row() {
+        assert_section_matches_plain(&[0, 1, 2, 3, 4], |i, l| i.save(l));
+    }
+
+    #[test]
+    fn a_section_row_forwards_unsave_like_its_plain_row() {
+        assert_section_matches_plain(&[0, 1, 2, 3, 4], |i, l| i.unsave(l));
+    }
+
+    #[test]
+    fn a_section_row_forwards_toggle_saved_like_its_plain_row() {
+        assert_section_matches_plain(&[0, 1, 2, 4], |i, l| i.toggle_saved(l));
+    }
+
+    // `album(queue)` has no offline case: a track reads its album from Spotify when it has an
+    // album id, and every other kind answers None, so no kind shows a difference without the
+    // network and it is not checked.
+    #[test]
+    fn a_section_row_gives_the_artists_of_its_plain_row() {
+        let artist_ids = |item: &TopItem| {
+            item.artists()
+                .map(|v| v.into_iter().map(|a| a.id).collect::<Vec<_>>())
+        };
+        for (plain, inner) in six().into_iter().zip(six()) {
+            let section = TopItem::Section(Box::new(inner));
+            assert_eq!(artist_ids(&section), artist_ids(&plain));
+        }
+        // Only a track and an album name artists; the plain rows must not both be empty.
+        let two = [("a1", "A"), ("a2", "B")];
+        let section = TopItem::Section(Box::new(TopItem::Track(track("t2", &two))));
+        assert_eq!(
+            artist_ids(&section),
+            Some(vec![Some("a1".to_string()), Some("a2".to_string())])
+        );
+        let mut by = album("b2");
+        by.artists = vec!["A".into()];
+        by.artist_ids = vec!["a1".into()];
+        let section = TopItem::Section(Box::new(TopItem::Album(by)));
+        assert_eq!(artist_ids(&section), Some(vec![Some("a1".to_string())]));
     }
 
     #[test]

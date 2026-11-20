@@ -1133,11 +1133,12 @@ mod tests {
         }
     }
 
-    /// The ids of `items`, `rule` for the rule row.
+    /// The labels of the rule rows of `items`.
     fn rule_labels(items: &[TopItem]) -> Vec<String> {
         items.iter().filter_map(|i| i.rule_label()).collect()
     }
 
+    /// The ids of `items`, `rule` for the rule row.
     fn item_ids(items: &[TopItem]) -> Vec<String> {
         items
             .iter()
