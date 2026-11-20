@@ -199,10 +199,21 @@ impl<I: ListItem + Clone> ListView<I> {
 
     /// Select the row at `target` (clamped to the list). A rule row is never selected: the
     /// nearest other row in the direction of travel is taken instead, else the nearest one the
-    /// other way, else the selection stays.
+    /// other way, else the selection stays. If the selection ends on a row with only rule rows
+    /// above it, those rows are scrolled into view too.
     pub fn move_focus_to(&mut self, target: usize) {
+        self.select_row(target, false);
+    }
+
+    /// [ListView::move_focus_to] for a mouse click: the clicked row is already visible, so the
+    /// list never scrolls under the pointer and a leading rule line is not brought back.
+    fn click_focus_to(&mut self, target: usize) {
+        self.select_row(target, true);
+    }
+
+    fn select_row(&mut self, target: usize, by_click: bool) {
         let down = target >= self.selected;
-        let top = self.scroller.content_viewport().top_left().y;
+        let selected = self.selected;
         let (chosen, only_rules_above) = {
             // Only `rule_label` runs under the guard; it never asks the library.
             let content = self.content.read();
@@ -220,7 +231,8 @@ impl<I: ListItem + Clone> ListView<I> {
                 Some(target)
             };
             // Stops at the first non-rule row, so a list without rules pays one check.
-            let only_rules_above = chosen.is_some_and(|c| c < top && (0..c).all(is_rule));
+            let end = chosen.unwrap_or(selected);
+            let only_rules_above = !by_click && end > 0 && (0..end).all(is_rule);
             (chosen, only_rules_above)
         };
         if let Some(index) = chosen {
@@ -365,7 +377,7 @@ impl<I: ListItem + Clone> ListView<I> {
                     } else {
                         // The clicked position wasn't focused yet or the item is a collection
                         // that can be opened.
-                        self.move_focus_to(clicked_row_index);
+                        self.click_focus_to(clicked_row_index);
                         if let Some(view) = self.open_selected() {
                             return MouseHandleResult::Handled(EventResult::Consumed(Some(
                                 Callback::from_fn_once(move |s| {
@@ -384,7 +396,7 @@ impl<I: ListItem + Clone> ListView<I> {
                 if let Some(y) = self.get_selected_row(position, offset)
                     && !self.is_rule_row(y)
                 {
-                    self.move_focus_to(y);
+                    self.click_focus_to(y);
 
                     let queue = self.queue.clone();
                     let library = self.library.clone();
@@ -1784,9 +1796,43 @@ mod draw_test {
         list.move_focus_to(13);
         assert_eq!(offset_y(&list), 4);
         list.scroller.set_offset((0, 1));
-        list.move_focus_to(1);
+        click_row(&mut list, 0);
         assert_eq!(list.get_selected_index(), 1);
         assert_eq!(offset_y(&list), 1);
+    }
+
+    #[test]
+    fn keys_that_land_on_the_first_row_show_the_leading_rule() {
+        let (mut list, _content) = list_b();
+        list.layout(Vec2::new(40, 10));
+        for _ in 0..9 {
+            down(&mut list, MoveAmount::Integer(1));
+        }
+        assert_eq!(list.get_selected_index(), 10);
+        assert_eq!(offset_y(&list), 1);
+        for _ in 0..9 {
+            up(&mut list, MoveAmount::Integer(1));
+        }
+        assert_eq!(list.get_selected_index(), 1);
+        assert_eq!(offset_y(&list), 0);
+    }
+
+    #[test]
+    fn a_key_on_the_first_row_shows_a_rule_the_wheel_hid() {
+        for amount in [
+            MoveAmount::Integer(1),
+            MoveAmount::Extreme,
+            MoveAmount::Float(1.0),
+        ] {
+            let (mut list, _content) = list_b();
+            list.layout(Vec2::new(40, 10));
+            assert_eq!(list.get_selected_index(), 1);
+            list.scroller.set_offset((0, 1));
+            assert_eq!(offset_y(&list), 1);
+            up(&mut list, amount);
+            assert_eq!(list.get_selected_index(), 1);
+            assert_eq!(offset_y(&list), 0);
+        }
     }
 
     #[test]
