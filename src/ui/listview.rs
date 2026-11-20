@@ -202,12 +202,13 @@ impl<I: ListItem + Clone> ListView<I> {
     /// other way, else the selection stays.
     pub fn move_focus_to(&mut self, target: usize) {
         let down = target >= self.selected;
-        let chosen = {
+        let top = self.scroller.content_viewport().top_left().y;
+        let (chosen, only_rules_above) = {
             // Only `rule_label` runs under the guard; it never asks the library.
             let content = self.content.read();
             let target = min(target, content.len().saturating_sub(1));
             let is_rule = |i: usize| content.get(i).is_some_and(|row| row.rule_label().is_some());
-            if is_rule(target) {
+            let chosen = if is_rule(target) {
                 let below = (target + 1..content.len()).find(|&i| !is_rule(i));
                 let above = (0..target).rev().find(|&i| !is_rule(i));
                 if down {
@@ -217,10 +218,17 @@ impl<I: ListItem + Clone> ListView<I> {
                 }
             } else {
                 Some(target)
-            }
+            };
+            // Stops at the first non-rule row, so a list without rules pays one check.
+            let only_rules_above = chosen.is_some_and(|c| c < top && (0..c).all(is_rule));
+            (chosen, only_rules_above)
         };
         if let Some(index) = chosen {
             self.selected = index;
+        }
+        if only_rules_above {
+            // Show the leading rule lines too; the selected row wins if both do not fit.
+            self.scroller.scroll_to_y(0);
         }
         self.scroller.scroll_to_y(self.selected);
     }
@@ -1627,5 +1635,180 @@ mod draw_test {
             assert_eq!(list.get_selected_index(), 0);
         }
         assert!(content.read().iter().all(|p| p.plays == 0));
+    }
+
+    /// List A of the section tests: rule rows first, between rows, and doubled.
+    fn list_a() -> (ListView<Probe>, Arc<RwLock<Vec<Probe>>>) {
+        list_of(vec![
+            rule("A"),
+            row("x1"),
+            row("x2"),
+            rule("B"),
+            row("x3"),
+            rule("C"),
+            rule("D"),
+            row("x4"),
+        ])
+    }
+
+    /// A rule row followed by 40 plain rows.
+    fn list_b() -> (ListView<Probe>, Arc<RwLock<Vec<Probe>>>) {
+        let mut rows = vec![rule("R")];
+        rows.extend((1..=40).map(|i| row(&format!("x{i}"))));
+        list_of(rows)
+    }
+
+    fn offset_y(list: &ListView<Probe>) -> usize {
+        list.scroller.content_viewport().top_left().y
+    }
+
+    fn click_row(list: &mut ListView<Probe>, y: usize) {
+        let result = list.handle_mouse_event(Event::Mouse {
+            offset: Vec2::new(0, 0),
+            position: Vec2::new(1, y),
+            event: MouseEvent::Press(MouseButton::Left),
+        });
+        assert!(matches!(
+            result,
+            MouseHandleResult::Handled(EventResult::Consumed(None))
+        ));
+    }
+
+    #[test]
+    fn a_list_that_starts_with_a_rule_selects_its_first_row() {
+        let (mut list, _content) = list_a();
+        list.layout(Vec2::new(40, 10));
+        assert_eq!(list.get_selected_index(), 1);
+        list.content_replaced();
+        assert_eq!(list.get_selected_index(), 1);
+    }
+
+    #[test]
+    fn line_moves_skip_every_rule_in_a_list_with_several() {
+        let (mut list, _content) = list_a();
+        list.layout(Vec2::new(40, 10));
+        let mut seen = vec![list.get_selected_index()];
+        for _ in 0..4 {
+            down(&mut list, MoveAmount::Integer(1));
+            seen.push(list.get_selected_index());
+        }
+        assert_eq!(seen, vec![1, 2, 4, 7, 7]);
+        let mut seen = vec![list.get_selected_index()];
+        for _ in 0..4 {
+            up(&mut list, MoveAmount::Integer(1));
+            seen.push(list.get_selected_index());
+        }
+        assert_eq!(seen, vec![7, 4, 2, 1, 1]);
+    }
+
+    #[test]
+    fn extreme_and_page_moves_never_rest_on_a_rule() {
+        let (mut list, _content) = list_a();
+        list.layout(Vec2::new(40, 10));
+        up(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 1);
+        down(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 7);
+
+        let (mut list, _content) = list_b();
+        list.layout(Vec2::new(40, 10));
+        for _ in 0..8 {
+            down(&mut list, MoveAmount::Float(1.0));
+            assert_ne!(list.get_selected_index(), 0);
+        }
+        assert_eq!(list.get_selected_index(), 40);
+        for _ in 0..8 {
+            up(&mut list, MoveAmount::Float(1.0));
+            assert_ne!(list.get_selected_index(), 0);
+        }
+        assert_eq!(list.get_selected_index(), 1);
+    }
+
+    #[test]
+    fn a_click_on_any_rule_of_several_does_nothing() {
+        let (mut list, _content) = list_a();
+        list.layout(Vec2::new(40, 10));
+        for y in [0, 3, 5, 6] {
+            click_row(&mut list, y);
+            assert_eq!(list.get_selected_index(), 1);
+        }
+        down(&mut list, MoveAmount::Integer(2));
+        assert_eq!(list.get_selected_index(), 4);
+        for y in [0, 3, 5, 6] {
+            click_row(&mut list, y);
+            assert_eq!(list.get_selected_index(), 4);
+        }
+    }
+
+    #[test]
+    fn in_list_search_skips_every_rule() {
+        let (list, _content) = list_of(vec![
+            rule("find"),
+            row("x1"),
+            rule("find"),
+            row("find x3"),
+            rule("find"),
+            rule("find"),
+            row("x4"),
+        ]);
+        assert_eq!(list.get_indexes_of("find"), vec![3]);
+    }
+
+    #[test]
+    fn moving_back_to_the_first_row_shows_the_leading_rule() {
+        let (mut list, _content) = list_b();
+        list.layout(Vec2::new(40, 10));
+        down(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 40);
+        assert_eq!(offset_y(&list), 31);
+        up(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 1);
+        assert_eq!(offset_y(&list), 0);
+    }
+
+    #[test]
+    fn the_selected_row_wins_when_the_leading_rule_does_not_fit() {
+        let (mut list, _content) = list_b();
+        list.layout(Vec2::new(40, 1));
+        down(&mut list, MoveAmount::Extreme);
+        assert_eq!(offset_y(&list), 40);
+        up(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 1);
+        assert_eq!(offset_y(&list), 1);
+    }
+
+    #[test]
+    fn a_click_on_a_visible_first_row_does_not_scroll() {
+        let (mut list, _content) = list_b();
+        list.layout(Vec2::new(40, 10));
+        list.move_focus_to(13);
+        assert_eq!(offset_y(&list), 4);
+        list.scroller.set_offset((0, 1));
+        list.move_focus_to(1);
+        assert_eq!(list.get_selected_index(), 1);
+        assert_eq!(offset_y(&list), 1);
+    }
+
+    #[test]
+    fn a_list_without_a_leading_rule_scrolls_as_before() {
+        let rows = (0..41).map(|i| row(&format!("p{i}"))).collect();
+        let (mut list, _content) = list_of(rows);
+        list.layout(Vec2::new(40, 10));
+        down(&mut list, MoveAmount::Extreme);
+        up(&mut list, MoveAmount::Extreme);
+        assert_eq!(list.get_selected_index(), 0);
+        assert_eq!(offset_y(&list), 0);
+
+        let mut rows: Vec<Probe> = (1..=20).map(|i| row(&format!("x{i}"))).collect();
+        rows.push(rule("R"));
+        rows.extend((21..=40).map(|i| row(&format!("x{i}"))));
+        let (mut list, _content) = list_of(rows);
+        list.layout(Vec2::new(40, 10));
+        list.move_focus_to(21);
+        assert_eq!(offset_y(&list), 12);
+        list.move_focus_to(40);
+        assert_eq!(offset_y(&list), 31);
+        list.move_focus_to(21);
+        assert_eq!(offset_y(&list), 21);
     }
 }
