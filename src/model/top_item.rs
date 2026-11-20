@@ -74,20 +74,7 @@ pub fn top_items(
         }
         items.push(TopItem::Rule(section_label(kind).to_string()));
         for row in rows {
-            let item = TopItem::from(row);
-            debug_assert!(
-                matches!(
-                    item,
-                    TopItem::Track(_)
-                        | TopItem::Album(_)
-                        | TopItem::Artist(_)
-                        | TopItem::Playlist(_)
-                        | TopItem::Show(_)
-                        | TopItem::Episode(_)
-                ),
-                "a section wraps one of the six row variants"
-            );
-            items.push(TopItem::Section(Box::new(item)));
+            items.push(TopItem::Section(Box::new(TopItem::from(row))));
         }
     }
     if !featured.is_empty() {
@@ -98,9 +85,13 @@ pub fn top_items(
 }
 
 impl TopItem {
-    /// Whether this is an item row (anything but `Rule`).
+    /// Whether this is an item row (anything but `Rule`, also when wrapped in `Section`).
     pub fn is_item(&self) -> bool {
-        !matches!(self, Self::Rule(_))
+        match self {
+            Self::Rule(_) => false,
+            Self::Section(i) => i.is_item(),
+            _ => true,
+        }
     }
 
     /// The model inside, `None` for the rule.
@@ -220,6 +211,7 @@ impl ListItem for TopItem {
     fn rule_label(&self) -> Option<String> {
         match self {
             Self::Rule(label) => Some(label.clone()),
+            Self::Section(i) => i.rule_label(),
             _ => None,
         }
     }
@@ -699,6 +691,30 @@ mod tests {
         let labels = menu.get_mut().labels_for_test();
         assert!(labels.iter().any(|l| l == "Play next"), "{labels:?}");
         assert!(labels.iter().any(|l| l == "Queue"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_section_that_wraps_a_rule_is_that_rule() {
+        let section = TopItem::Section(Box::new(TopItem::Rule("Tracks".into())));
+        assert_eq!(section.rule_label().as_deref(), Some("Tracks"));
+        assert!(!section.is_item());
+        assert!(section_track("t1").rule_label().is_none());
+        assert!(section_track("t1").is_item());
+    }
+
+    #[test]
+    fn a_loaded_section_row_merges_into_its_stale_twin() {
+        let mut row = TopItem::Section(Box::new(TopItem::Playlist(playlist("p1"))));
+        let mut loaded = playlist("p1");
+        loaded.tracks = Some(vec![Playable::Track(playable_track("t1"))]);
+        row.merge_loaded(TopItem::Section(Box::new(TopItem::Playlist(loaded))));
+        match &row {
+            TopItem::Section(inner) => match inner.as_ref() {
+                TopItem::Playlist(p) => assert_eq!(p.tracks.as_ref().map(Vec::len), Some(1)),
+                _ => panic!("the wrapped variant changed"),
+            },
+            _ => panic!("the variant changed"),
+        }
     }
 
     #[test]

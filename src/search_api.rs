@@ -116,6 +116,18 @@ fn into_top_rows(rows: Rows) -> Vec<TopRow> {
     }
 }
 
+/// Copies of the first `n` rows of `rows`, in order; the rest is not copied.
+fn first_top_rows(rows: &Rows, n: usize) -> Vec<TopRow> {
+    match rows {
+        Rows::Tracks(r) => r.iter().take(n).cloned().map(TopRow::Track).collect(),
+        Rows::Albums(r) => r.iter().take(n).cloned().map(TopRow::Album).collect(),
+        Rows::Artists(r) => r.iter().take(n).cloned().map(TopRow::Artist).collect(),
+        Rows::Playlists(r) => r.iter().take(n).cloned().map(TopRow::Playlist).collect(),
+        Rows::Shows(r) => r.iter().take(n).cloned().map(TopRow::Show).collect(),
+        Rows::Episodes(r) => r.iter().take(n).cloned().map(TopRow::Episode).collect(),
+    }
+}
+
 /// The first `per_kind` rows of each kind's first page, in tab order
 /// (Track, Album, Artist, Playlist, Show, Episode). A kind with no rows, or missing from
 /// `tabs`, is left out. `per_kind == 0` gives an empty list.
@@ -126,10 +138,7 @@ pub fn section_rows(tabs: &HashMap<Kind, TabPage>, per_kind: usize) -> Vec<(Kind
     Kind::ALL
         .into_iter()
         .filter_map(|kind| {
-            let rows: Vec<TopRow> = into_top_rows(tabs.get(&kind)?.rows.clone())
-                .into_iter()
-                .take(per_kind)
-                .collect();
+            let rows = first_top_rows(&tabs.get(&kind)?.rows, per_kind);
             (!rows.is_empty()).then_some((kind, rows))
         })
         .collect()
