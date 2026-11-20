@@ -1068,7 +1068,10 @@ mod tests {
     }
 
     fn setup() -> (EventManager, Arc<Queue>, Arc<Library>) {
-        let cfg = Config::new_for_test();
+        setup_with(Config::new_for_test())
+    }
+
+    fn setup_with(cfg: Arc<Config>) -> (EventManager, Arc<Queue>, Arc<Library>) {
         let ev = EventManager::new_for_test();
         let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
         let library = Library::new_for_test(ev.clone(), spotify.clone(), cfg.clone());
@@ -1083,11 +1086,7 @@ mod tests {
 
     /// Like `view(true)`, with a config holding `values`.
     fn view_with_values(values: ConfigValues) -> SearchResultsView {
-        let cfg = Config::new_for_test_with_values(values);
-        let ev = EventManager::new_for_test();
-        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
-        let library = Library::new_for_test(ev.clone(), spotify.clone(), cfg.clone());
-        let queue = Arc::new(Queue::new(spotify, cfg, library.clone()));
+        let (ev, queue, library) = setup_with(Config::new_for_test_with_values(values));
         SearchResultsView::build("x".into(), ev, queue, library, true)
     }
 
@@ -1135,6 +1134,10 @@ mod tests {
     }
 
     /// The ids of `items`, `rule` for the rule row.
+    fn rule_labels(items: &[TopItem]) -> Vec<String> {
+        items.iter().filter_map(|i| i.rule_label()).collect()
+    }
+
     fn item_ids(items: &[TopItem]) -> Vec<String> {
         items
             .iter()
@@ -1488,6 +1491,10 @@ mod tests {
             item_ids(&view.top.as_ref().unwrap().read()),
             ["rule", "t0", "t1", "t2", "rule", "b0", "b1"]
         );
+        assert_eq!(
+            rule_labels(&view.top.as_ref().unwrap().read()),
+            ["Tracks", "Albums"]
+        );
         assert!(!view.to_tracks.load(Ordering::Relaxed));
     }
 
@@ -1502,13 +1509,76 @@ mod tests {
 
     #[test]
     fn the_text_search_cuts_the_sections_at_the_views_own_row_count() {
-        let mut view = view(true);
-        view.rows_per_kind = 1;
-        view.text_search_finish("x".into())(tracks_and_albums_page());
-        assert_eq!(
-            item_ids(&view.top.as_ref().unwrap().read()),
-            ["rule", "t0", "rule", "b0"]
-        );
+        for n in [1, 2] {
+            let mut view = view(true);
+            view.rows_per_kind = n;
+            view.text_search_finish("x".into())(tracks_and_albums_page());
+            let mut expected = vec!["rule".to_string()];
+            expected.extend((0..n).map(|i| format!("t{i}")));
+            expected.push("rule".into());
+            expected.extend((0..n).map(|i| format!("b{i}")));
+            assert_eq!(item_ids(&view.top.as_ref().unwrap().read()), expected);
+        }
+    }
+
+    /// An internal first page of 5 tracks (t0..t4) with a next offset of 5 and a total of 40.
+    fn paged_tracks_page() -> FirstPage {
+        let tabs = Kind::ALL
+            .into_iter()
+            .map(|kind| {
+                let page = match kind {
+                    Kind::Track => TabPage {
+                        rows: Rows::Tracks((0..5).map(|i| track_row(&format!("t{i}"))).collect()),
+                        next_offset: Some(5),
+                        total: 40,
+                    },
+                    _ => TabPage {
+                        rows: Rows::empty(kind),
+                        next_offset: None,
+                        total: 0,
+                    },
+                };
+                (kind, page)
+            })
+            .collect();
+        FirstPage::Internal {
+            tabs,
+            top: TopDraft::default(),
+        }
+    }
+
+    #[test]
+    fn a_tab_still_pages_after_the_sections_were_cut() {
+        let state = |rows_per_kind: usize| {
+            let view = view(true);
+            finish_with_count(&view, paged_tracks_page(), rows_per_kind);
+            let ids: Vec<String> = view
+                .results_tracks
+                .read()
+                .iter()
+                .filter_map(|t| t.id())
+                .collect();
+            (
+                ids,
+                view.pagination_tracks.position().next_offset(),
+                view.pagination_tracks.max_content(),
+                view.pagination_tracks.can_load_more(),
+                view.top.as_ref().unwrap().read().len(),
+            )
+        };
+        let cut = state(3);
+        let uncut = state(0);
+        assert_eq!(cut.0, ["t0", "t1", "t2", "t3", "t4"]);
+        assert_eq!(cut.1, Some(5));
+        assert_eq!(cut.2, Some(40));
+        assert!(cut.3);
+        assert_eq!(cut.0, uncut.0);
+        assert_eq!(cut.1, uncut.1);
+        assert_eq!(cut.2, uncut.2);
+        assert_eq!(cut.3, uncut.3);
+        // The cut really happened in one run and not in the other.
+        assert_eq!(cut.4, 4);
+        assert_eq!(uncut.4, 0);
     }
 
     #[test]

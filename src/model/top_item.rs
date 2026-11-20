@@ -295,7 +295,9 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    // `full_track` and `full_artist` set fields that rspotify marks as deprecated because Spotify
+    // removed them; the structs have no other way to be built.
+    #[allow(deprecated)]
     fn full_track(id: &str) -> FullTrack {
         FullTrack {
             album: SimplifiedAlbum::default(),
@@ -320,7 +322,7 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    #[allow(deprecated)]
     fn full_artist(id: &str) -> FullArtist {
         FullArtist {
             external_urls: HashMap::new(),
@@ -580,6 +582,20 @@ mod tests {
             assert_eq!(
                 item.open(queue.clone(), library.clone()).is_some(),
                 inner.open(queue.clone(), library.clone()).is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn a_section_row_saves_opens_and_shares_like_its_plain_row() {
+        let (queue, library) = setup();
+        for (plain, inner) in six().into_iter().zip(six()) {
+            let section = TopItem::Section(Box::new(inner));
+            assert_eq!(section.share_url(), plain.share_url());
+            assert_eq!(section.is_saved(&library), plain.is_saved(&library));
+            assert_eq!(
+                section.open(queue.clone(), library.clone()).is_some(),
+                plain.open(queue.clone(), library.clone()).is_some()
             );
         }
     }
