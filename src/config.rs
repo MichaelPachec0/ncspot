@@ -17,6 +17,8 @@ use crate::serialization::{CBOR, Serializer, TOML};
 
 pub const CACHE_VERSION: u16 = 1;
 pub const DEFAULT_COMMAND_KEY: char = ':';
+/// Rows of each kind shown in the search Top tab when the config does not say.
+pub const SEARCH_TOP_ROWS_PER_KIND: u32 = 3;
 
 /// The playback state when ncspot is started.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -93,6 +95,8 @@ pub struct ConfigValues {
     pub notify: Option<bool>,
     /// Show a desktop notification when Spotify rate limits ncspot (HTTP 429). Defaults to true.
     pub notify_rate_limit: Option<bool>,
+    /// Rows of each kind shown in the Top tab of a search; 0 shows none. Defaults to 3.
+    pub search_top_rows_per_kind: Option<u32>,
     pub bitrate: Option<u32>,
     pub gapless: Option<bool>,
     pub shuffle: Option<bool>,
@@ -799,6 +803,15 @@ mod test {
             Some(PERSONAL_ID),
             Some(ClientIdSource::Env)
         ));
+    }
+
+    #[test]
+    fn search_top_rows_per_kind_parses_and_is_optional() {
+        let values: ConfigValues =
+            toml::from_str("search_top_rows_per_kind = 5").expect("valid toml");
+        assert_eq!(values.search_top_rows_per_kind, Some(5));
+        let values: ConfigValues = toml::from_str("").expect("valid toml");
+        assert_eq!(values.search_top_rows_per_kind, None);
     }
 
     #[test]

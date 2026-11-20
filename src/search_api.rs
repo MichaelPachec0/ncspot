@@ -116,6 +116,25 @@ fn into_top_rows(rows: Rows) -> Vec<TopRow> {
     }
 }
 
+/// The first `per_kind` rows of each kind's first page, in tab order
+/// (Track, Album, Artist, Playlist, Show, Episode). A kind with no rows, or missing from
+/// `tabs`, is left out. `per_kind == 0` gives an empty list.
+pub fn section_rows(tabs: &HashMap<Kind, TabPage>, per_kind: usize) -> Vec<(Kind, Vec<TopRow>)> {
+    if per_kind == 0 {
+        return Vec::new();
+    }
+    Kind::ALL
+        .into_iter()
+        .filter_map(|kind| {
+            let rows: Vec<TopRow> = into_top_rows(tabs.get(&kind)?.rows.clone())
+                .into_iter()
+                .take(per_kind)
+                .collect();
+            (!rows.is_empty()).then_some((kind, rows))
+        })
+        .collect()
+}
+
 /// One place of the Top tab, in the answer's order.
 #[derive(Debug, Clone)]
 #[expect(
@@ -1428,6 +1447,106 @@ mod tests {
             name: id.to_string(),
             publisher: String::new(),
         }
+    }
+
+    /// An album row with nothing set but its id.
+    fn album_fixture(id: &str) -> SimplifiedAlbum {
+        SimplifiedAlbum {
+            id: Some(rspotify::model::AlbumId::from_id(id.to_string()).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// An episode row with nothing set but the id and name.
+    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    fn episode_fixture(id: &str) -> SimplifiedEpisode {
+        SimplifiedEpisode {
+            audio_preview_url: None,
+            description: String::new(),
+            duration: chrono::Duration::zero(),
+            explicit: false,
+            external_urls: HashMap::new(),
+            href: String::new(),
+            id: rspotify::model::EpisodeId::from_id(id.to_string()).unwrap(),
+            images: Vec::new(),
+            is_externally_hosted: false,
+            is_playable: true,
+            language: String::new(),
+            languages: Vec::new(),
+            name: id.to_string(),
+            release_date: String::new(),
+            release_date_precision: rspotify::model::DatePrecision::Day,
+            resume_point: None,
+        }
+    }
+
+    fn page_of(rows: Rows) -> TabPage {
+        TabPage {
+            rows,
+            next_offset: None,
+            total: 0,
+        }
+    }
+
+    fn section_pages() -> HashMap<Kind, TabPage> {
+        let ids = |prefix: &str, n: usize| -> Vec<String> {
+            (0..n).map(|i| format!("{prefix}{i}")).collect()
+        };
+        HashMap::from([
+            (
+                Kind::Track,
+                page_of(Rows::Tracks(
+                    ids("t", 5).iter().map(|i| full_track(i)).collect(),
+                )),
+            ),
+            (
+                Kind::Album,
+                page_of(Rows::Albums(
+                    ids("b", 2).iter().map(|i| album_fixture(i)).collect(),
+                )),
+            ),
+            (Kind::Artist, page_of(Rows::Artists(Vec::new()))),
+            (
+                Kind::Playlist,
+                page_of(Rows::Playlists(
+                    ids("p", 4).iter().map(|i| playlist(i)).collect(),
+                )),
+            ),
+            (
+                Kind::Episode,
+                page_of(Rows::Episodes(vec![episode_fixture("e0")])),
+            ),
+        ])
+    }
+
+    #[test]
+    fn section_rows_take_the_first_rows_of_each_kind_in_tab_order() {
+        let pages = section_pages();
+        let sections = section_rows(&pages, 3);
+        let kinds: Vec<Kind> = sections.iter().map(|(k, _)| *k).collect();
+        let lens: Vec<usize> = sections.iter().map(|(_, rows)| rows.len()).collect();
+        assert_eq!(
+            kinds,
+            [Kind::Track, Kind::Album, Kind::Playlist, Kind::Episode]
+        );
+        assert_eq!(lens, [3, 2, 3, 1]);
+        for (kind, rows) in &sections {
+            let all = into_top_rows(pages[kind].rows.clone());
+            for (at, row) in rows.iter().enumerate() {
+                assert_eq!(row.uri(), all[at].uri(), "{kind:?} row {at}");
+            }
+        }
+    }
+
+    #[test]
+    fn section_rows_with_zero_or_a_huge_count() {
+        let pages = section_pages();
+        assert!(section_rows(&pages, 0).is_empty());
+        let lens: Vec<usize> = section_rows(&pages, 1000)
+            .iter()
+            .map(|(_, rows)| rows.len())
+            .collect();
+        assert_eq!(lens, [5, 2, 4, 1]);
     }
 
     /// A fetch that answers with exactly the track and show rows of the uris it was asked;

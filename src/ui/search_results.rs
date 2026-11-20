@@ -1,6 +1,7 @@
 use crate::application::ASYNC_RUNTIME;
 use crate::command::Command;
 use crate::commands::CommandResult;
+use crate::config::SEARCH_TOP_ROWS_PER_KIND;
 use crate::events::{Event, EventManager};
 use crate::internal_api::search::Kind;
 use crate::library::Library;
@@ -12,7 +13,7 @@ use crate::model::show::Show;
 use crate::model::top_item::{TopItem, top_items};
 use crate::model::track::Track;
 use crate::queue::Queue;
-use crate::search_api::{FirstPage, NextPage, Rows, TabPage, TopDraft};
+use crate::search_api::{FirstPage, NextPage, Rows, TabPage, TopDraft, TopRow, section_rows};
 use crate::spotify::{Spotify, UriType};
 use crate::spotify_api::WebApi;
 use crate::spotify_url::SpotifyUrl;
@@ -48,6 +49,8 @@ pub struct SearchResultsView {
     /// Set by the search thread to ask for the move from Top to Tracks; applied and cleared
     /// on the next layout.
     to_tracks: Arc<AtomicBool>,
+    /// Rows of each kind in the Top tab, from the config when the view was built.
+    rows_per_kind: usize,
     tabs: TabbedView,
     spotify: Spotify,
     events: EventManager,
@@ -96,6 +99,15 @@ fn uri_tab(uri_type: UriType) -> usize {
     }
 }
 
+/// Rows of each kind the Top tab shows, from the config.
+fn rows_per_kind(library: &Library) -> usize {
+    library
+        .cfg
+        .values()
+        .search_top_rows_per_kind
+        .unwrap_or(SEARCH_TOP_ROWS_PER_KIND) as usize
+}
+
 /// The index of the Tracks tab in a view with a Top tab.
 const TRACKS_AFTER_TOP: usize = 1;
 
@@ -105,10 +117,11 @@ pub(crate) fn tracks_hop(asked: bool, moved_by_user: bool, has_top: bool) -> Opt
 }
 
 /// The Top tab's part of a finished internal first page: settle the strays with
-/// `fetch_strays`, write the rows once, and ask for the move to Tracks when no item row
-/// came of it.
+/// `fetch_strays`, write the rows and `sections` once, and ask for the move to Tracks when no
+/// item row (a section row counts) came of it.
 fn fill_top(
     mut top: TopDraft,
+    sections: Vec<(Kind, Vec<TopRow>)>,
     fetch_strays: impl FnOnce(&mut TopDraft),
     rows: &RwLock<Vec<TopItem>>,
     to_tracks: &AtomicBool,
@@ -116,7 +129,7 @@ fn fill_top(
     if top.has_strays() {
         fetch_strays(&mut top);
     }
-    let items = top_items(top.rows(), Vec::new(), top.featured());
+    let items = top_items(top.rows(), sections, top.featured());
     if !items.iter().any(TopItem::is_item) {
         to_tracks.store(true, Ordering::Relaxed);
     }
@@ -331,6 +344,7 @@ fn finish_text_search(
     top_rows: Option<&RwLock<Vec<TopItem>>>,
     to_tracks: &AtomicBool,
     term: &str,
+    rows_per_kind: usize,
     spotify: &Spotify,
     events: &EventManager,
     fetch_strays: impl FnOnce(&mut TopDraft),
@@ -343,6 +357,12 @@ fn finish_text_search(
             tabs: mut pages,
             top,
         } => {
+            // Cut before the fills, which take the pages out of the map.
+            let sections = if top_rows.is_some() {
+                section_rows(&pages, rows_per_kind)
+            } else {
+                Vec::new()
+            };
             tabs.tracks.fill(
                 pages.remove(&Kind::Track),
                 Kind::Track,
@@ -382,7 +402,7 @@ fn finish_text_search(
             );
             trigger();
             if let Some(rows) = top_rows {
-                fill_top(top, fetch_strays, rows, to_tracks);
+                fill_top(top, sections, fetch_strays, rows, to_tracks);
                 trigger();
             }
         }
@@ -415,6 +435,7 @@ impl SearchResultsView {
         library: Arc<Library>,
         with_top: bool,
     ) -> Self {
+        let rows_per_kind = rows_per_kind(&library);
         let results_tracks = Arc::new(RwLock::new(Vec::new()));
         let results_albums = Arc::new(RwLock::new(Vec::new()));
         let results_artists = Arc::new(RwLock::new(Vec::new()));
@@ -466,6 +487,7 @@ impl SearchResultsView {
             pagination_episodes,
             top,
             to_tracks: Arc::new(AtomicBool::new(false)),
+            rows_per_kind,
             tabs,
             spotify: queue.get_spotify(),
             events,
@@ -816,6 +838,7 @@ impl SearchResultsView {
         let events = self.events.clone();
         let top_rows = self.top.clone();
         let to_tracks = self.to_tracks.clone();
+        let rows_per_kind = self.rows_per_kind;
 
         std::thread::spawn(move || {
             let _activity = activity;
@@ -826,6 +849,7 @@ impl SearchResultsView {
                 top_rows.as_deref(),
                 &to_tracks,
                 &term,
+                rows_per_kind,
                 &spotify,
                 &events,
                 |draft| spotify.api.search_top_strays(draft),
@@ -967,12 +991,12 @@ impl ViewExt for SearchResultsView {
 mod tests {
     use super::*;
     use crate::command::{MoveAmount, MoveMode};
-    use crate::config::Config;
+    use crate::config::{Config, ConfigValues};
     use crate::model::playable::Playable;
     use crate::save_log::test_items;
     use crate::search_api::TopRow;
     use crate::ui::pagination::Position;
-    use rspotify::model::{AlbumId, SimplifiedAlbum};
+    use rspotify::model::{AlbumId, FullTrack, SimplifiedAlbum, TrackId, Type};
     use std::collections::HashMap;
 
     fn track(id: &str) -> Track {
@@ -1045,6 +1069,16 @@ mod tests {
     fn view(with_top: bool) -> SearchResultsView {
         let (ev, queue, library) = setup();
         SearchResultsView::build("x".into(), ev, queue, library, with_top)
+    }
+
+    /// Like `view(true)`, with a config holding `values`.
+    fn view_with_values(values: ConfigValues) -> SearchResultsView {
+        let cfg = Config::new_for_test_with_values(values);
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev.clone(), spotify.clone(), cfg.clone());
+        let queue = Arc::new(Queue::new(spotify, cfg, library.clone()));
+        SearchResultsView::build("x".into(), ev, queue, library, true)
     }
 
     fn tab_names(view: &SearchResultsView) -> Vec<String> {
@@ -1210,6 +1244,7 @@ mod tests {
             Some(&top),
             &flag,
             &term,
+            0,
             &spotify,
             &events,
             |_| panic!("no stray to fetch"),
@@ -1243,6 +1278,7 @@ mod tests {
         let flag = AtomicBool::new(false);
         fill_top(
             draft,
+            Vec::new(),
             |d| {
                 assert!(rows.read().is_empty(), "written before the strays settled");
                 d.settle(Kind::Album, Some(Rows::Albums(vec![album_row("b2")])));
@@ -1262,7 +1298,13 @@ mod tests {
         );
         let rows = RwLock::new(Vec::new());
         let flag = AtomicBool::new(false);
-        fill_top(draft, |_| panic!("no stray to fetch"), &rows, &flag);
+        fill_top(
+            draft,
+            Vec::new(),
+            |_| panic!("no stray to fetch"),
+            &rows,
+            &flag,
+        );
         assert_eq!(item_ids(&rows.read()), ["p1"]);
     }
 
@@ -1274,17 +1316,188 @@ mod tests {
         );
         let rows = RwLock::new(Vec::new());
         let flag = AtomicBool::new(false);
-        fill_top(draft, |d| d.settle(Kind::Album, None), &rows, &flag);
+        fill_top(
+            draft,
+            Vec::new(),
+            |d| d.settle(Kind::Album, None),
+            &rows,
+            &flag,
+        );
         assert!(rows.read().is_empty());
         assert!(flag.load(Ordering::Relaxed));
 
         let draft = TopDraft::for_test(Vec::new(), vec![test_items::playlist("f1")]);
         let flag = AtomicBool::new(false);
-        fill_top(draft, |_| {}, &rows, &flag);
+        fill_top(draft, Vec::new(), |_| {}, &rows, &flag);
         assert!(
             !flag.load(Ordering::Relaxed),
             "a featured playlist is an item row"
         );
+    }
+
+    /// A track row with nothing set but the id and name.
+    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    fn track_row(id: &str) -> FullTrack {
+        FullTrack {
+            album: SimplifiedAlbum::default(),
+            artists: Vec::new(),
+            available_markets: Vec::new(),
+            disc_number: 0,
+            duration: chrono::Duration::zero(),
+            explicit: false,
+            external_ids: HashMap::new(),
+            external_urls: HashMap::new(),
+            href: None,
+            id: Some(TrackId::from_id(id.to_string()).unwrap()),
+            is_local: false,
+            is_playable: None,
+            linked_from: None,
+            restrictions: None,
+            name: id.to_string(),
+            popularity: 0,
+            preview_url: None,
+            track_number: 0,
+            r#type: Type::Track,
+        }
+    }
+
+    #[test]
+    fn fill_top_writes_the_sections_between_the_top_rows_and_featured() {
+        let draft = TopDraft::for_test(
+            vec![Ok(TopRow::Album(album_row("b1")))],
+            vec![test_items::playlist("p9")],
+        );
+        let sections = vec![
+            (
+                Kind::Album,
+                vec![
+                    TopRow::Album(album_row("b1")),
+                    TopRow::Album(album_row("b2")),
+                ],
+            ),
+            (
+                Kind::Playlist,
+                vec![TopRow::Playlist(test_items::playlist("p1"))],
+            ),
+        ];
+        let rows = RwLock::new(Vec::new());
+        let flag = AtomicBool::new(false);
+        fill_top(draft, sections, |_| {}, &rows, &flag);
+        assert_eq!(
+            item_ids(&rows.read()),
+            ["b1", "rule", "b1", "b2", "rule", "p1", "rule", "p9"]
+        );
+        let items = rows.read();
+        assert!(matches!(&items[1], TopItem::Rule(label) if label == "Albums"));
+        assert!(matches!(&items[4], TopItem::Rule(label) if label == "Playlists"));
+        assert!(matches!(&items[6], TopItem::Rule(label) if label == "Featured playlists"));
+    }
+
+    #[test]
+    fn fill_top_shows_the_sections_when_the_stray_fetch_fails() {
+        let draft = TopDraft::for_test(
+            vec![Err((Kind::Album, "spotify:album:b2".into()))],
+            Vec::new(),
+        );
+        let sections = vec![(Kind::Album, vec![TopRow::Album(album_row("b1"))])];
+        let rows = RwLock::new(Vec::new());
+        let flag = AtomicBool::new(false);
+        fill_top(
+            draft,
+            sections,
+            |d| d.settle(Kind::Album, None),
+            &rows,
+            &flag,
+        );
+        assert_eq!(item_ids(&rows.read()), ["rule", "b1"]);
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_top_tab_with_only_section_rows_does_not_ask_for_tracks() {
+        let sections = vec![(Kind::Album, vec![TopRow::Album(album_row("b1"))])];
+        let rows = RwLock::new(Vec::new());
+        let flag = AtomicBool::new(false);
+        fill_top(TopDraft::default(), sections, |_| {}, &rows, &flag);
+        assert_eq!(item_ids(&rows.read()), ["rule", "b1"]);
+        assert!(!flag.load(Ordering::Relaxed));
+    }
+
+    /// An internal first page of 5 tracks (t0..t4) and 2 albums (b0, b1), other kinds empty.
+    fn tracks_and_albums_page() -> FirstPage {
+        let tabs = Kind::ALL
+            .into_iter()
+            .map(|kind| {
+                let rows = match kind {
+                    Kind::Track => {
+                        Rows::Tracks((0..5).map(|i| track_row(&format!("t{i}"))).collect())
+                    }
+                    Kind::Album => {
+                        Rows::Albums((0..2).map(|i| album_row(&format!("b{i}"))).collect())
+                    }
+                    _ => Rows::empty(kind),
+                };
+                let page = TabPage {
+                    rows,
+                    next_offset: None,
+                    total: 0,
+                };
+                (kind, page)
+            })
+            .collect();
+        FirstPage::Internal {
+            tabs,
+            top: TopDraft::default(),
+        }
+    }
+
+    /// Run `finish_text_search` on `view`'s handles for `page` with `rows_per_kind`.
+    fn finish_with_count(view: &SearchResultsView, page: FirstPage, rows_per_kind: usize) {
+        finish_text_search(
+            page,
+            view.search_tabs(),
+            view.top.as_deref(),
+            &view.to_tracks,
+            &view.search_term,
+            rows_per_kind,
+            &view.spotify,
+            &view.events,
+            |_| panic!("no stray to fetch"),
+            || {},
+            |_| panic!("no Web API search"),
+        );
+    }
+
+    #[test]
+    fn the_text_search_cuts_the_sections_and_still_fills_every_tab_row() {
+        let view = view(true);
+        finish_with_count(&view, tracks_and_albums_page(), 3);
+        assert_eq!(view.results_tracks.read().len(), 5);
+        assert_eq!(view.results_albums.read().len(), 2);
+        assert_eq!(
+            item_ids(&view.top.as_ref().unwrap().read()),
+            ["rule", "t0", "t1", "t2", "rule", "b0", "b1"]
+        );
+        assert!(!view.to_tracks.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn rows_per_kind_zero_gives_the_top_tab_without_sections() {
+        let view = view(true);
+        finish_with_count(&view, tracks_and_albums_page(), 0);
+        assert_eq!(view.results_tracks.read().len(), 5);
+        assert!(view.top.as_ref().unwrap().read().is_empty());
+        assert!(view.to_tracks.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_search_view_takes_its_rows_per_kind_from_the_config() {
+        let values = ConfigValues {
+            search_top_rows_per_kind: Some(5),
+            ..Default::default()
+        };
+        assert_eq!(view_with_values(values).rows_per_kind, 5);
+        assert_eq!(view_with_values(ConfigValues::default()).rows_per_kind, 3);
     }
 
     #[test]
@@ -1410,6 +1623,7 @@ mod tests {
             view.top.as_deref(),
             &view.to_tracks,
             &view.search_term,
+            0,
             &view.spotify,
             &view.events,
             |draft| {
