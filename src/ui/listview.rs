@@ -1754,16 +1754,14 @@ mod draw_test {
 
     #[test]
     fn in_list_search_skips_every_rule() {
-        let (list, _content) = list_of(vec![
-            rule("find"),
-            row("x1"),
-            rule("find"),
-            row("find x3"),
-            rule("find"),
-            rule("find"),
-            row("x4"),
-        ]);
-        assert_eq!(list.get_indexes_of("find"), vec![3]);
+        let (list, content) = list_a();
+        for p in content.write().iter_mut() {
+            // The word is in the left text of every rule row and of x3.
+            if p.rule.is_some() || p.id == "x3" {
+                p.id = format!("find {}", p.id);
+            }
+        }
+        assert_eq!(list.get_indexes_of("find"), vec![4]);
     }
 
     #[test]
@@ -1845,13 +1843,21 @@ mod draw_test {
         assert_eq!(list.get_selected_index(), 0);
         assert_eq!(offset_y(&list), 0);
 
-        let mut rows: Vec<Probe> = (1..=20).map(|i| row(&format!("x{i}"))).collect();
-        rows.push(rule("R"));
-        rows.extend((21..=40).map(|i| row(&format!("x{i}"))));
-        let (mut list, _content) = list_of(rows);
-        list.layout(Vec2::new(40, 10));
+        // List C: a rule row after row 20, no leading rule.
+        let list_c = || {
+            let mut rows: Vec<Probe> = (1..=20).map(|i| row(&format!("x{i}"))).collect();
+            rows.push(rule("R"));
+            rows.extend((21..=40).map(|i| row(&format!("x{i}"))));
+            let (mut list, _content) = list_of(rows);
+            list.layout(Vec2::new(40, 10));
+            list
+        };
+        // (a) from the top
+        let mut list = list_c();
         list.move_focus_to(21);
         assert_eq!(offset_y(&list), 12);
+        // (b) after going to the bottom
+        let mut list = list_c();
         list.move_focus_to(40);
         assert_eq!(offset_y(&list), 31);
         list.move_focus_to(21);
