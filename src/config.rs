@@ -815,6 +815,16 @@ mod test {
     }
 
     #[test]
+    fn a_bad_search_top_rows_per_kind_value_fails_to_parse() {
+        for text in [
+            "search_top_rows_per_kind = -1",
+            "search_top_rows_per_kind = \"three\"",
+        ] {
+            assert!(toml::from_str::<ConfigValues>(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
     fn notify_rate_limit_parses_and_defaults_to_unset() {
         let values: ConfigValues = toml::from_str("notify_rate_limit = false").expect("valid toml");
         assert_eq!(values.notify_rate_limit, Some(false));

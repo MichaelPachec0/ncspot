@@ -833,6 +833,18 @@ impl SearchResultsView {
         // Taken here so the app does not look idle between the search command and the first
         // request; dropped once the tabs are written.
         let activity = crate::activity::ACTIVITY.begin();
+        let spotify = self.spotify.clone();
+        let finish = self.text_search_finish(term.clone());
+
+        std::thread::spawn(move || {
+            let _activity = activity;
+            finish(spotify.api.search_first_page(&term));
+        });
+    }
+
+    /// What [SearchResultsView::search_text] runs on its thread once the first page for
+    /// `term` is in: [finish_text_search] on this view's handles and row count.
+    fn text_search_finish(&self, term: String) -> impl FnOnce(FirstPage) + Send + 'static {
         let tabs = self.search_tabs();
         let spotify = self.spotify.clone();
         let events = self.events.clone();
@@ -840,9 +852,7 @@ impl SearchResultsView {
         let to_tracks = self.to_tracks.clone();
         let rows_per_kind = self.rows_per_kind;
 
-        std::thread::spawn(move || {
-            let _activity = activity;
-            let page = spotify.api.search_first_page(&term);
+        move |page| {
             finish_text_search(
                 page,
                 tabs,
@@ -859,7 +869,7 @@ impl SearchResultsView {
                     Self::search_web_api(&spotify, &events, tabs, &term);
                 },
             );
-        });
+        }
     }
 
     /// Today's six Web API searches, one thread per tab.
@@ -1491,6 +1501,17 @@ mod tests {
     }
 
     #[test]
+    fn the_text_search_cuts_the_sections_at_the_views_own_row_count() {
+        let mut view = view(true);
+        view.rows_per_kind = 1;
+        view.text_search_finish("x".into())(tracks_and_albums_page());
+        assert_eq!(
+            item_ids(&view.top.as_ref().unwrap().read()),
+            ["rule", "t0", "rule", "b0"]
+        );
+    }
+
+    #[test]
     fn a_search_view_takes_its_rows_per_kind_from_the_config() {
         let values = ConfigValues {
             search_top_rows_per_kind: Some(5),
@@ -1544,6 +1565,30 @@ mod tests {
         list.on_command(&mut siv, &Command::Play).unwrap();
         let ids: Vec<Option<String>> = queue.list().read().iter().map(|p| p.id()).collect();
         assert_eq!(ids, [Some("t1".to_string())]);
+    }
+
+    #[test]
+    fn enter_on_a_section_track_in_the_top_list_plays_only_that_track() {
+        let (_ev, queue, library) = setup();
+        let section =
+            |id: &str| TopItem::Section(Box::new(TopItem::Track(test_items::playable_track(id))));
+        let content = Arc::new(RwLock::new(vec![
+            TopItem::Track(test_items::playable_track("t1")),
+            TopItem::Artist(test_items::artist("a1", "A", false)),
+            TopItem::Rule("Tracks".into()),
+            section("t1"),
+            section("t2"),
+            section("t3"),
+            TopItem::Rule("Featured playlists".into()),
+            TopItem::Featured(test_items::playlist("f1")),
+        ]));
+        let mut list = ListView::new(content, queue.clone(), library);
+        list.move_focus_to(4);
+        assert_eq!(list.get_selected_index(), 4);
+        let mut siv = Cursive::new();
+        list.on_command(&mut siv, &Command::Play).unwrap();
+        let ids: Vec<Option<String>> = queue.list().read().iter().map(|p| p.id()).collect();
+        assert_eq!(ids, [Some("t2".to_string())]);
     }
 
     #[test]
