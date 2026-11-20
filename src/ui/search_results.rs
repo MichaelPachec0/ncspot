@@ -116,7 +116,7 @@ fn fill_top(
     if top.has_strays() {
         fetch_strays(&mut top);
     }
-    let items = top_items(top.rows(), top.featured());
+    let items = top_items(top.rows(), Vec::new(), top.featured());
     if !items.iter().any(TopItem::is_item) {
         to_tracks.store(true, Ordering::Relaxed);
     }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::internal_api::search::Kind;
 use crate::library::Library;
 use crate::model::album::Album;
 use crate::model::artist::Artist;
@@ -22,8 +23,11 @@ pub enum TopItem {
     Episode(Episode),
     /// A featured playlist: drawn without a kind word.
     Featured(Playlist),
-    /// The rule line above the featured playlists.
-    Rule,
+    /// A row of a kind's section: drawn without a kind word, otherwise the wrapped row.
+    /// Only ever wraps Track, Album, Artist, Playlist, Show or Episode.
+    Section(Box<Self>),
+    /// A rule line with this label.
+    Rule(String),
 }
 
 /// The label of the rule line above the featured playlists.
@@ -42,12 +46,52 @@ impl From<TopRow> for TopItem {
     }
 }
 
-/// The rows of the Top tab: `rows`, then, only if `featured` is not empty, `Rule` and
-/// the featured playlists.
-pub fn top_items(rows: Vec<TopRow>, featured: &[Playlist]) -> Vec<TopItem> {
+/// The label of a kind's section: its tab name.
+pub fn section_label(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Track => "Tracks",
+        Kind::Album => "Albums",
+        Kind::Artist => "Artists",
+        Kind::Playlist => "Playlists",
+        Kind::Show => "Shows",
+        Kind::Episode => "Episodes",
+    }
+}
+
+/// The rows of the Top tab: `rows`; then for each section, in the order given,
+/// `Rule(section_label(kind))` and its rows as `Section`; then, only if `featured` is not
+/// empty, `Rule(FEATURED_LABEL)` and the featured playlists. A section without rows is
+/// skipped.
+pub fn top_items(
+    rows: Vec<TopRow>,
+    sections: Vec<(Kind, Vec<TopRow>)>,
+    featured: &[Playlist],
+) -> Vec<TopItem> {
     let mut items: Vec<TopItem> = rows.into_iter().map(TopItem::from).collect();
+    for (kind, rows) in sections {
+        if rows.is_empty() {
+            continue;
+        }
+        items.push(TopItem::Rule(section_label(kind).to_string()));
+        for row in rows {
+            let item = TopItem::from(row);
+            debug_assert!(
+                matches!(
+                    item,
+                    TopItem::Track(_)
+                        | TopItem::Album(_)
+                        | TopItem::Artist(_)
+                        | TopItem::Playlist(_)
+                        | TopItem::Show(_)
+                        | TopItem::Episode(_)
+                ),
+                "a section wraps one of the six row variants"
+            );
+            items.push(TopItem::Section(Box::new(item)));
+        }
+    }
     if !featured.is_empty() {
-        items.push(TopItem::Rule);
+        items.push(TopItem::Rule(FEATURED_LABEL.to_string()));
         items.extend(featured.iter().cloned().map(TopItem::Featured));
     }
     items
@@ -56,7 +100,7 @@ pub fn top_items(rows: Vec<TopRow>, featured: &[Playlist]) -> Vec<TopItem> {
 impl TopItem {
     /// Whether this is an item row (anything but `Rule`).
     pub fn is_item(&self) -> bool {
-        !matches!(self, Self::Rule)
+        !matches!(self, Self::Rule(_))
     }
 
     /// The model inside, `None` for the rule.
@@ -68,7 +112,8 @@ impl TopItem {
             Self::Playlist(i) | Self::Featured(i) => Some(i),
             Self::Show(i) => Some(i),
             Self::Episode(i) => Some(i),
-            Self::Rule => None,
+            Self::Section(i) => i.inner(),
+            Self::Rule(_) => None,
         }
     }
 
@@ -81,7 +126,8 @@ impl TopItem {
             Self::Playlist(i) | Self::Featured(i) => Some(i),
             Self::Show(i) => Some(i),
             Self::Episode(i) => Some(i),
-            Self::Rule => None,
+            Self::Section(i) => i.inner_mut(),
+            Self::Rule(_) => None,
         }
     }
 }
@@ -172,7 +218,20 @@ impl ListItem for TopItem {
     }
 
     fn rule_label(&self) -> Option<String> {
-        matches!(self, Self::Rule).then(|| FEATURED_LABEL.to_string())
+        match self {
+            Self::Rule(label) => Some(label.clone()),
+            _ => None,
+        }
+    }
+
+    fn display_center(&self, library: &Library) -> String {
+        match self {
+            Self::Section(i) => i
+                .inner()
+                .map(|m| m.display_center(library))
+                .unwrap_or_default(),
+            _ => String::new(),
+        }
     }
 
     fn display_tag(&self, _library: &Library) -> Option<String> {
@@ -183,7 +242,7 @@ impl ListItem for TopItem {
             Self::Playlist(_) => "Playlist",
             Self::Show(_) => "Show",
             Self::Episode(_) => "Episode",
-            Self::Featured(_) | Self::Rule => return None,
+            Self::Featured(_) | Self::Section(_) | Self::Rule(_) => return None,
         };
         Some(word.to_string())
     }
@@ -209,6 +268,7 @@ impl ListItem for TopItem {
             (Self::Show(a), Self::Show(b)) => a.merge_loaded(b),
             (Self::Episode(a), Self::Episode(b)) => a.merge_loaded(b),
             (Self::Featured(a), Self::Featured(b)) => a.merge_loaded(b),
+            (Self::Section(a), Self::Section(b)) => a.merge_loaded(*b),
             _ => {}
         }
     }
@@ -222,7 +282,7 @@ impl ListItem for TopItem {
     fn as_listitem(&self) -> Box<dyn ListItem> {
         match self.inner() {
             Some(i) => i.as_listitem(),
-            None => Box::new(Self::Rule),
+            None => Box::new(self.clone()),
         }
     }
 }
@@ -238,6 +298,60 @@ mod tests {
     };
     use crate::spotify::Spotify;
     use crate::ui::contextmenu::ContextMenu;
+    use rspotify::model::{
+        AlbumId, ArtistId, FullArtist, FullTrack, SimplifiedAlbum, TrackId, Type,
+    };
+    use std::collections::HashMap;
+
+    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    fn full_track(id: &str) -> FullTrack {
+        FullTrack {
+            album: SimplifiedAlbum::default(),
+            artists: Vec::new(),
+            available_markets: Vec::new(),
+            disc_number: 0,
+            duration: chrono::Duration::zero(),
+            explicit: false,
+            external_ids: HashMap::new(),
+            external_urls: HashMap::new(),
+            href: None,
+            id: Some(TrackId::from_id(id.to_string()).unwrap()),
+            is_local: false,
+            is_playable: Some(true),
+            linked_from: None,
+            restrictions: None,
+            name: id.to_string(),
+            popularity: 0,
+            preview_url: None,
+            track_number: 0,
+            r#type: Type::Track,
+        }
+    }
+
+    #[allow(deprecated)] // rspotify marks fields Spotify removed as deprecated; they must be set.
+    fn full_artist(id: &str) -> FullArtist {
+        FullArtist {
+            external_urls: HashMap::new(),
+            followers: Default::default(),
+            genres: Vec::new(),
+            href: String::new(),
+            id: ArtistId::from_id(id.to_string()).unwrap(),
+            images: Vec::new(),
+            name: id.to_string(),
+            popularity: 0,
+        }
+    }
+
+    fn album_row(id: &str) -> SimplifiedAlbum {
+        SimplifiedAlbum {
+            id: Some(AlbumId::from_id(id.to_string()).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    fn section_track(id: &str) -> TopItem {
+        TopItem::Section(Box::new(TopItem::from(TopRow::Track(full_track(id)))))
+    }
 
     fn setup_with(cfg: Arc<Config>) -> (Arc<Queue>, Arc<Library>) {
         let ev = EventManager::new_for_test();
@@ -273,7 +387,8 @@ mod tests {
                 TopItem::Show(_) => "show",
                 TopItem::Episode(_) => "episode",
                 TopItem::Featured(_) => "featured",
-                TopItem::Rule => "rule",
+                TopItem::Section(inner) => kinds(std::slice::from_ref(inner))[0],
+                TopItem::Rule(_) => "rule",
             })
             .collect()
     }
@@ -289,12 +404,15 @@ mod tests {
     fn top_items_put_the_rule_before_featured_and_omit_it_without_featured() {
         let featured = [playlist("f1"), playlist("f2")];
         assert_eq!(
-            kinds(&top_items(rows(), &featured)),
+            kinds(&top_items(rows(), Vec::new(), &featured)),
             ["playlist", "playlist", "rule", "featured", "featured"]
         );
-        assert_eq!(kinds(&top_items(rows(), &[])), ["playlist", "playlist"]);
         assert_eq!(
-            kinds(&top_items(Vec::new(), &featured)),
+            kinds(&top_items(rows(), Vec::new(), &[])),
+            ["playlist", "playlist"]
+        );
+        assert_eq!(
+            kinds(&top_items(Vec::new(), Vec::new(), &featured)),
             ["rule", "featured", "featured"]
         );
     }
@@ -322,7 +440,10 @@ mod tests {
             TopItem::Featured(playlist("f1")).display_tag(&library),
             None
         );
-        assert_eq!(TopItem::Rule.display_tag(&library), None);
+        assert_eq!(
+            TopItem::Rule(FEATURED_LABEL.into()).display_tag(&library),
+            None
+        );
     }
 
     #[test]
@@ -358,7 +479,7 @@ mod tests {
     #[test]
     fn the_rule_row_is_inert() {
         let (queue, library) = setup();
-        let mut rule = TopItem::Rule;
+        let mut rule = TopItem::Rule(FEATURED_LABEL.into());
         assert_eq!(rule.rule_label().as_deref(), Some(FEATURED_LABEL));
         assert!(!rule.is_item());
         assert!(rule.id().is_none());
@@ -469,5 +590,140 @@ mod tests {
                 inner.open(queue.clone(), library.clone()).is_some()
             );
         }
+    }
+
+    #[test]
+    fn top_items_put_sections_between_the_rows_and_featured() {
+        let (_queue, library) = setup();
+        let mixed = vec![
+            TopRow::Artist(full_artist("a1")),
+            TopRow::Track(full_track("t1")),
+        ];
+        let sections = vec![
+            (
+                Kind::Track,
+                vec![
+                    TopRow::Track(full_track("t2")),
+                    TopRow::Track(full_track("t3")),
+                ],
+            ),
+            (Kind::Album, vec![TopRow::Album(album_row("b1"))]),
+        ];
+        let featured = [playlist("f1")];
+        let items = top_items(mixed, sections, &featured);
+        assert_eq!(
+            kinds(&items),
+            [
+                "artist", "track", "rule", "track", "track", "rule", "album", "rule", "featured"
+            ]
+        );
+        let labels: Vec<String> = items.iter().filter_map(|i| i.rule_label()).collect();
+        assert_eq!(labels, ["Tracks", "Albums", FEATURED_LABEL]);
+        let tagged: Vec<bool> = items
+            .iter()
+            .filter(|i| i.is_item())
+            .map(|i| i.display_tag(&library).is_some())
+            .collect();
+        assert_eq!(tagged, [true, true, false, false, false, false]);
+    }
+
+    #[test]
+    fn top_items_skip_an_empty_section() {
+        let sections = vec![
+            (Kind::Track, Vec::new()),
+            (Kind::Album, vec![TopRow::Album(album_row("b1"))]),
+        ];
+        let items = top_items(Vec::new(), sections, &[]);
+        assert_eq!(kinds(&items), ["rule", "album"]);
+        assert_eq!(items[0].rule_label().as_deref(), Some("Albums"));
+    }
+
+    #[test]
+    fn a_section_row_has_no_tag_and_looks_like_its_tab_row() {
+        let (_queue, library) = setup();
+        let mut row = full_track("t1");
+        row.album.name = "Some Album".into();
+        let model = Track::from(&row);
+        let plain = TopItem::Track(model.clone());
+        let section = TopItem::Section(Box::new(TopItem::from(TopRow::Track(row))));
+        assert_eq!(section.display_tag(&library), None);
+        assert_eq!(section.display_left(&library), model.display_left(&library));
+        assert_eq!(
+            section.display_center(&library),
+            model.display_center(&library)
+        );
+        assert_eq!(
+            section.display_right(&library),
+            model.display_right(&library)
+        );
+        assert_ne!(section.display_center(&library), "");
+        assert_eq!(plain.display_center(&library), "");
+        assert_eq!(section.id(), plain.id());
+        assert_eq!(section.is_playable(), plain.is_playable());
+        assert!(section.track().is_some());
+        let artist = TopItem::Section(Box::new(TopItem::from(TopRow::Artist(full_artist("a1")))));
+        assert!(artist.track().is_none());
+    }
+
+    #[test]
+    fn a_section_track_shows_a_custom_center_format() {
+        let values = ConfigValues {
+            track_format: Some(TrackFormat {
+                left: None,
+                center: Some("%title".into()),
+                right: None,
+            }),
+            ..Default::default()
+        };
+        let (_queue, library) = setup_with(Config::new_for_test_with_values(values));
+        let section = section_track("t1");
+        assert_eq!(section.display_center(&library), "t1");
+    }
+
+    #[test]
+    fn enter_on_a_section_track_plays_that_one_track() {
+        let (queue, _library) = setup();
+        let mut item = section_track("t1");
+        item.play(&queue);
+        let list = queue.list();
+        let list = list.read();
+        assert_eq!(list.len(), 1);
+        assert!(matches!(&list[0], Playable::Track(t) if t.id.as_deref() == Some("t1")));
+    }
+
+    #[test]
+    fn a_section_track_offers_play_next_and_queue() {
+        let (queue, library) = setup();
+        let item = section_track("t1").as_listitem();
+        let mut menu = ContextMenu::new(item.as_ref(), queue, library);
+        let labels = menu.get_mut().labels_for_test();
+        assert!(labels.iter().any(|l| l == "Play next"), "{labels:?}");
+        assert!(labels.iter().any(|l| l == "Queue"), "{labels:?}");
+    }
+
+    #[test]
+    fn section_labels_are_the_tab_names() {
+        let labels: Vec<&str> = [
+            Kind::Track,
+            Kind::Album,
+            Kind::Artist,
+            Kind::Playlist,
+            Kind::Show,
+            Kind::Episode,
+        ]
+        .into_iter()
+        .map(section_label)
+        .collect();
+        assert_eq!(
+            labels,
+            [
+                "Tracks",
+                "Albums",
+                "Artists",
+                "Playlists",
+                "Shows",
+                "Episodes"
+            ]
+        );
     }
 }
