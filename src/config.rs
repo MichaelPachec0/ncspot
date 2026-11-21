@@ -18,7 +18,7 @@ use crate::serialization::{CBOR, Serializer, TOML};
 pub const CACHE_VERSION: u16 = 1;
 pub const DEFAULT_COMMAND_KEY: char = ':';
 /// Rows of each kind shown in the search Top tab when the config does not say.
-pub const SEARCH_TOP_ROWS_PER_KIND: u32 = 3;
+pub const SEARCH_TOP_ROWS_PER_KIND: u32 = 6;
 
 /// The playback state when ncspot is started.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]

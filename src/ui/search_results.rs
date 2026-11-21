@@ -1589,7 +1589,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(view_with_values(values).rows_per_kind, 5);
-        assert_eq!(view_with_values(ConfigValues::default()).rows_per_kind, 3);
+        assert_eq!(view_with_values(ConfigValues::default()).rows_per_kind, 6);
     }
 
     #[test]
