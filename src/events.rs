@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender, TryIter, unbounded};
@@ -53,6 +55,8 @@ pub struct EventManager {
     tx: Sender<Event>,
     rx: Receiver<Event>,
     cursive_sink: CbSink,
+    /// Set by the player worker while a track plays, taken by the event loop.
+    playback_tick: Arc<AtomicBool>,
 }
 
 impl EventManager {
@@ -84,7 +88,20 @@ impl EventManager {
             tx,
             rx,
             cursive_sink,
+            playback_tick: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Note that playback moved on. Unlike [EventManager::trigger] this does not wake the
+    /// Cursive event loop, which would redraw the whole screen: the main loop takes the note
+    /// and redraws only the parts that show the playback position.
+    pub fn playback_tick(&self) {
+        self.playback_tick.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether playback moved on since the last call.
+    pub fn take_playback_tick(&self) -> bool {
+        self.playback_tick.swap(false, Ordering::Relaxed)
     }
 
     /// Return a non-blocking iterator over the messages awaiting handling. Calling `next()` on the
@@ -111,6 +128,15 @@ impl EventManager {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn a_playback_tick_is_taken_once_and_shared_by_clones() {
+        let events = EventManager::new_for_test();
+        assert!(!events.take_playback_tick());
+        events.clone().playback_tick();
+        assert!(events.take_playback_tick());
+        assert!(!events.take_playback_tick());
+    }
 
     #[test]
     fn try_trigger_returns_false_when_the_ui_is_gone() {

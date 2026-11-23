@@ -115,6 +115,12 @@ pub trait ViewExt: View {
 
     fn on_leave(&self) {}
 
+    /// Whether the view shows the playback position, and so is redrawn as a track plays.
+    /// Other views are only redrawn on input and on their own redraw requests.
+    fn follows_playback(&self) -> bool {
+        false
+    }
+
     /// State reported to the drive harness; `None` for views it does not inspect.
     #[cfg(feature = "harness")]
     fn harness_state(&self) -> Option<crate::harness::HarnessState> {
@@ -141,6 +147,10 @@ impl<V: ViewExt> ViewExt for NamedView<V> {
 
     fn on_leave(&self) {
         self.with_view(|v| v.on_leave());
+    }
+
+    fn follows_playback(&self) -> bool {
+        self.with_view(|v| v.follows_playback()).unwrap_or(false)
     }
 
     #[cfg(feature = "harness")]
@@ -236,6 +246,10 @@ impl ViewExt for BoxedViewExt {
 
     fn on_leave(&self) {
         self.boxed_view.on_leave();
+    }
+
+    fn follows_playback(&self) -> bool {
+        self.boxed_view.follows_playback()
     }
 
     #[cfg(feature = "harness")]

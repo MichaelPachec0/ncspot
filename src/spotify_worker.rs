@@ -275,8 +275,9 @@ impl Worker {
                 },
                 // Update animated parts of the UI (e.g. statusbar during playback).
                 _ = ui_refresh.tick() => {
-                    if !matches!(self.player_status, PlayerStatus::Stopped) {
-                        self.events.trigger();
+                    // Nothing moves while paused, so only a playing track needs the redraw.
+                    if matches!(self.player_status, PlayerStatus::Playing) {
+                        self.events.playback_tick();
                     }
 
                     // Stall watchdog: a play request with no `Playing` event after a while is
