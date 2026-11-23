@@ -148,10 +148,13 @@ impl CoverView {
         }
 
         let download_url = url.clone();
+        let library = self.library.clone();
         spawn_download(self.loading.clone(), url, move || {
             if let Err(e) = crate::utils::download(download_url, path) {
                 error!("Failed to download cover: {e}");
             }
+            // The cover is drawn by the next draw of this view: ask for one.
+            library.trigger_redraw();
         });
 
         None
