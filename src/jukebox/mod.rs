@@ -114,6 +114,9 @@ struct JukeboxInner {
     settings: RwLock<JukeboxSettings>,
     state: RwLock<Option<SongState>>,
     seek_request: Mutex<Option<usize>>,
+    /// Set when the jukebox view draws, taken by the driver when it asks for a redraw: while
+    /// the view is hidden nothing sets it again, so playback progress costs no redraws.
+    view_drawn: AtomicBool,
 }
 
 impl JukeboxInner {
@@ -127,6 +130,7 @@ impl JukeboxInner {
             settings: RwLock::new(settings),
             state: RwLock::new(None),
             seek_request: Mutex::new(None),
+            view_drawn: AtomicBool::new(false),
         }
     }
 }
@@ -189,6 +193,10 @@ impl Jukebox {
         let mut g = self.inner.view_mode.write();
         *g = g.next();
         *g
+    }
+    /// Tell the driver the jukebox view is on screen and wants redraws as the song advances.
+    pub fn mark_view_drawn(&self) {
+        self.inner.view_drawn.store(true, Ordering::Relaxed);
     }
     pub fn graphics_enabled(&self) -> bool {
         self.inner.graphics.load(Ordering::Relaxed)
@@ -324,6 +332,8 @@ fn run_driver_loop(
     let mut seek_cooldown: u32 = 0;
     let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
     let mut retry = AnalysisRetry::default();
+    // What the view showed at the last redraw request; `None` forces the next one.
+    let mut shown: Option<Shown> = None;
 
     loop {
         std::thread::sleep(Duration::from_millis(TICK_MS));
@@ -377,6 +387,7 @@ fn run_driver_loop(
             match build_driver(&analysis, &cfg, &eff, &id, seed) {
                 Ok((d, g)) => {
                     driver = Some(d);
+                    shown = None;
                     current_graph = g;
                     current_title = playable.track().map(|t| t.title).unwrap_or_default();
                     current_effective = eff;
@@ -409,6 +420,7 @@ fn run_driver_loop(
             };
             if let Ok((d, g)) = build_driver(&analysis, &cfg, &eff, &id, seed | 2) {
                 driver = Some(d);
+                shown = None;
                 current_graph = g;
                 current_effective = eff;
                 current_source = src;
@@ -439,23 +451,55 @@ fn run_driver_loop(
             }
         }
 
-        *inner.state.write() = Some(SongState {
-            track_title: current_title.clone(),
-            graph: current_graph.clone(),
+        let listen_time_ms = started.elapsed().as_millis() as u64;
+        let bouncing = inner.bouncing.load(Ordering::Relaxed);
+        let now = Shown {
             current_beat: d.current_beat().unwrap_or(0),
             beats_played: d.beats_played(),
             jumps: d.jumps(),
+            branch_chance: d.branch_chance().to_bits(),
+            listen_secs: listen_time_ms / 1000,
+            last_branch: d.last_branch().map(|e| (e.source, e.destination)),
+            bouncing,
+        };
+        // The tick is much faster than anything the view shows changes: publish and redraw
+        // only on a visible change, and redraw only while the view is on screen.
+        if shown == Some(now) {
+            continue;
+        }
+        shown = Some(now);
+
+        *inner.state.write() = Some(SongState {
+            track_title: current_title.clone(),
+            graph: current_graph.clone(),
+            current_beat: now.current_beat,
+            beats_played: now.beats_played,
+            jumps: now.jumps,
             branch_chance: d.branch_chance(),
-            listen_time_ms: started.elapsed().as_millis() as u64,
+            listen_time_ms,
             last_branch: d.last_branch(),
-            bouncing: inner.bouncing.load(Ordering::Relaxed),
+            bouncing,
             no_analysis: false,
             effective: current_effective.clone(),
             source: current_source,
             per_song: current_partial.clone(),
         });
-        events.trigger();
+        if inner.view_drawn.swap(false, Ordering::Relaxed) {
+            events.trigger();
+        }
     }
+}
+
+/// The parts of the published state that change while a song plays, as the view shows them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Shown {
+    current_beat: usize,
+    beats_played: u64,
+    jumps: u64,
+    branch_chance: u64,
+    listen_secs: u64,
+    last_branch: Option<(usize, usize)>,
+    bouncing: bool,
 }
 
 #[cfg(test)]
