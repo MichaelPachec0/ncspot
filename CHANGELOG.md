@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Top tab in search with Spotify's top results and featured playlists
+- Per-kind sections in the search Top tab; `search_top_rows_per_kind` sets how many rows each shows
 - Playlist folders and pinned playlists in the Playlists tab
 - Save episodes to Your Episodes from their context menu
 - `u` updates only the current library tab
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The tab bar scrolls and marks hidden tabs with `<-` and `->` when the tab titles do not fit
 - Playlists load over Spotify's internal API, including Spotify-owned playlists
 - Saving and removing tracks, albums, artists and shows goes through Spotify's internal API
 - Library saves no longer freeze the UI, work during a library update, and are undone with a note if they fail

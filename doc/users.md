@@ -355,6 +355,7 @@ Possible configuration values are:
 | `default_keybindings`           | Enable default keybindings                                     | `true`, `false`                                                                       | `false`             |
 | `notify`<sup>[4]</sup>          | Enable desktop notifications                                   | `true`, `false`                                                                       | `false`             |
 | `notify_rate_limit`<sup>[4]</sup> | Notify when Spotify rate limits ncspot (HTTP 429)            | `true`, `false`                                                                       | `true`              |
+| `search_top_rows_per_kind`      | Rows of each kind shown in the Top tab of a search (0 shows none) | Number                                                                             | `6`                 |
 | `bitrate`                       | Audio bitrate to use for streaming                             | `96`, `160`, `320`                                                                    | `320`               |
 | `gapless`                       | Enable gapless playback                                        | `true`, `false`                                                                       | `true`              |
 | `shuffle`                       | Set default shuffle state                                      | `true`, `false`                                                                       | `false`             |
