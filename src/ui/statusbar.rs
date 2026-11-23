@@ -7,6 +7,7 @@ use cursive::event::{Event, EventResult, MouseButton, MouseEvent};
 use cursive::theme::{ColorStyle, ColorType, PaletteColor};
 use cursive::traits::View;
 use cursive::vec::Vec2;
+use parking_lot::Mutex;
 use unicode_width::UnicodeWidthStr;
 
 use crate::library::Library;
@@ -23,6 +24,24 @@ pub struct StatusBar {
     last_size: Vec2,
     /// Read-only view of the pending count prefix (`0` means none).
     pending_count: Arc<AtomicUsize>,
+    /// The playback position as last drawn.
+    shown: Mutex<Option<PlaybackShown>>,
+}
+
+/// The playback position as the bar shows it: whole seconds elapsed and filled progress cells.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PlaybackShown {
+    elapsed_secs: u32,
+    progress_cells: usize,
+}
+
+/// The number of progress cells filled `elapsed_ms` into a track of `duration_ms`, on a bar
+/// `width` cells wide.
+fn progress_cells(elapsed_ms: u32, width: usize, duration_ms: u32) -> usize {
+    elapsed_ms
+        .checked_mul(width as u32)
+        .and_then(|v| v.checked_div(duration_ms))
+        .unwrap_or(0) as usize
 }
 
 impl StatusBar {
@@ -35,7 +54,26 @@ impl StatusBar {
             library,
             last_size: Vec2::new(0, 0),
             pending_count,
+            shown: Mutex::new(None),
         }
+    }
+
+    fn playback_shown(&self, elapsed_ms: u32, width: usize) -> PlaybackShown {
+        PlaybackShown {
+            elapsed_secs: elapsed_ms / 1000,
+            progress_cells: self
+                .queue
+                .get_current()
+                .map(|t| progress_cells(elapsed_ms, width, t.duration()))
+                .unwrap_or(0),
+        }
+    }
+
+    /// Whether the playback position would be drawn differently now than at the last draw:
+    /// the time reads another second or the progress bar fills another cell.
+    pub fn playback_changed(&self) -> bool {
+        let elapsed_ms = self.spotify.get_current_progress().as_millis() as u32;
+        *self.shown.lock() != Some(self.playback_shown(elapsed_ms, self.last_size.x))
     }
 
     fn use_nerdfont(&self) -> bool {
@@ -117,10 +155,6 @@ impl View for StatusBar {
             ColorType::Color(*printer.theme.palette.custom("statusbar_bg").unwrap()),
         );
 
-        printer.print(
-            (0, 0),
-            &vec![' '; printer.size.x].into_iter().collect::<String>(),
-        );
         printer.with_color(style, |printer| {
             printer.print(
                 (0, 1),
@@ -180,12 +214,9 @@ impl View for StatusBar {
             n => format!("{n} "),
         };
 
-        printer.with_color(style_bar_bg, |printer| {
-            printer.print((0, 0), &"┉".repeat(printer.size.x));
-        });
-
         let elapsed = self.spotify.get_current_progress();
         let elapsed_ms = elapsed.as_millis() as u32;
+        *self.shown.lock() = Some(self.playback_shown(elapsed_ms, printer.size.x));
 
         let formatted_elapsed = ms_to_hms(elapsed.as_millis().try_into().unwrap_or(0));
 
@@ -223,15 +254,18 @@ impl View for StatusBar {
             });
         }
 
-        if let Some(t) = self.queue.get_current() {
-            printer.with_color(style_bar, |printer| {
-                let duration_width = elapsed_ms
-                    .checked_mul(printer.size.x as u32)
-                    .and_then(|v| v.checked_div(t.duration()))
-                    .unwrap_or(0) as usize;
-                printer.print((0, 0), &"━".repeat(duration_width + 1));
-            });
+        // The progress row, each cell printed once: this is drawn on every playback redraw.
+        let filled = match self.queue.get_current() {
+            Some(t) => progress_cells(elapsed_ms, printer.size.x, t.duration()) + 1,
+            None => 0,
         }
+        .min(printer.size.x);
+        printer.with_color(style_bar, |printer| {
+            printer.print((0, 0), &"━".repeat(filled));
+        });
+        printer.with_color(style_bar_bg, |printer| {
+            printer.print((filled, 0), &"┉".repeat(printer.size.x - filled));
+        });
     }
 
     fn layout(&mut self, size: Vec2) {
@@ -310,5 +344,67 @@ mod reconnect_tests {
     fn segment_only_while_reconnecting() {
         assert_eq!(reconnect_segment(true), "Reconnecting... ");
         assert_eq!(reconnect_segment(false), "");
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use std::time::Duration;
+
+    use cursive::buffer::PrintBuffer;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::events::EventManager;
+
+    #[test]
+    fn progress_cells_fill_with_the_elapsed_share() {
+        assert_eq!(progress_cells(0, 100, 200_000), 0);
+        assert_eq!(progress_cells(100_000, 100, 200_000), 50);
+        assert_eq!(progress_cells(200_000, 100, 200_000), 100);
+        // No track length, and a product past u32: an empty bar, not a panic.
+        assert_eq!(progress_cells(5_000, 100, 0), 0);
+        assert_eq!(progress_cells(u32::MAX, 100, 200_000), 0);
+    }
+
+    #[test]
+    fn playback_changes_only_when_the_drawn_second_does() {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev, spotify.clone(), cfg.clone());
+        let queue = Arc::new(Queue::new(spotify.clone(), cfg.clone(), library.clone()));
+        let mut bar = StatusBar::new(queue, library, Arc::new(AtomicUsize::new(0)));
+
+        let size = Vec2::new(80, 2);
+        let theme = crate::theme::load(&None);
+        let mut buffer = PrintBuffer::new();
+        buffer.resize(size);
+        let buffer = parking_lot::RwLock::new(buffer);
+        let printer = Printer::new(size, &theme, &buffer);
+
+        // Never drawn: a draw is due.
+        bar.layout(size);
+        assert!(bar.playback_changed());
+        bar.draw(&printer);
+        assert!(!bar.playback_changed());
+        // Nothing queued: the progress row is all track, and covers the full width.
+        let row: String = (0..size.x)
+            .map(|x| {
+                buffer
+                    .read()
+                    .cell_text(Vec2::new(x, 0))
+                    .unwrap_or(" ")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(row, "┉".repeat(size.x));
+
+        spotify.update_status(PlayerEvent::Paused(Duration::from_millis(900)));
+        assert!(!bar.playback_changed(), "still reads 0:00");
+        spotify.update_status(PlayerEvent::Paused(Duration::from_millis(1100)));
+        assert!(bar.playback_changed(), "reads 0:01 now");
+        bar.draw(&printer);
+        assert!(!bar.playback_changed());
     }
 }

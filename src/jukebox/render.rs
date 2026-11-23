@@ -7,6 +7,12 @@ pub mod raster {
             return;
         }
         let (x, y) = (x as u32, y as u32);
+        // An opaque colour replaces the pixel: the same result as the mix below, without the
+        // float work, and every colour the jukebox draws is opaque.
+        if color.0[3] == 255 {
+            img.put_pixel(x, y, color);
+            return;
+        }
         let bg = img.get_pixel(x, y).0;
         let fa = color.0[3] as f32 / 255.0;
         let mix = |f: u8, b: u8| (f as f32 * fa + b as f32 * (1.0 - fa)).round() as u8;
@@ -147,7 +153,7 @@ pub mod raster {
     }
 }
 
-use image::{Rgba, RgbaImage, imageops::FilterType};
+use image::{Rgba, RgbaImage};
 
 use crate::jukebox::graph::Edge;
 use crate::jukebox::{SongState, ViewMode};
@@ -244,9 +250,35 @@ pub fn render(
         }
     }
 
-    // Triangle (bilinear) is much cheaper than Lanczos3 and, after the 2x supersample, still
-    // smooths the edges well — important because this runs on each beat in the UI loop.
-    image::imageops::resize(&img, w, h, FilterType::Triangle)
+    downsample(&img, w, h)
+}
+
+/// Average each `SS` x `SS` block of the supersampled `img` into one pixel of a `w` x `h`
+/// image. This runs on each beat in the UI loop, and the general resize filters of the image
+/// crate cost many times more for the same whole-number reduction.
+fn downsample(img: &RgbaImage, w: u32, h: u32) -> RgbaImage {
+    let ss = SS as usize;
+    let src = img.as_raw();
+    let stride = img.width() as usize * 4;
+    let count = SS * SS;
+    let mut out = vec![0u8; w as usize * h as usize * 4];
+    for (y, row) in out.chunks_exact_mut(w as usize * 4).enumerate() {
+        for (x, pixel) in row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let mut sum = [0u32; 4];
+            for dy in 0..ss {
+                let at = (y * ss + dy) * stride + x * ss * 4;
+                for block in src[at..at + ss * 4].as_chunks::<4>().0 {
+                    for (total, value) in sum.iter_mut().zip(block) {
+                        *total += u32::from(*value);
+                    }
+                }
+            }
+            for (channel, total) in pixel.iter_mut().zip(sum) {
+                *channel = ((total + count / 2) / count) as u8;
+            }
+        }
+    }
+    RgbaImage::from_raw(w, h, out).expect("the buffer holds w x h pixels")
 }
 
 fn draw_radial(img: &mut RgbaImage, state: &SongState, w: u32, h: u32, show_web: bool, max: usize) {
@@ -425,6 +457,22 @@ mod render_tests {
             [0, 0, 0, 255],
         );
         assert!(img.pixels().any(|p| p.0[3] > 0));
+    }
+
+    #[test]
+    fn downsample_averages_each_block() {
+        let mut img = RgbaImage::from_pixel(2 * SS, SS, Rgba([0, 0, 0, 255]));
+        // Left block: one white pixel of four. Right block: all white.
+        img.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
+        for y in 0..SS {
+            for x in SS..2 * SS {
+                img.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        let out = downsample(&img, 2, 1);
+        assert_eq!(out.dimensions(), (2, 1));
+        assert_eq!(out.get_pixel(0, 0).0, [64, 64, 64, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
     }
 
     #[test]

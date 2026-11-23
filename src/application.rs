@@ -340,7 +340,7 @@ impl Application {
             layout.set_screen("library");
         }
 
-        cursive.add_fullscreen_layer(layout.with_name("main"));
+        layout.show(&mut cursive);
 
         Ok(Self {
             queue,
@@ -353,6 +353,26 @@ impl Application {
         })
     }
 
+    /// Redraw the parts of the screen that show the playback position, if they changed.
+    fn redraw_playback(&mut self) {
+        let wanted = self
+            .cursive
+            .call_on_name("main", |layout: &mut ui::layout::Layout| {
+                layout.prepare_playback_redraw()
+            })
+            .unwrap_or(false);
+        if !wanted {
+            return;
+        }
+        let layers = self.cursive.screen().layer_sizes();
+        self.cursive.refresh();
+        // Cursive clears the screen buffer when a layer changed size, which leaves the parts
+        // not drawn blank: draw everything then.
+        if self.cursive.screen().layer_sizes() != layers {
+            self.cursive.refresh();
+        }
+    }
+
     /// Start the application and run the event loop.
     pub fn run(&mut self) -> Result<(), String> {
         #[cfg(unix)]
@@ -361,7 +381,14 @@ impl Application {
 
         // cursive event loop
         while self.cursive.is_running() {
-            self.cursive.step();
+            let redrawn = self.cursive.step();
+            // A playing track moves the status bar on. Waking Cursive for that would redraw
+            // the whole screen, so the worker leaves a note and the redraw is asked for here,
+            // limited to the parts that show the playback position. A step that redrew
+            // everything has covered it already.
+            if self.event_manager.take_playback_tick() && !redrawn {
+                self.redraw_playback();
+            }
             #[cfg(feature = "cover")]
             self.cursive
                 .call_on_name("cover", |view: &mut ui::cover::CoverView| {

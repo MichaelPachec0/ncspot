@@ -546,6 +546,11 @@ impl ViewExt for LyricsView {
         "Lyrics".to_string()
     }
 
+    // Synced lyrics mark the line being sung.
+    fn follows_playback(&self) -> bool {
+        true
+    }
+
     fn on_command(&mut self, _s: &mut Cursive, cmd: &Command) -> Result<CommandResult, String> {
         let cfg = self.cfg.values().lyrics.clone().unwrap_or_default();
 

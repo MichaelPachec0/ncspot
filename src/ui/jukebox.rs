@@ -818,6 +818,7 @@ pub fn dial_lines(state: &SongState) -> Vec<(char, String)> {
 
 impl View for JukeboxView {
     fn draw(&self, printer: &Printer<'_, '_>) {
+        self.jukebox.mark_view_drawn();
         let Some(state) = self.jukebox.state() else {
             #[cfg(feature = "jukebox-graphics")]
             {

@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use cursive::align::HAlign;
 use cursive::direction::Direction;
 use cursive::event::{AnyCb, Event, EventResult, Key, MouseButton, MouseEvent};
 use cursive::theme::{ColorStyle, ColorType, Theme};
+use cursive::traits::Nameable;
 use cursive::traits::View;
 use cursive::vec::Vec2;
-use cursive::view::{CannotFocus, IntoBoxedView, Selector};
+use cursive::view::{CannotFocus, Selector};
 use cursive::views::EditView;
+use cursive::views::stack_view::{Fullscreen, Transparent};
 use cursive::{Cursive, Printer};
 use unicode_width::UnicodeWidthStr;
 
@@ -21,11 +23,27 @@ use crate::config::{self, Config};
 use crate::events;
 use crate::ext_traits::CursiveExt;
 use crate::traits::{IntoBoxedViewExt, ViewExt};
+use crate::ui::statusbar::StatusBar;
+
+/// Draw everything: the default, and what any redraw Cursive starts gets.
+const DRAW_ALL: u8 = 0;
+/// Draw the status bar only.
+const DRAW_STATUSBAR: u8 = 1;
+/// Draw the status bar and the current view.
+const DRAW_STATUSBAR_AND_VIEW: u8 = 2;
 
 pub struct Layout {
     screens: HashMap<String, Box<dyn ViewExt>>,
     stack: HashMap<String, Vec<Box<dyn ViewExt>>>,
-    statusbar: Box<dyn View>,
+    statusbar: StatusBar,
+    /// What the next draw covers, one of the `DRAW_` values; every draw sets it back to
+    /// `DRAW_ALL`. The screen buffer keeps what is not drawn again, so the parts left out
+    /// stay as they are. That only holds while nothing paints over the layout before it
+    /// draws, which is why [Layout::show] adds it as a transparent layer.
+    next_draw: AtomicU8,
+    /// Rows the command line and result took at the last draw. A change moves the status
+    /// bar, so the next draw covers everything.
+    drawn_cmdline_height: AtomicUsize,
     focus: Option<String>,
     previous_focus: Option<String>,
     cmdline: EditView,
@@ -42,8 +60,8 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new<T: IntoBoxedView>(
-        status: T,
+    pub fn new(
+        status: StatusBar,
         ev: &events::EventManager,
         theme: Theme,
         configuration: Arc<Config>,
@@ -98,7 +116,9 @@ impl Layout {
         Self {
             screens: HashMap::new(),
             stack: HashMap::new(),
-            statusbar: status.into_boxed_view(),
+            statusbar: status,
+            next_draw: AtomicU8::new(DRAW_ALL),
+            drawn_cmdline_height: AtomicUsize::new(0),
             focus: None,
             previous_focus: None,
             cmdline: command_line_input,
@@ -111,6 +131,130 @@ impl Layout {
             configuration,
             pending_count,
         }
+    }
+
+    /// Add the layout to `siv` as its full screen layer, named "main".
+    ///
+    /// The layer is transparent: Cursive fills the background of any other layer on every
+    /// draw, which would blank the parts a playback redraw leaves out. The layout fills its
+    /// own background instead, when it draws everything.
+    pub fn show(self, siv: &mut Cursive) {
+        siv.screen_mut()
+            .add_layer(Transparent(Fullscreen(self.with_name("main"))));
+    }
+
+    /// Draw the parts the next draw covers, in the view colours `printer` is set to.
+    fn draw_parts(&self, printer: &Printer<'_, '_>) {
+        let result = self.get_result();
+
+        let cmdline_visible = !self.cmdline.get_content().is_empty();
+        let mut cmdline_height = usize::from(cmdline_visible);
+        if result.as_ref().map(Option::is_some).unwrap_or(true) {
+            cmdline_height += 1;
+        }
+
+        // A draw that leaves parts out needs them where the last draw put them.
+        let moved = self
+            .drawn_cmdline_height
+            .swap(cmdline_height, Ordering::Relaxed)
+            != cmdline_height;
+        let draw = match self.next_draw.swap(DRAW_ALL, Ordering::Relaxed) {
+            _ if moved => DRAW_ALL,
+            draw => draw,
+        };
+        if draw != DRAW_ALL {
+            if draw == DRAW_STATUSBAR_AND_VIEW
+                && let Some(view) = self.get_top_view()
+            {
+                let printer = &printer
+                    .offset((0, 1))
+                    .cropped((printer.size.x, printer.size.y - 3 - cmdline_height))
+                    .focused(true);
+                view.draw(printer);
+            }
+            self.statusbar
+                .draw(&printer.offset((0, printer.size.y - 2 - cmdline_height)));
+            return;
+        }
+
+        // The background, for the cells no part prints to.
+        for y in 0..printer.size.y {
+            printer.print_hline((0, y), printer.size.x, " ");
+        }
+
+        let screen_title = self
+            .get_current_screen()
+            .map(|screen| screen.title())
+            .unwrap_or_default();
+
+        if let Some(view) = self.get_top_view() {
+            // back button + title
+            if !self.is_current_stack_empty() {
+                printer.with_color(ColorStyle::title_secondary(), |printer| {
+                    printer.print((1, 0), &format!("< {screen_title}"));
+                });
+            }
+
+            // view title
+            printer.with_color(ColorStyle::title_primary(), |printer| {
+                let offset = HAlign::Center.get_offset(view.title().width(), printer.size.x);
+                printer.print((offset, 0), &view.title());
+            });
+
+            printer.with_color(ColorStyle::secondary(), |printer| {
+                let offset = HAlign::Right.get_offset(view.title_sub().width(), printer.size.x);
+                printer.print((offset, 0), &view.title_sub());
+            });
+
+            // screen content
+            let printer = &printer
+                .offset((0, 1))
+                .cropped((printer.size.x, printer.size.y - 3 - cmdline_height))
+                .focused(true);
+            view.draw(printer);
+        }
+
+        self.statusbar
+            .draw(&printer.offset((0, printer.size.y - 2 - cmdline_height)));
+
+        if let Ok(Some(r)) = result {
+            printer.print_hline((0, printer.size.y - cmdline_height), printer.size.x, " ");
+            printer.print((0, printer.size.y - cmdline_height), &r);
+        } else if let Err(e) = result {
+            let style = ColorStyle::new(
+                ColorType::Color(*self.theme.palette.custom("error").unwrap()),
+                ColorType::Color(*self.theme.palette.custom("error_bg").unwrap()),
+            );
+
+            printer.with_color(style, |printer| {
+                printer.print_hline((0, printer.size.y - cmdline_height), printer.size.x, " ");
+                printer.print((0, printer.size.y - cmdline_height), &format!("ERROR: {e}"));
+            });
+        }
+
+        if cmdline_visible {
+            let printer = &printer.offset((0, printer.size.y - 1));
+            self.cmdline.draw(printer);
+        }
+    }
+
+    /// Get ready for a redraw asked for only because playback moved on. Returns false when
+    /// nothing on screen shows a change, and no redraw is needed. Otherwise the next draw
+    /// covers the status bar, and the current view if it follows playback, and leaves out
+    /// the rest.
+    pub fn prepare_playback_redraw(&mut self) -> bool {
+        let view = self
+            .get_top_view()
+            .is_some_and(|view| view.follows_playback());
+        if !view && !self.statusbar.playback_changed() {
+            return false;
+        }
+        *self.next_draw.get_mut() = if view {
+            DRAW_STATUSBAR_AND_VIEW
+        } else {
+            DRAW_STATUSBAR
+        };
+        true
     }
 
     pub fn enable_cmdline(&mut self, prefix: char) {
@@ -337,71 +481,15 @@ impl Layout {
 
 impl View for Layout {
     fn draw(&self, printer: &Printer<'_, '_>) {
-        let result = self.get_result();
-
-        let cmdline_visible = !self.cmdline.get_content().is_empty();
-        let mut cmdline_height = usize::from(cmdline_visible);
-        if result.as_ref().map(Option::is_some).unwrap_or(true) {
-            cmdline_height += 1;
-        }
-
-        let screen_title = self
-            .get_current_screen()
-            .map(|screen| screen.title())
-            .unwrap_or_default();
-
-        if let Some(view) = self.get_top_view() {
-            // back button + title
-            if !self.is_current_stack_empty() {
-                printer.with_color(ColorStyle::title_secondary(), |printer| {
-                    printer.print((1, 0), &format!("< {screen_title}"));
-                });
-            }
-
-            // view title
-            printer.with_color(ColorStyle::title_primary(), |printer| {
-                let offset = HAlign::Center.get_offset(view.title().width(), printer.size.x);
-                printer.print((offset, 0), &view.title());
-            });
-
-            printer.with_color(ColorStyle::secondary(), |printer| {
-                let offset = HAlign::Right.get_offset(view.title_sub().width(), printer.size.x);
-                printer.print((offset, 0), &view.title_sub());
-            });
-
-            // screen content
-            let printer = &printer
-                .offset((0, 1))
-                .cropped((printer.size.x, printer.size.y - 3 - cmdline_height))
-                .focused(true);
-            view.draw(printer);
-        }
-
-        self.statusbar
-            .draw(&printer.offset((0, printer.size.y - 2 - cmdline_height)));
-
-        if let Ok(Some(r)) = result {
-            printer.print_hline((0, printer.size.y - cmdline_height), printer.size.x, " ");
-            printer.print((0, printer.size.y - cmdline_height), &r);
-        } else if let Err(e) = result {
-            let style = ColorStyle::new(
-                ColorType::Color(*self.theme.palette.custom("error").unwrap()),
-                ColorType::Color(*self.theme.palette.custom("error_bg").unwrap()),
-            );
-
-            printer.with_color(style, |printer| {
-                printer.print_hline((0, printer.size.y - cmdline_height), printer.size.x, " ");
-                printer.print((0, printer.size.y - cmdline_height), &format!("ERROR: {e}"));
-            });
-        }
-
-        if cmdline_visible {
-            let printer = &printer.offset((0, printer.size.y - 1));
-            self.cmdline.draw(printer);
-        }
+        // What Cursive's own layer background does for other layers: the view colours.
+        printer.with_color(ColorStyle::view(), |printer| self.draw_parts(printer));
     }
 
     fn layout(&mut self, size: Vec2) {
+        // A new size clears the screen buffer: the draw has to cover everything.
+        if size != self.last_size {
+            *self.next_draw.get_mut() = DRAW_ALL;
+        }
         self.last_size = size;
 
         self.statusbar.layout(Vec2::new(size.x, 2));
@@ -604,6 +692,139 @@ fn word_completion(input: &str, dictionary: &[&str]) -> String {
     }
 
     prefix.into_iter().collect::<String>()
+}
+
+#[cfg(test)]
+mod draw_tests {
+    use cursive::buffer::PrintBuffer;
+
+    use super::*;
+    use crate::events::EventManager;
+    use crate::library::Library;
+    use crate::queue::Queue;
+    use crate::spotify::Spotify;
+
+    /// A view that counts its draws.
+    struct Probe {
+        draws: Arc<AtomicUsize>,
+        follows_playback: bool,
+    }
+
+    impl View for Probe {
+        fn draw(&self, printer: &Printer<'_, '_>) {
+            self.draws.fetch_add(1, Ordering::Relaxed);
+            printer.print((0, 0), "PROBE");
+        }
+    }
+
+    impl ViewExt for Probe {
+        fn follows_playback(&self) -> bool {
+            self.follows_playback
+        }
+    }
+
+    /// A layout showing a probe view, and the probe's draw count.
+    fn layout(follows_playback: bool) -> (Layout, Arc<AtomicUsize>) {
+        let cfg = Config::new_for_test();
+        let ev = EventManager::new_for_test();
+        let spotify = Spotify::new_for_test(cfg.clone(), ev.clone());
+        let library = Library::new_for_test(ev.clone(), spotify.clone(), cfg.clone());
+        let queue = Arc::new(Queue::new(spotify, cfg.clone(), library.clone()));
+        let count = Arc::new(AtomicUsize::new(0));
+        let status = StatusBar::new(queue, library, count.clone());
+        let draws = Arc::new(AtomicUsize::new(0));
+        let probe = Probe {
+            draws: draws.clone(),
+            follows_playback,
+        };
+        let mut layout =
+            Layout::new(status, &ev, crate::theme::load(&None), cfg, count).screen("probe", probe);
+        layout.set_screen("probe");
+        (layout, draws)
+    }
+
+    /// Lay out and draw at `size`, as one Cursive refresh does.
+    fn refresh(layout: &mut Layout, size: Vec2) {
+        layout.layout(size);
+        let mut buffer = PrintBuffer::new();
+        buffer.resize(size);
+        let buffer = parking_lot::RwLock::new(buffer);
+        layout.draw(&Printer::new(size, &layout.theme.clone(), &buffer));
+    }
+
+    const SIZE: Vec2 = Vec2::new(80, 24);
+
+    #[test]
+    fn a_playback_redraw_leaves_out_a_view_that_does_not_follow_playback() {
+        let (mut layout, draws) = layout(false);
+        refresh(&mut layout, SIZE);
+        assert_eq!(draws.load(Ordering::Relaxed), 1);
+
+        // Nothing moved since the draw: no redraw at all.
+        assert!(!layout.prepare_playback_redraw());
+
+        *layout.next_draw.get_mut() = DRAW_STATUSBAR;
+        refresh(&mut layout, SIZE);
+        assert_eq!(draws.load(Ordering::Relaxed), 1, "the view was left out");
+
+        // The draw after it covers everything again.
+        refresh(&mut layout, SIZE);
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_playback_redraw_draws_a_view_that_follows_playback() {
+        let (mut layout, draws) = layout(true);
+        refresh(&mut layout, SIZE);
+        assert!(layout.prepare_playback_redraw());
+        refresh(&mut layout, SIZE);
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+    }
+
+    /// Through Cursive itself, as the application draws: the view a playback redraw leaves
+    /// out has to stay on screen.
+    #[test]
+    fn a_playback_redraw_keeps_the_view_on_screen() {
+        let (layout, draws) = layout(false);
+        let backend = cursive::backends::puppet::Backend::init(Some(SIZE));
+        let screens = backend.stream();
+        let mut siv = cursive::CursiveRunner::new(Cursive::new(), backend);
+        siv.set_theme(crate::theme::load(&None));
+        layout.show(&mut siv);
+        siv.refresh();
+        assert_eq!(draws.load(Ordering::Relaxed), 1);
+
+        siv.call_on_name("main", |layout: &mut Layout| {
+            *layout.next_draw.get_mut() = DRAW_STATUSBAR;
+        });
+        siv.refresh();
+        assert_eq!(draws.load(Ordering::Relaxed), 1, "the view was left out");
+        let screen = screens.try_iter().last().expect("a screen was drawn");
+        assert!(
+            !screen.find_occurences("PROBE").is_empty(),
+            "the view left out is gone from the screen"
+        );
+    }
+
+    #[test]
+    fn a_new_size_draws_everything() {
+        let (mut layout, draws) = layout(false);
+        refresh(&mut layout, SIZE);
+        *layout.next_draw.get_mut() = DRAW_STATUSBAR;
+        refresh(&mut layout, Vec2::new(100, 30));
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_moved_status_bar_draws_everything() {
+        let (mut layout, draws) = layout(false);
+        refresh(&mut layout, SIZE);
+        // A result line takes a row and moves the status bar up.
+        layout.set_result(Ok(Some("done".into())));
+        *layout.next_draw.get_mut() = DRAW_STATUSBAR;
+        refresh(&mut layout, SIZE);
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+    }
 }
 
 #[cfg(test)]
