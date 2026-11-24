@@ -26,6 +26,9 @@ use crate::traits::{IntoBoxedViewExt, ViewExt};
 use crate::ui::statusbar::StatusBar;
 
 /// Draw everything: the default, and what any redraw Cursive starts gets.
+/// How long the result of a command stays on screen.
+const RESULT_SHOWN_FOR: Duration = Duration::from_secs(5);
+
 const DRAW_ALL: u8 = 0;
 /// Draw the status bar only.
 const DRAW_STATUSBAR: u8 = 1;
@@ -317,6 +320,18 @@ impl Layout {
     }
 
     pub fn set_result(&mut self, result: Result<Option<String>, String>) {
+        // A message goes away when it has been shown long enough, and only a draw takes
+        // it away: ask for one then, since nothing else may redraw (paused, or stopped).
+        if !matches!(result, Ok(None)) {
+            let ev = self.ev.clone();
+            let shown_for = RESULT_SHOWN_FOR + Duration::from_millis(50);
+            let _ = std::thread::Builder::new()
+                .name("result-expiry".into())
+                .spawn(move || {
+                    std::thread::sleep(shown_for);
+                    ev.trigger();
+                });
+        }
         self.result = result;
         self.result_time = Some(SystemTime::now());
     }
@@ -335,7 +350,7 @@ impl Layout {
 
     fn get_result(&self) -> Result<Option<String>, String> {
         if let Some(t) = self.result_time
-            && t.elapsed().unwrap() > Duration::from_secs(5)
+            && t.elapsed().unwrap() > RESULT_SHOWN_FOR
         {
             return Ok(None);
         }
