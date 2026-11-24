@@ -26,6 +26,9 @@ use crate::traits::{IntoBoxedViewExt, ViewExt};
 use crate::ui::statusbar::StatusBar;
 
 /// Draw everything: the default, and what any redraw Cursive starts gets.
+/// How long the result of a command stays on screen.
+const RESULT_SHOWN_FOR: Duration = Duration::from_secs(5);
+
 const DRAW_ALL: u8 = 0;
 /// Draw the status bar only.
 const DRAW_STATUSBAR: u8 = 1;
@@ -170,6 +173,11 @@ impl Layout {
                     .offset((0, 1))
                     .cropped((printer.size.x, printer.size.y - 3 - cmdline_height))
                     .focused(true);
+                // Views print over an empty area and count on it: what one printed last
+                // time and leaves out now has to go.
+                for y in 0..printer.size.y {
+                    printer.print_hline((0, y), printer.size.x, " ");
+                }
                 view.draw(printer);
             }
             self.statusbar
@@ -312,6 +320,18 @@ impl Layout {
     }
 
     pub fn set_result(&mut self, result: Result<Option<String>, String>) {
+        // A message goes away when it has been shown long enough, and only a draw takes
+        // it away: ask for one then, since nothing else may redraw (paused, or stopped).
+        if !matches!(result, Ok(None)) {
+            let ev = self.ev.clone();
+            let shown_for = RESULT_SHOWN_FOR + Duration::from_millis(50);
+            let _ = std::thread::Builder::new()
+                .name("result-expiry".into())
+                .spawn(move || {
+                    std::thread::sleep(shown_for);
+                    ev.trigger();
+                });
+        }
         self.result = result;
         self.result_time = Some(SystemTime::now());
     }
@@ -330,7 +350,7 @@ impl Layout {
 
     fn get_result(&self) -> Result<Option<String>, String> {
         if let Some(t) = self.result_time
-            && t.elapsed().unwrap() > Duration::from_secs(5)
+            && t.elapsed().unwrap() > RESULT_SHOWN_FOR
         {
             return Ok(None);
         }
@@ -712,7 +732,10 @@ mod draw_tests {
 
     impl View for Probe {
         fn draw(&self, printer: &Printer<'_, '_>) {
-            self.draws.fetch_add(1, Ordering::Relaxed);
+            // Its first draw fills a line that the later ones leave empty.
+            if self.draws.fetch_add(1, Ordering::Relaxed) == 0 {
+                printer.print((0, 1), "FIRST");
+            }
             printer.print((0, 0), "PROBE");
         }
     }
@@ -803,6 +826,36 @@ mod draw_tests {
         assert!(
             !screen.find_occurences("PROBE").is_empty(),
             "the view left out is gone from the screen"
+        );
+    }
+
+    /// A view drawn by a playback redraw starts from an empty area, as in a full draw: what
+    /// it no longer prints (lyrics lines after a jump back in the song) must not stay.
+    #[test]
+    fn a_playback_redraw_clears_what_the_view_no_longer_prints() {
+        let (layout, draws) = layout(true);
+        let backend = cursive::backends::puppet::Backend::init(Some(SIZE));
+        let screens = backend.stream();
+        let mut siv = cursive::CursiveRunner::new(Cursive::new(), backend);
+        siv.set_theme(crate::theme::load(&None));
+        layout.show(&mut siv);
+        siv.refresh();
+        let screen = screens.try_iter().last().expect("a screen was drawn");
+        assert!(!screen.find_occurences("FIRST").is_empty());
+
+        let partial = siv
+            .call_on_name("main", |layout: &mut Layout| {
+                layout.prepare_playback_redraw()
+            })
+            .unwrap();
+        assert!(partial);
+        siv.refresh();
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+        let screen = screens.try_iter().last().expect("a screen was drawn");
+        assert!(!screen.find_occurences("PROBE").is_empty());
+        assert!(
+            screen.find_occurences("FIRST").is_empty(),
+            "a line the view no longer prints is still on screen"
         );
     }
 
