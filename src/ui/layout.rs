@@ -170,6 +170,11 @@ impl Layout {
                     .offset((0, 1))
                     .cropped((printer.size.x, printer.size.y - 3 - cmdline_height))
                     .focused(true);
+                // Views print over an empty area and count on it: what one printed last
+                // time and leaves out now has to go.
+                for y in 0..printer.size.y {
+                    printer.print_hline((0, y), printer.size.x, " ");
+                }
                 view.draw(printer);
             }
             self.statusbar
@@ -712,7 +717,10 @@ mod draw_tests {
 
     impl View for Probe {
         fn draw(&self, printer: &Printer<'_, '_>) {
-            self.draws.fetch_add(1, Ordering::Relaxed);
+            // Its first draw fills a line that the later ones leave empty.
+            if self.draws.fetch_add(1, Ordering::Relaxed) == 0 {
+                printer.print((0, 1), "FIRST");
+            }
             printer.print((0, 0), "PROBE");
         }
     }
@@ -803,6 +811,36 @@ mod draw_tests {
         assert!(
             !screen.find_occurences("PROBE").is_empty(),
             "the view left out is gone from the screen"
+        );
+    }
+
+    /// A view drawn by a playback redraw starts from an empty area, as in a full draw: what
+    /// it no longer prints (lyrics lines after a jump back in the song) must not stay.
+    #[test]
+    fn a_playback_redraw_clears_what_the_view_no_longer_prints() {
+        let (layout, draws) = layout(true);
+        let backend = cursive::backends::puppet::Backend::init(Some(SIZE));
+        let screens = backend.stream();
+        let mut siv = cursive::CursiveRunner::new(Cursive::new(), backend);
+        siv.set_theme(crate::theme::load(&None));
+        layout.show(&mut siv);
+        siv.refresh();
+        let screen = screens.try_iter().last().expect("a screen was drawn");
+        assert!(!screen.find_occurences("FIRST").is_empty());
+
+        let partial = siv
+            .call_on_name("main", |layout: &mut Layout| {
+                layout.prepare_playback_redraw()
+            })
+            .unwrap();
+        assert!(partial);
+        siv.refresh();
+        assert_eq!(draws.load(Ordering::Relaxed), 2);
+        let screen = screens.try_iter().last().expect("a screen was drawn");
+        assert!(!screen.find_occurences("PROBE").is_empty());
+        assert!(
+            screen.find_occurences("FIRST").is_empty(),
+            "a line the view no longer prints is still on screen"
         );
     }
 
