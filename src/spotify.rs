@@ -222,6 +222,22 @@ pub(crate) fn restart_credentials(
     }
 }
 
+/// The environment variable PipeWire's client library reads the wanted latency from.
+const PIPEWIRE_LATENCY: &str = "PIPEWIRE_LATENCY";
+
+/// The latency asked of PipeWire when the ALSA backend plays through PipeWire's ALSA plugin:
+/// frames per graph cycle over the sample rate, about 93 ms. Music needs no low latency, and
+/// a PipeWire graph runs at the smallest latency any of its clients asks for: on a system
+/// set up for low latency, a client that asks for nothing gets that default and makes the
+/// whole graph, sink included, wake up some thirty times as often.
+const PIPEWIRE_LATENCY_DEFAULT: &str = "4096/44100";
+
+/// The latency to set for PipeWire, given what the environment already holds: the user's own
+/// setting wins. Without PipeWire nothing reads the variable.
+fn pipewire_latency_default(existing: Option<std::ffi::OsString>) -> Option<&'static str> {
+    existing.is_none().then_some(PIPEWIRE_LATENCY_DEFAULT)
+}
+
 impl Spotify {
     pub fn new(
         events: EventManager,
@@ -408,6 +424,9 @@ impl Spotify {
     }
 
     /// Create and initialize the requested audio backend.
+    ///
+    /// With several backends compiled in and none configured, librespot's own order decides:
+    /// ALSA comes before PulseAudio.
     fn init_backend(desired_backend: Option<String>) -> Result<SinkBuilder, Box<dyn Error>> {
         let backend = if let Some(name) = desired_backend {
             audio_backend::BACKENDS
@@ -432,6 +451,12 @@ impl Spotify {
             unsafe { env::set_var("PULSE_PROP_stream.description", "ncurses Spotify client") };
             // TODO: Audit that the environment access only happens in single-threaded code.
             unsafe { env::set_var("PULSE_PROP_media.role", "music") };
+        }
+        if backend_name == "alsa"
+            && let Some(latency) = pipewire_latency_default(env::var_os(PIPEWIRE_LATENCY))
+        {
+            // TODO: Audit that the environment access only happens in single-threaded code.
+            unsafe { env::set_var(PIPEWIRE_LATENCY, latency) };
         }
 
         Ok(backend.1)
@@ -1059,6 +1084,14 @@ mod tests {
         let channel = RwLock::new(Some(new_tx));
         assert!(!release_if_ours(&channel, &own));
         assert!(channel.read().is_some());
+    }
+
+    #[test]
+    fn the_pipewire_latency_default_yields_to_the_environment() {
+        assert_eq!(pipewire_latency_default(None), Some("4096/44100"));
+        assert_eq!(pipewire_latency_default(Some("64/48000".into())), None);
+        // Set but empty is still the user's setting.
+        assert_eq!(pipewire_latency_default(Some("".into())), None);
     }
 
     #[test]

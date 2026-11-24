@@ -123,6 +123,18 @@ Rodio for Windows
 cargo build --no-default-features --features rodio_backend,pancurses_backend
 ```
 
+ALSA on Linux, next to PulseAudio
+```sh
+cargo build --features alsa_backend
+```
+With both compiled in and no `backend` in the configuration, ALSA is used. On a system that
+runs PipeWire, ALSA reaches it through PipeWire's ALSA plugin, without the `pipewire-pulse`
+server and libpulse's own thread in between; those two wake up several hundred times a second
+for a single stream, which costs battery. ncspot then asks PipeWire for a latency of about
+93 ms, unless `PIPEWIRE_LATENCY` is already set in the environment. Set
+`backend = "pulseaudio"` to go back. The Nix package builds with this feature; the
+`ncspot-pulseaudio` package (`nix build .#ncspot-pulseaudio`) leaves it out.
+
 ## Other Features
 Here are some auxiliary features you may wish to enable:
 
