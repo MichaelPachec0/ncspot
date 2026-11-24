@@ -7,7 +7,7 @@ pub mod remixer;
 pub mod render;
 pub mod settings;
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Condvar, Mutex, RwLock};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -117,6 +117,10 @@ struct JukeboxInner {
     /// Set when the jukebox view draws, taken by the driver when it asks for a redraw: while
     /// the view is hidden nothing sets it again, so playback progress costs no redraws.
     view_drawn: AtomicBool,
+    /// Where the driver thread waits while the jukebox is off, so that it costs no wakeups.
+    /// The lock guards nothing: it only orders the wait against the wake-up.
+    parked: Mutex<()>,
+    turned_on: Condvar,
 }
 
 impl JukeboxInner {
@@ -131,6 +135,26 @@ impl JukeboxInner {
             state: RwLock::new(None),
             seek_request: Mutex::new(None),
             view_drawn: AtomicBool::new(false),
+            parked: Mutex::new(()),
+            turned_on: Condvar::new(),
+        }
+    }
+
+    fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+        if on {
+            // Under the lock, so the wake-up cannot fall between the driver's check of
+            // `enabled` and its wait.
+            let _parked = self.parked.lock();
+            self.turned_on.notify_all();
+        }
+    }
+
+    /// Block until the jukebox is on.
+    fn wait_until_enabled(&self) {
+        let mut parked = self.parked.lock();
+        while !self.enabled.load(Ordering::Relaxed) {
+            self.turned_on.wait(&mut parked);
         }
     }
 }
@@ -172,7 +196,7 @@ impl Jukebox {
         self.inner.enabled.load(Ordering::Relaxed)
     }
     pub fn set_enabled(&self, on: bool) {
-        self.inner.enabled.store(on, Ordering::Relaxed);
+        self.inner.set_enabled(on);
     }
     pub fn toggle(&self) -> bool {
         let new = !self.is_enabled();
@@ -336,8 +360,6 @@ fn run_driver_loop(
     let mut shown: Option<Shown> = None;
 
     loop {
-        std::thread::sleep(Duration::from_millis(TICK_MS));
-
         if !inner.enabled.load(Ordering::Relaxed) {
             if driver.is_some() {
                 driver = None;
@@ -345,8 +367,12 @@ fn run_driver_loop(
                 *inner.state.write() = None;
                 events.trigger();
             }
+            // Off: sleep until it is turned on instead of ticking.
+            inner.wait_until_enabled();
             continue;
         }
+
+        std::thread::sleep(Duration::from_millis(TICK_MS));
 
         let spotify = queue.get_spotify();
         let Some(playable) = queue.get_current() else {
@@ -565,6 +591,29 @@ mod tests {
         let (_, src, partial) = resolve_effective(&base, false, &overrides, "other");
         assert_eq!(src, SettingsSource::Global);
         assert!(partial.is_none());
+    }
+
+    #[test]
+    fn the_driver_wait_ends_only_when_the_jukebox_is_turned_on() {
+        let inner = Arc::new(JukeboxInner::new(JukeboxSettings::default(), false, false));
+        let (done, woke) = crossbeam_channel::bounded(1);
+        let waiter = {
+            let inner = inner.clone();
+            std::thread::spawn(move || {
+                inner.wait_until_enabled();
+                let _ = done.send(());
+            })
+        };
+        assert!(
+            woke.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the wait ended with the jukebox off"
+        );
+        // Turning it off again changes nothing for the waiter.
+        inner.set_enabled(false);
+        assert!(woke.recv_timeout(Duration::from_millis(100)).is_err());
+        inner.set_enabled(true);
+        assert!(woke.recv_timeout(Duration::from_secs(5)).is_ok());
+        waiter.join().unwrap();
     }
 
     #[test]
