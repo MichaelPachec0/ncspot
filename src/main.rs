@@ -50,6 +50,8 @@ mod spotify;
 mod spotify_api;
 mod spotify_url;
 mod spotify_worker;
+#[cfg(unix)]
+mod stderr;
 #[cfg(any(test, feature = "harness"))]
 mod test_playlists;
 mod theme;
@@ -110,6 +112,11 @@ fn main() -> Result<(), String> {
             // limit. Startup work in Application::new above may still wait like a background
             // thread.
             rate_limit::set_ui_thread();
+
+            // The UI owns the terminal while the event loop runs: what libraries write to
+            // the standard error stream would land in the middle of it.
+            #[cfg(unix)]
+            let _stderr = stderr::off_the_terminal(&config::cache_path(stderr::LOG_FILE));
 
             // Start the application event loop.
             application.run()
